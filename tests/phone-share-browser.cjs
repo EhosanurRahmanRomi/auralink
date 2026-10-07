@@ -74,6 +74,7 @@ async function main() {
       // Reproduce unavailable compositor capture independently of the native
       // bridge fixture. Phone streaming must use explicit generated frames.
       HTMLCanvasElement.prototype.captureStream = () => { throw new Error('Canvas capture is unavailable in this background regression'); };
+      Image.prototype.decode = () => Promise.reject(new Error('DOM image decode is unavailable in this background regression'));
       const fixture = window.qaPhone = { started: 0, stops: 0, sequence: 0, acked: [], inputs: [], routes: [], grant: null, timer: null, frame: null, stop: null, emergency: null };
       const canvas = document.createElement('canvas'); canvas.width = 720; canvas.height = 1280; const draw = canvas.getContext('2d');
       window.auralink = Object.freeze({ platform: 'android',
@@ -158,7 +159,7 @@ async function main() {
     await phone.waitForFunction(() => document.getElementById('toast-region').textContent.includes('Update Android System WebView'));
     assert.equal(await phone.evaluate(() => qaPhone.started), 1, 'Unsupported frame generation must fail before requesting another native projection');
     result = { passed: true, environment: 'Real HTTPS broker and RTC engine; mobile UI; explicit native Android bridge fixture producing720x1280JPEG frames',
-      verified: ['no projection on join', 'phone share button calls native consent contract', 'quality and current microphone/camera flags passed', 'JPEGs become explicit VideoFrames with native acknowledgments while canvas capture is disabled',
+      verified: ['no projection on join', 'phone share button calls native consent contract', 'quality and current microphone/camera flags passed', 'JPEGs become explicit VideoFrames with native acknowledgments while canvas capture and DOM image decoding are disabled',
         'desktop actually decodes portrait RTP video', 'bad JPEG acknowledged and following frames recover', 'phone accepts control only after explicit review', 'approved input bound to remote peer/session', 'owner revocation rejects late input', 'stop releases stream and frame subscription', 'older WebView gets update guidance before native projection starts'],
       limitations: ['Native projection approval, Accessibility and Android background lifecycle are fixtures; a physical phone test is required'], decoded, errors };
     assert.deepEqual(errors, []); assert.deepEqual(await host.page.evaluate(() => fixtureErrors), []);

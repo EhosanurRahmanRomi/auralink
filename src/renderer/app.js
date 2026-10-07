@@ -718,7 +718,7 @@ async function beginSharing() {
   updateButtons(); renderParticipants(); renderStage();
 }
 async function beginPhoneSharing() {
-  if (typeof MediaStreamTrackGenerator !== 'function' || typeof VideoFrame !== 'function') throw new Error('Update Android System WebView to enable phone screen streaming, including sharing while another app is open.');
+  if (typeof MediaStreamTrackGenerator !== 'function' || typeof VideoFrame !== 'function' || typeof createImageBitmap !== 'function') throw new Error('Update Android System WebView to enable phone screen streaming, including sharing while another app is open.');
   const rtc = state.rtc;
   $('share-button').disabled = true;
   const screen = await bridge.startScreenShare({ quality: preferences.quality === '720' || preferences.quality === 'auto' ? '720p' : '1080p', microphone: state.local.has('audio'), camera: state.local.has('camera') });
@@ -736,16 +736,21 @@ async function beginPhoneSharing() {
     }
     if (capture.busy) { await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); return; }
     capture.busy = true; capture.lastSeq = frame.seq;
+    let image;
     try {
-      const image = new Image(); image.src = frame.data;
-      await image.decode();
+      // Image.decode can queue work on a hidden WebView's inactive compositor.
+      // Decode an in-memory blob directly; no DOM paint or network fetch.
+      const binary = atob(frame.data.slice('data:image/jpeg;base64,'.length));
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+      image = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
       if (!capture.active || state.phoneScreen !== capture) return;
       if (image.width < 1 || image.height < 1 || image.width > 1920 || image.height > 1920) throw new Error('Invalid phone frame size');
       capture.timestamp = Math.max(capture.timestamp + 1, Math.round(performance.now() * 1000));
       const videoFrame = new VideoFrame(image, { timestamp: capture.timestamp });
       try { await writer.write(videoFrame); } finally { videoFrame.close(); }
     } catch { /* A corrupt frame is skipped; the native capture can send the next. */ }
-    finally { capture.busy = false; await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); }
+    finally { image?.close(); capture.busy = false; await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); }
   });
   state.local.set('screen', { track, stream }); await state.rtc.setTrack('screen', track, stream);
   state.selected = { peerId: state.selfId, kind: 'screen' }; track.addEventListener('ended', () => { if (state.phoneScreen === capture) void stopSharing(); });
