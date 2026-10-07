@@ -75,7 +75,7 @@ jobs:
           mkdir -p "$ANDROID_AVD_HOME" "$ANDROID_USER_HOME"
           sudo chmod 666 /dev/kvm
           "$task_sdk/cmdline-tools/latest/bin/sdkmanager" --licenses <<< "$(printf 'y\n%.0s' {1..100})"
-          "$task_sdk/cmdline-tools/latest/bin/sdkmanager" 'emulator' 'platform-tools' 'system-images;android-36;google_apis;x86_64'
+          "$task_sdk/cmdline-tools/latest/bin/sdkmanager" 'emulator' 'platform-tools' 'platforms;android-36' 'build-tools;36.0.0' 'system-images;android-36;google_apis;x86_64'
           printf 'no\n' | "$task_sdk/cmdline-tools/latest/bin/avdmanager" create avd --name AuralinkAPI36 --package 'system-images;android-36;google_apis;x86_64' --device pixel_7 --path "$ANDROID_AVD_HOME/AuralinkAPI36.avd"
           cat >> "$ANDROID_AVD_HOME/AuralinkAPI36.avd/config.ini" <<'CONFIG'
           hw.lcd.width=720
@@ -88,6 +88,8 @@ jobs:
           disk.dataPartition.size=2048M
           CONFIG
           "$task_sdk/emulator/emulator" -avd AuralinkAPI36 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -memory 4096 -cores 4 -port 5556 -accel on > .tools/emulator-runtime.log 2>&1 &
+      - name: Build separate non-suppressing hierarchy observer
+        run: node tests/qa-hierarchy/build.cjs
       - name: Actual production WebView, native projection and Accessibility input
         run: node tests/android-emulator.cjs --control
       - name: Preserve runtime evidence

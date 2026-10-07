@@ -43,8 +43,12 @@ async function adb(args,options={}) {
 }
 function decodeXML(value) {return value.replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');}
 async function hierarchy() {
-  await adb(['shell','uiautomator','dump','--compressed','/sdcard/auralink-qa.xml'],{timeout:60000});
-  const xml=await adb(['exec-out','cat','/sdcard/auralink-qa.xml']);
+  const result=await adb(['shell','am','instrument','-w','local.auralink.qa/.HierarchyInstrumentation'],{timeout:60000});
+  assert.ok(!/INSTRUMENTATION_FAILED|FAILURES!!!|shortMsg=/.test(result),'The non-suppressing hierarchy observer must run successfully');
+  assert.match(result,/qa_hierarchy=ok/,'The separate observer must report a fresh successful snapshot');
+  assert.match(result,/accessibility_services_preserved=true/,'The observer must preserve Accessibility services');
+  const xml=await adb(['exec-out','run-as','local.auralink.qa','cat','files/hierarchy.xml']);
+  assert.match(xml,/observation-flags="dont-suppress-accessibility-services"/);
   return [...xml.matchAll(/<node\b([^>]*?)(?:\/>|>)/g)].map(match=>Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(pair=>[pair[1],decodeXML(pair[2])])));
 }
 function coordinates(node) {
@@ -289,6 +293,10 @@ async function nativeDevice() {
   assert.match(installedPath,/^\/data\/app\/[A-Za-z0-9_~=/.-]+\/base\.apk$/);
   assert.equal((await adb(['shell',`sha256sum '${installedPath}'`])).split(/\s+/)[0],installedApkHash,'The installed APK must match the actual tested file');
   checkpoint('productionApkInstalled');
+  const observerApk=path.join(project,'.tools','qa-hierarchy','Auralink-QA-hierarchy.apk');
+  assert.ok(fs.existsSync(observerApk),'Build the separate non-suppressing QA observer before native runtime testing');
+  await adb(['install','--no-incremental','-r',observerApk],{timeout:120000});
+  checkpoint('separateNonSuppressingObserverInstalled');
   await adb(['shell','am','force-stop','local.auralink.mobile']);
   await adb(['shell','logcat','-c']);
   if(process.argv.includes('--control')) {
@@ -305,6 +313,22 @@ async function hostFixture() {
   const broker=await createBroker({host:'0.0.0.0',name:'Android runtime verification',tls:{key:cert.private,cert:cert.cert},assetsDir:path.join(project,'src','renderer')});
   const ws=new WebSocket(`wss://127.0.0.1:${broker.port}/ws`,{rejectUnauthorized:false});
   const fixture={broker,ws,inbox:[],waiters:[],peerId:null,page:null,chain:Promise.resolve(),errors:[],network:{healthRequests:0,socketUpgrades:0,tlsErrorCodes:[]}};
+  // Observe the unmodified broker's incoming frame only for a static native
+  // rejection reason. The broker intentionally omits reasons on its response.
+  // Never retain peer/session identifiers, room credentials or arbitrary text.
+  const originalEmit=WebSocket.prototype.emit;
+  const safeReasons=new Set(['Share the full phone display before granting control.','Approval expired or the room changed.','Android input permission is unavailable.','Desktop control could not start.']);
+  WebSocket.prototype.emit=function(event,...args) {
+    if(this._isServer && event==='message') {
+      try {
+        const packet=JSON.parse(args[0].toString());
+        if(packet.type==='control-response') runtimeDiagnostics.nativeControlResponse={accepted:packet.accepted===true,
+          reason:packet.accepted===true?null:safeReasons.has(packet.reason)?packet.reason:'Rejection reason omitted'};
+      }catch{}
+    }
+    return Reflect.apply(originalEmit,this,[event,...args]);
+  };
+  fixture.restoreObserver=()=>{WebSocket.prototype.emit=originalEmit;};
   broker.server.on('request',request=>{if(request.url==='/health')fixture.network.healthRequests++;});
   broker.server.on('upgrade',request=>{if(request.url==='/ws')fixture.network.socketUpgrades++;});
   broker.server.on('tlsClientError',error=>fixture.network.tlsErrorCodes.push(error.code || 'TLS handshake rejected'));
@@ -411,7 +435,7 @@ async function runUI(fixture) {
     await screenshot('android-emulator-native-control-consent.png');
     await tapStable(node=>node['resource-id']==='android:id/button1' && /^allow control$/i.test(node.text),30000);
     const grant=await fixture.take('control-response',30000);
-    assert.equal(grant.from,fixture.peerId);assert.equal(grant.accepted,true);
+    assert.equal(grant.from,fixture.peerId);assert.equal(grant.accepted,true,`Native owner approval must succeed: ${runtimeDiagnostics.nativeControlResponse?.reason || 'No native reason'}`);
     await findNode(node=>node['content-desc']==='Stop remote control immediately',30000);
     checkpoint('separateNativeControlApproved');
     phase='actual Android Accessibility input';console.log(phase);
@@ -508,6 +532,7 @@ async function main() {
       for(const waiter of fixture.waiters)clearTimeout(waiter.timer);
       await fixture.browser?.close().catch(()=>{});
       await fixture.broker.stop().catch(()=>{});
+      fixture.restoreObserver?.();
     }
   }
 }
