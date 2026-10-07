@@ -1,6 +1,6 @@
 # Android test companion
 
-Auralink 0.3.0 uses a bundled Android WebView for WebRTC calls and the native Android platform for room connections, screen consent, audio routing and attended input. Android 10 or newer is required. Android can create or join an **Internet** room through the private hosted coordinator after device pairing. In **Nearby** mode, it joins a room hosted on Windows or macOS; it does not host the local signaling broker. Nearby connections pin the invitation certificate, while Internet connections verify the service's normal certificate chain and hostname.
+Auralink 0.3.1 uses a bundled Android WebView for WebRTC calls and the native Android platform for room connections, screen consent, audio routing and attended input. Android 10 or newer is required. Android can create or join an **Internet** room through the private hosted coordinator after device pairing. In **Nearby** mode, it joins a room hosted on Windows or macOS; it does not host the local signaling broker. Nearby connections pin the invitation certificate, while Internet connections verify the service's normal certificate chain and hostname.
 
 ## Try phone screen sharing
 

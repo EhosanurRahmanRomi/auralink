@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — Guided Internet setup
+
+- Creating an Internet room with a missing or invalid service address now opens the relevant Settings field with persistent setup instructions, before room admission or audio preparation begins.
+- Unpaired Android devices go directly to setup when Create a room is selected. Desktop Nearby rooms retain their existing flow; desktop Internet rooms use the same setup guidance.
+- Setup guidance closes blocking room/invitation dialogs, focuses the address or pairing field, and preserves custom service addresses and saved credentials. Paired devices can still reconnect when offline.
+
 ## 0.3.0 — Private Internet beta
 
 - Added an optional **Internet** mode alongside existing **Nearby** rooms, with a Cloudflare Workers Free/SQLite Durable Object coordinator and a free public `workers.dev` address. A purchased domain is not required.

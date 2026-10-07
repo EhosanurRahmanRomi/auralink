@@ -20,6 +20,9 @@ const sdk=process.env.ANDROID_SDK_ROOT || path.join(project,'.tools','android-sd
 const adbPath=path.join(sdk,'platform-tools',process.platform==='win32'?'adb.exe':'adb');
 const serial=process.env.AURALINK_EMULATOR_SERIAL || 'emulator-5556';
 const pkg=require('../package.json');
+const testedVersion=process.env.AURALINK_TEST_APK_VERSION || pkg.version;
+const [testedMajor,testedMinor,testedPatch]=testedVersion.split('.').map(Number);
+const freshSetupRegression=testedMajor>0 || testedMinor>3 || testedMinor===3 && testedPatch>=1;
 const output=path.join(project,'test-results');
 const fixtureDir=path.join(project,'.tools','android-runtime-fixture');
 const apk=process.env.AURALINK_TEST_APK ? path.resolve(process.env.AURALINK_TEST_APK) : path.join(project,'release',`Auralink-${pkg.version}-Android.apk`);
@@ -294,6 +297,12 @@ async function nativeDevice() {
   assert.match(installedPath,/^\/data\/app\/[A-Za-z0-9_~=/.-]+\/base\.apk$/);
   assert.equal((await adb(['shell',`sha256sum '${installedPath}'`])).split(/\s+/)[0],installedApkHash,'The installed APK must match the actual tested file');
   checkpoint('productionApkInstalled');
+  if (freshSetupRegression) {
+    // The verified, throwaway AVD must exercise a truly unpaired installation.
+    // This never targets a physical device or changes a user's saved setup.
+    assert.match(await adb(['shell','pm','clear','local.auralink.mobile']),/Success/);
+    checkpoint('isolatedAppDataResetForFreshSetup');
+  }
   const observerApk=path.join(project,'.tools','qa-hierarchy','Auralink-QA-hierarchy.apk');
   assert.ok(fs.existsSync(observerApk),'Build the separate non-suppressing QA observer before native runtime testing');
   await adb(['install','--no-incremental','-r',observerApk],{timeout:120000});
@@ -396,10 +405,52 @@ async function hostFixture() {
   return fixture;
 }
 
+async function checkFreshInternetSetup(fixture) {
+  phase='fresh Android Internet setup guidance';console.log(phase);
+  const before={healthRequests:fixture.network.healthRequests,socketUpgrades:fixture.network.socketUpgrades,joins:fixture.network.incomingTypes.join || 0};
+  await tapRoomAction(label('Create a room'));
+  let service;
+  try { service=await findNode(node=>node['resource-id']==='internet-service' && node.class==='android.widget.EditText' && node.focused==='true',30000); }
+  catch { throw new Error('Native setup visibility check failed: focused service input was not exposed after Create a room. Inspect the local hierarchy and screenshot.'); }
+  // Android Accessibility can expose the input placeholder as node.text. The
+  // browser regression separately proves the actual HTML value remains empty.
+  assert.ok(!service.text || service.text==='https://your-space.workers.dev','Fresh native setup must show an empty service field or its example placeholder');
+  if(await keyboardShown()) await adb(['shell','input','keyevent','4']);
+  let hint;
+  try { hint=await findNode(node=>node['resource-id']==='internet-setup-hint' && /Enter the private service address and pairing code supplied by your group owner/.test(node.text || ''),30000); }
+  catch { throw new Error('Native setup visibility check failed: persistent setup instructions were not exposed after dismissing the keyboard. Inspect the local hierarchy and screenshot.'); }
+  assert.match(hint.text,/Go online/);assert.match(hint.text,/create your room again/i);
+  let nodes=await hierarchy();
+  assert.ok(!nodes.some(node=>label('Create your room')(node) || label('Create room')(node)), 'The host modal must close so Settings can be used immediately');
+  assert.ok(!nodes.some(node=>label('Turn microphone on')(node) || label('Leave room')(node)), 'Missing Internet setup cannot enter an admitted room');
+  assert.ok(!nodes.some(node=>/invalid (?:internet service|url)|Invalid URL/i.test(node.text || '')), 'Fresh setup must explain the required fields rather than show a generic URL error');
+  // The keyboard can resize the native WebView. Observe each real setting
+  // after it closes rather than tapping cached document coordinates.
+  await findNode(label('Private service address'));
+  await findNode(label('Private pairing code'));
+  await findNode(label('Go online'));
+  await screenshot('android-emulator-fresh-internet-setup.png');
+  const networkAfter={healthRequests:fixture.network.healthRequests,socketUpgrades:fixture.network.socketUpgrades,joins:fixture.network.incomingTypes.join || 0};
+  assert.deepEqual(networkAfter,before,'Missing setup must not attempt native signaling or room admission');
+  await tapStable(node=>label('Rooms')(node) && node.class==='android.widget.Button');
+  for (const [id,direction] of [['host-button','up'],['join-button','down']]) {
+    let action;
+    for(let attempt=0;attempt<6;attempt++) {
+      action=(await hierarchy()).find(node=>node['resource-id']===id && visible(node));
+      if(action)break;
+      await adb(['shell','input','swipe','355',direction==='up'?'470':'1060','355',direction==='up'?'1060':'470','450']);await delay(500);
+    }
+    assert.ok(action,`Native setup visibility check failed: ${id} was not exposed after returning to Rooms`);
+    assert.equal(action.enabled,'true','Setup guidance must leave both room actions usable after returning to Rooms');
+  }
+  checkpoint('freshInternetSetupGuidance',{passed:true,ownerAction:'Create a room',serviceInputFocused:true,actionableServiceAndPairingFields:true,persistentSetupHint:true,hostModalClosed:true,noAdmissionAttempt:true,roomActionsRemainUsable:true});
+}
+
 async function runUI(fixture) {
   phase='production APK lobby';console.log(phase);
   await findNode(node=>node.package==='local.auralink.mobile' && /Rooms|Your space|Settings/.test(node.text),60000);await screenshot('android-emulator-lobby.png');
   checkpoint('productionLobbyRendered');
+  if (freshSetupRegression) await checkFreshInternetSetup(fixture);
   if(process.argv.includes('--control')) {
     // Start after cold WebView startup instead of racing the Accessibility
     // binding deadline with first-launch provider initialization. Only this

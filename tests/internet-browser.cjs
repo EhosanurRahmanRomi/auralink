@@ -54,6 +54,66 @@ async function pair(page, origin, pairingKey, name, uiOrigin = origin) {
   assert.ok(!storage.includes(pairingKey), 'Pairing code must not be persisted');
 }
 async function visitRooms(page) { await page.locator('.nav-item[data-view="rooms"]').click(); }
+async function setupPreflightProof(desktop, mobile, origin) {
+  const pc = await desktop.newPage(); const phone = await mobile.newPage();
+  try {
+    await pc.addInitScript(() => { window.auralink.hostRoom = async () => { throw new Error('Nearby hosting is not exercised by this Internet fixture.'); }; });
+    await phone.addInitScript(() => { window.auralink.platform = 'android'; });
+    await pc.goto(origin); await phone.goto(origin);
+    await pc.waitForFunction(() => document.getElementById('profile-platform').textContent !== 'Loading…');
+    // A fresh desktop still offers Nearby with no Internet configuration.
+    await pc.locator('#host-button').click();
+    assert.equal(await pc.locator('#host-mode').inputValue(), 'nearby');
+    assert.equal(await pc.locator('#host-dialog').evaluate(dialog => dialog.open), true);
+    await pc.locator('#host-mode').selectOption('internet'); await pc.locator('#create-room').click();
+    for (const page of [pc, phone]) {
+      if (page === phone) await page.locator('#host-button').click();
+      await page.locator('#internet-setup-hint').waitFor();
+      assert.equal(await page.locator('#view-settings').isVisible(), true);
+      assert.equal(await page.locator('#host-dialog').evaluate(dialog => dialog.open), false);
+      assert.equal(await page.evaluate(() => document.activeElement.id), 'internet-service');
+      assert.match(await page.locator('#internet-setup-hint').innerText(), /service address and pairing code.*Go online/);
+      assert.equal(await page.locator('#host-button').isDisabled(), false);
+      assert.equal(await page.locator('#join-button').isDisabled(), false);
+      assert.equal(await page.locator('#session').isVisible(), false);
+    }
+    // Invalid custom input is preserved for correction, before admission/audio.
+    const invalid = 'https://custom.example/path';
+    await phone.locator('#internet-service').fill(invalid); await visitRooms(phone); await phone.locator('#host-button').click();
+    assert.equal(await phone.locator('#internet-service').inputValue(), invalid);
+    assert.match(await phone.locator('#internet-setup-hint').innerText(), /without a path or invitation/);
+    assert.equal(await phone.evaluate(() => document.activeElement.id), 'internet-service');
+    // A valid first-use service focuses its code; even a filled code waits for
+    // the explicit Go online action rather than pairing from a room action.
+    await phone.locator('#internet-service').fill(origin); await visitRooms(phone); await phone.locator('#host-button').click();
+    assert.equal(await phone.evaluate(() => document.activeElement.id), 'internet-pairing-code');
+    await phone.locator('#internet-pairing-code').fill('qa-code-must-not-be-sent'); await visitRooms(phone); await phone.locator('#host-button').click();
+    assert.equal(await phone.evaluate(() => document.activeElement.id), 'internet-go-online');
+    assert.equal(await phone.locator('#internet-pairing-code').inputValue(), 'qa-code-must-not-be-sent');
+    await phone.locator('#internet-pairing-code').fill('');
+    // An Internet invitation can supply an empty service field; it cannot
+    // silently replace an existing custom group or discard that identity.
+    const invite = `${origin}/#internet=1&room=qa-room&key=qa-room-key`;
+    await phone.locator('#internet-service').fill(''); await visitRooms(phone); await phone.locator('#join-button').click(); await phone.locator('#join-invite').fill(invite); await phone.locator('#join-submit').click();
+    assert.equal(await phone.locator('#join-dialog').evaluate(dialog => dialog.open), false);
+    assert.equal(await phone.locator('#internet-service').inputValue(), origin);
+    assert.equal(await phone.evaluate(() => document.activeElement.id), 'internet-pairing-code');
+    assert.equal(await phone.locator('#join-invite').inputValue(), invite);
+    const custom = 'https://kept-private-group.example';
+    await phone.evaluate(custom => localStorage.setItem(`auralink.internet.identity:${custom}`, JSON.stringify({ deviceId: 'qa-preserved-device', deviceToken: 'qa-preserved-token-123456789' })), custom);
+    await phone.locator('#internet-service').fill(custom); await visitRooms(phone); await phone.locator('#join-button').click(); await phone.locator('#join-submit').click();
+    assert.equal(await phone.locator('#internet-service').inputValue(), custom);
+    assert.match(await phone.locator('#internet-setup-hint').innerText(), /current service and saved device credentials have been kept/);
+    assert.equal(await phone.evaluate(custom => JSON.parse(localStorage.getItem(`auralink.internet.identity:${custom}`)).deviceId, custom), 'qa-preserved-device');
+    await phone.evaluate(custom => localStorage.removeItem(`auralink.internet.identity:${custom}`), custom);
+    for (const page of [pc, phone]) {
+      assert.deepEqual(await page.evaluate(() => ({ sockets: qaSocketConstructions, audioContexts: qaAudioContextConstructions, capture: qaCaptureCalls.length, trust: qaInternetTrustCalls })), { sockets: 0, audioContexts: 0, capture: 0, trust: 0 });
+      assert.equal(await page.locator('#host-button').isDisabled(), false);
+      assert.equal(await page.locator('#join-button').isDisabled(), false);
+    }
+    return { desktopNearbyPreserved: true, freshPhoneAndDesktopRouteBeforeAdmission: true, invalidAddressPreserved: true, explicitFirstPairing: true, invitationSetupClosesModal: true, customGroupAndCredentialPreserved: true, noSocketAudioCaptureOrTrustBeforeSetup: true };
+  } finally { await pc.close(); await phone.close(); }
+}
 async function joinApproved(page, owner, invite) {
   await visitRooms(page); await page.locator('#join-button').click(); await page.locator('#join-invite').fill(invite); await page.locator('#join-submit').click();
   await owner.waitForFunction(() => !document.getElementById('pending-banner').hidden); await review(owner, true); await page.waitForFunction(() => !document.getElementById('mic-button').disabled);
@@ -122,7 +182,8 @@ async function main() {
     const mobile = await browser.newContext({ permissions: ['camera', 'microphone'], viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true }); contexts.push(desktop, mobile);
     for (const context of contexts) {
       await context.addInitScript(({ signalDelay }) => {
-        window.qaCaptureCalls = []; window.qaStreams = []; window.qaRTCConfigs = []; window.qaRTCs = []; window.qaChannels = []; window.qaReceivedInputs = []; window.qaTrackEvents = []; window.qaSignaling = []; window.qaNative = { grants: [], revokes: 0, inputs: [] }; window.qaWaiting = []; window.qaHolds = new Map();
+        window.qaCaptureCalls = []; window.qaStreams = []; window.qaRTCConfigs = []; window.qaRTCs = []; window.qaChannels = []; window.qaReceivedInputs = []; window.qaTrackEvents = []; window.qaSignaling = []; window.qaNative = { grants: [], revokes: 0, inputs: [] }; window.qaWaiting = []; window.qaHolds = new Map(); window.qaSocketConstructions = 0; window.qaAudioContextConstructions = 0; window.qaInternetTrustCalls = 0;
+        const NativeAudioContext = window.AudioContext; window.AudioContext = new Proxy(NativeAudioContext, { construct(target, args) { qaAudioContextConstructions++; return Reflect.construct(target, args); } });
         window.qaHold = label => qaHolds.set(label, { promise: new Promise(resolve => { window.qaPendingResolve = resolve; }), resolve: qaPendingResolve });
         window.qaRelease = label => { const hold = qaHolds.get(label); qaHolds.delete(label); hold?.resolve(); };
         window.qaPause = async label => { const hold = qaHolds.get(label); if (hold) { qaWaiting.push(label); await hold.promise; qaWaiting = qaWaiting.filter(item => item !== label); } };
@@ -132,7 +193,7 @@ async function main() {
           if (packet.type === 'signal' && (packet.data.description || packet.data.mediaState)) qaSignaling.push({ direction, type: 'signal', peerId: packet.to || packet.from, descriptionType: packet.data.description?.type, trackKinds: packet.data.trackKinds, midKinds: packet.data.midKinds, mediaState: packet.data.mediaState, time: performance.now() });
           if (qaSignaling.length > 300) qaSignaling.shift();
         }
-        window.WebSocket = new Proxy(NativeSocket, { construct(target, args) { const socket = Reflect.construct(target, args); const listen = socket.addEventListener.bind(socket); const send = socket.send.bind(socket); socket.send = raw => { try { recordSignal('out', JSON.parse(raw)); } catch {} return send(raw); }; socket.addEventListener = (type, callback, options) => listen(type, type === 'message' ? async event => { try { const packet = JSON.parse(event.data); recordSignal('in', packet); if (['room-created', 'room-left'].includes(packet.type)) await qaPause(packet.type); if (packet.type === 'signal' && signalDelay) await new Promise(resolve => setTimeout(resolve, signalDelay)); } catch {} callback(event); } : callback, options); return socket; } });
+        window.WebSocket = new Proxy(NativeSocket, { construct(target, args) { qaSocketConstructions++; const socket = Reflect.construct(target, args); const listen = socket.addEventListener.bind(socket); const send = socket.send.bind(socket); socket.send = raw => { try { recordSignal('out', JSON.parse(raw)); } catch {} return send(raw); }; socket.addEventListener = (type, callback, options) => listen(type, type === 'message' ? async event => { try { const packet = JSON.parse(event.data); recordSignal('in', packet); if (['room-created', 'room-left'].includes(packet.type)) await qaPause(packet.type); if (packet.type === 'signal' && signalDelay) await new Promise(resolve => setTimeout(resolve, signalDelay)); } catch {} callback(event); } : callback, options); return socket; } });
         function recordChannel(channel) { qaChannels.push(channel); channel.addEventListener('message', ({ data }) => { try { const packet = JSON.parse(data); if (packet.type === 'input') qaReceivedInputs.push(packet); } catch {} }); }
         const NativeRTC = window.RTCPeerConnection; window.RTCPeerConnection = new Proxy(NativeRTC, { construct(target, args) { qaRTCConfigs.push(args[0]); const pc = Reflect.construct(target, args); qaRTCs.push(pc); pc.addEventListener('track', ({ track, transceiver }) => { qaTrackEvents.push({ type: 'track', id: track.id, kind: track.kind, mid: transceiver.mid, muted: track.muted }); for (const type of ['mute', 'unmute', 'ended']) track.addEventListener(type, () => qaTrackEvents.push({ type, id: track.id, kind: track.kind, muted: track.muted })); }); const createChannel = pc.createDataChannel.bind(pc); pc.createDataChannel = (...values) => { const channel = createChannel(...values); recordChannel(channel); return channel; }; pc.addEventListener('datachannel', ({ channel }) => recordChannel(channel)); return pc; } });
         const nativeCapture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
@@ -140,18 +201,21 @@ async function main() {
         navigator.mediaDevices.getDisplayMedia = async () => { await qaPause('display'); const canvas = document.createElement('canvas'); canvas.width = 960; canvas.height = 540; const context = canvas.getContext('2d'); let frame = 0;
           const timer = setInterval(() => { context.fillStyle = frame++ % 2 ? '#244360' : '#287f69'; context.fillRect(0, 0, 960, 540); context.fillStyle = 'white'; context.font = '40px sans-serif'; context.fillText(`Synthetic shared desktop ${frame}`, 60, 120); }, 70);
           const stream = canvas.captureStream(12); const track = stream.getVideoTracks()[0]; track.addEventListener('ended', () => clearInterval(timer)); track.applyConstraints = async () => { await qaPause('constraints'); }; qaStreams.push(stream); return stream; };
-        window.auralink = { platform: 'qa-browser-fixture', getInfo: async () => ({ platform: 'Browser test fixture' }), requestMedia: async () => { await qaPause('permission'); return { ok: true }; }, sources: async () => { await qaPause('sources'); return [{ id: 'screen:qa', name: 'Synthetic desktop' }]; }, chooseScreen: async () => { await qaPause('selection'); }, stopSharing: async () => {},
+        window.auralink = { platform: 'qa-browser-fixture', getInfo: async () => ({ platform: 'Browser test fixture' }), trustInternetService: async () => { qaInternetTrustCalls++; }, requestMedia: async () => { await qaPause('permission'); return { ok: true }; }, sources: async () => { await qaPause('sources'); return [{ id: 'screen:qa', name: 'Synthetic desktop' }]; }, chooseScreen: async () => { await qaPause('selection'); }, stopSharing: async () => {},
           onScreenStopped: listener => { window.qaScreenStopped = listener; return () => {}; },
           grantControl: async request => { qaNative.grants.push(request); await qaPause('grant'); return { ok: true }; }, revokeControl: async () => { qaNative.revokes++; }, applyInput: async input => { qaNative.inputs.push(input); } };
       }, { signalDelay });
     }
+    phase = 'fresh setup preflight'; proof.setupPreflight = await setupPreflightProof(desktop, mobile, proxy.origin);
     const host = await desktop.newPage(); const guest = await mobile.newPage();
     for (const page of [host, guest]) page.on('pageerror', error => errors.push(`${phase}: ${error.message}`));
     phase = 'pair and presence'; await pair(host, serviceOrigin, runtime.pairingKey, hostName, proxy.origin); await pair(guest, serviceOrigin, runtime.pairingKey, guestName, proxy.origin);
     await guest.locator('.nav-item[data-view="devices"]').click(); const hostCard = guest.locator('#online-device-list .device-card').filter({ has: guest.getByRole('heading', { name: hostName, exact: true }) });
     await hostCard.waitFor(); assert.match(await hostCard.innerText(), /Online/); assert.equal(await hostCard.getByRole('button', { name: 'Request connection' }).isDisabled(), true);
     if (!publicMode) { await host.screenshot({ path: path.join(output, 'internet-settings-desktop.png'), fullPage: true }); await guest.screenshot({ path: path.join(output, 'internet-devices-phone.png'), fullPage: true }); }
-    phase = 'cancel an Internet room before its creation reply'; await visitRooms(host); await host.locator('#host-button').click(); await host.locator('#host-mode').selectOption('internet'); await host.locator('#host-name').fill('Cancelled Internet room'); await host.evaluate(() => qaHold('room-created')); await host.locator('#create-room').click(); await host.waitForFunction(() => qaWaiting.includes('room-created'));
+    phase = 'paired offline device reconnects safely'; const pairedCredential = await host.evaluate(origin => localStorage.getItem(`auralink.internet.identity:${origin}`), serviceOrigin); await host.locator('#internet-go-offline').click(); await host.waitForFunction(() => document.getElementById('internet-status').textContent === 'Offline');
+    await visitRooms(host); await host.locator('#host-button').click(); assert.equal(await host.locator('#host-dialog').evaluate(dialog => dialog.open), true); assert.equal(await host.locator('#internet-status').textContent(), 'Offline'); assert.equal(await host.evaluate(origin => localStorage.getItem(`auralink.internet.identity:${origin}`), serviceOrigin), pairedCredential);
+    phase = 'cancel an Internet room before its creation reply'; await host.locator('#host-mode').selectOption('internet'); await host.locator('#host-name').fill('Cancelled Internet room'); await host.evaluate(() => qaHold('room-created')); await host.locator('#create-room').click(); await host.waitForFunction(() => qaWaiting.includes('room-created')); proof.pairedOfflineRoomActionReconnectsWithoutPairingCode = true;
     await host.evaluate(() => qaHold('room-left')); await host.locator('#host-dialog [data-close]').click(); await host.waitForFunction(() => qaWaiting.includes('room-left')); assert.equal(await host.locator('#host-button').isDisabled(), true); assert.equal(await host.locator('#join-button').isDisabled(), true); await host.evaluate(() => qaRelease('room-left'));
     await host.waitForFunction(() => !document.getElementById('host-button').disabled); assert.equal(await host.locator('#internet-status').textContent(), 'Online'); proof.roomExitDisablesReplacementAdmissionUntilAcknowledged = true;
     await host.evaluate(() => qaRelease('room-created')); await host.waitForFunction(() => !qaWaiting.includes('room-created')); assert.equal(await host.locator('#session').isVisible(), false); proof.cancelledInternetCreationCannotOpenRoom = true;

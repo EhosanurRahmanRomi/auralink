@@ -8,9 +8,9 @@
 
 **Calls, presentations and remote assistance across your devices.**
 
-[![Download Windows Setup](https://img.shields.io/badge/Windows-Download%20Setup-7795ff?style=for-the-badge)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-Setup-0.3.0-Windows-x64.exe)
-[![Download Android APK](https://img.shields.io/badge/Android-Download%20APK-71e7bf?style=for-the-badge)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-0.3.0-Android.apk)
-[![Download Apple Silicon DMG](https://img.shields.io/badge/macOS-Apple%20Silicon%20DMG-b69aff?style=for-the-badge)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-0.3.0-Mac-arm64.dmg)
+[![Download Windows Setup](https://img.shields.io/badge/Windows-Download%20Setup-7795ff?style=for-the-badge)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-Setup-0.3.1-Windows-x64.exe)
+[![Download Android APK](https://img.shields.io/badge/Android-Download%20APK-71e7bf?style=for-the-badge)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-0.3.1-Android.apk)
+[![Download Apple Silicon DMG](https://img.shields.io/badge/macOS-Apple%20Silicon%20DMG-b69aff?style=for-the-badge)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-0.3.1-Mac-arm64.dmg)
 
 [Latest release](https://github.com/EhosanurRahmanRomi/auralink/releases/latest) · [Gallery](#gallery) · [Testing guide](docs/TESTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Report an issue](https://github.com/EhosanurRahmanRomi/auralink/issues/new/choose)
 
@@ -20,15 +20,15 @@ Auralink connects Windows, Apple Silicon Macs and Android phones through **Nearb
 
 **Experimental private Internet beta.** Check [validation and limits](VALIDATION.md) before relying on it. Internet coordination can use a free Cloudflare account and its supplied `workers.dev` address. Media attempts direct WebRTC; optional TURN fallback has finite provider allowances. Messaging, file sharing and recording are outside this app.
 
-## Download Auralink 0.3.0
+## Download Auralink 0.3.1
 
 | Your device | Installer |
 |---|---|
-| Windows 11 / 64-bit Windows | [Download Windows Setup (.exe)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-Setup-0.3.0-Windows-x64.exe) |
-| Android 10+ / iQOO | [Download Android app (.apk)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-0.3.0-Android.apk) |
-| Apple Silicon / MacBook Air M4, macOS 13+ | [Download Mac app (.dmg)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-0.3.0-Mac-arm64.dmg) |
+| Windows 11 / 64-bit Windows | [Download Windows Setup (.exe)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-Setup-0.3.1-Windows-x64.exe) |
+| Android 10+ / iQOO | [Download Android app (.apk)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-0.3.1-Android.apk) |
+| Apple Silicon / MacBook Air M4, macOS 13+ | [Download Mac app (.dmg)](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-0.3.1-Mac-arm64.dmg) |
 
-[Quick start](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/START-HERE.md) · [Checksums](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/SHA256SUMS.txt) · [Verification report](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/RELEASE-VERIFICATION.json) · [Source archive](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.0/Auralink-0.3.0-source.zip)
+[Quick start](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/START-HERE.md) · [Checksums](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/SHA256SUMS.txt) · [Verification report](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/RELEASE-VERIFICATION.json) · [Source archive](https://github.com/EhosanurRahmanRomi/auralink/releases/download/v0.3.1/Auralink-0.3.1-source.zip)
 
 Open [the release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest) to find all seven files under **Assets**. Install instructions and device checks are below.
 

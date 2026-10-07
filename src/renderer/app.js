@@ -103,6 +103,7 @@ $('help-button').addEventListener('click', () => openDialog('help-dialog'));
 $('host-button').addEventListener('click', () => {
   if (!bridge?.hostRoom) $('host-mode').value = 'internet';
   updateHostMode();
+  if ($('host-mode').value === 'internet' && !internetRoomPreflight()) return;
   openDialog('host-dialog');
 });
 $('join-button').addEventListener('click', () => { $('join-name').value = preferences.name; openDialog('join-dialog'); });
@@ -125,7 +126,42 @@ function updateHostMode() {
   $('host-mode-help').textContent = globalRoom ? 'Connect through your private Internet service. Keep this device online; you approve every guest. Relay availability depends on the free allowance.' : 'Nearby rooms use the same Wi-Fi or private network. Windows may ask you to allow Auralink on your private network.';
 }
 $('host-mode').addEventListener('change', updateHostMode);
-document.querySelectorAll('[data-internet-settings]').forEach(button => button.addEventListener('click', () => { showView('settings'); $('internet-settings').scrollIntoView({ block: 'start', behavior: 'smooth' }); $('internet-service').focus(); }));
+function showInternetSettings(message = '', focus = 'internet-service') {
+  // Room setup has not begun when preflight routes here. Close the modal first
+  // so that Settings and its focused field are actually usable on phones.
+  for (const id of ['host-dialog', 'join-dialog']) if ($(id).open) $(id).close();
+  $('internet-setup-hint').textContent = message; $('internet-setup-hint').hidden = !message;
+  showView('settings'); $('internet-settings').scrollIntoView({ block: 'start', behavior: 'smooth' });
+  $(focus).focus();
+}
+document.querySelectorAll('[data-internet-settings]').forEach(button => button.addEventListener('click', () => showInternetSettings()));
+function internetRoomPreflight(value = $('internet-service').value, nextStep = 'create your room again') {
+  const finish = `When Online appears, ${nextStep}.`;
+  let origin;
+  try { origin = internetOrigin(value); }
+  catch {
+    const message = String(value).trim() ? 'Use a complete HTTPS service address without a path or invitation. Enter the pairing code supplied by your group owner, then tap Go online.' : 'Enter the private service address and pairing code supplied by your group owner, then tap Go online.';
+    showInternetSettings(`${message} ${finish}`); return false;
+  }
+  const configured = $('internet-service').value;
+  let configuredOrigin; try { configuredOrigin = internetOrigin(configured); } catch { /* Keep an entered custom address intact for correction. */ }
+  if (configuredOrigin !== origin) {
+    if (!configured.trim() && internet.status === 'offline') $('internet-service').value = origin;
+    else {
+      showInternetSettings(`This invitation uses ${origin}. ${internet.status === 'online' ? 'Go offline first, then enter' : 'Enter'} that service address and its private pairing code, then tap Go online. Your current service and saved device credentials have been kept. ${finish}`);
+      return false;
+    }
+  }
+  if (internet.status === 'online' && internet.origin === origin) return true;
+  if (['connecting', 'retrying'].includes(internet.status)) {
+    showInternetSettings(`Your Internet connection is still connecting. ${finish}`, 'internet-setup-hint'); return false;
+  }
+  // Saved, paired devices retain their normal reconnect behavior. A first
+  // pairing is explicit through Go online, before any room admission starts.
+  if (internet.identity(origin)) return true;
+  showInternetSettings(`Enter the private pairing code supplied by your group owner, then tap Go online. ${finish}`, $('internet-pairing-code').value.trim() ? 'internet-go-online' : 'internet-pairing-code');
+  return false;
+}
 function renderInternet() {
   const labels = { offline: 'Offline', connecting: 'Connecting…', online: 'Online', retrying: 'Reconnecting…' };
   $('internet-status').textContent = labels[internet.status]; $('internet-status').dataset.status = internet.status;
@@ -154,14 +190,14 @@ async function ensureInternetOnline(origin = $('internet-service').value) {
   // Names stay fixed during a room. If preferences changed while in the
   // directory, reconnect before admission so the host sees the new name.
   if (internet.status === 'online' && internet.origin === origin && internet.name === preferences.name) return;
-  if (!internet.identity(origin) && !$('internet-pairing-code').value.trim()) { $('internet-service').value = origin; showView('settings'); throw new Error('Pair this device in Internet connections, then try the invitation again.'); }
+  if (!internet.identity(origin) && !$('internet-pairing-code').value.trim()) throw new Error('Enter the private pairing code supplied by your group owner, then tap Go online.');
   await internet.open(origin, { pairingKey: $('internet-pairing-code').value, name: preferences.name });
-  $('internet-pairing-code').value = ''; preferences.internetOrigin = origin; preferences.internetOnline = true; $('internet-service').value = origin; savePreferences(); renderInternet();
+  $('internet-pairing-code').value = ''; $('internet-setup-hint').hidden = true; preferences.internetOrigin = origin; preferences.internetOnline = true; $('internet-service').value = origin; savePreferences(); renderInternet();
 }
 $('internet-go-online').addEventListener('click', async () => {
   if (state.joined || state.joining) { toast('Leave your room before changing its Internet connection.'); return; }
   try { await ensureInternetOnline(); toast('This device is online in your private group.'); }
-  catch (error) { toast(cleanError(error), true); }
+  catch (error) { $('internet-setup-hint').textContent = cleanError(error); $('internet-setup-hint').hidden = false; toast(cleanError(error), true); }
   finally { $('internet-pairing-code').value = ''; renderInternet(); }
 });
 for (const dialog of ['host-dialog', 'join-dialog']) $(dialog).addEventListener('close', () => { if (state.preparing === dialog) void leaveRoom(); });
@@ -409,6 +445,7 @@ function validInvitation(value) {
 $('host-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const globalRoom = $('host-mode').value === 'internet';
+  if (globalRoom && !internetRoomPreflight()) return;
   const epoch = beginAdmission('host-dialog', globalRoom ? 'internet' : 'nearby'); if (epoch === null) return;
   prepareListening();
   $('create-room').disabled = true;
@@ -429,6 +466,10 @@ $('host-form').addEventListener('submit', async (event) => {
 });
 $('join-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  let room;
+  try { room = validInvitation($('join-invite').value); }
+  catch (error) { toast(`Could not request access: ${cleanError(error)}`, true); return; }
+  if (room.internet && !internetRoomPreflight(room.url, 'request to join again')) return;
   const epoch = beginAdmission('join-dialog'); if (epoch === null) { toast('Leave the current room before joining another.'); return; }
   prepareListening();
   $('join-submit').disabled = true;
@@ -436,7 +477,6 @@ $('join-form').addEventListener('submit', async (event) => {
     await configureSpeakers();
     if (!admissionCurrent(epoch)) return;
     preferences.name = $('join-name').value.trim().slice(0, 48) || 'My device'; $('display-name').value = preferences.name; savePreferences();
-    let room = validInvitation($('join-invite').value);
     if (room.internet) await ensureInternetOnline(room.url);
     else if (bridge?.trustInvite) room = { ...room, ...await bridge.trustInvite(room.invite) };
     if (!admissionCurrent(epoch)) return;

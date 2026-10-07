@@ -51,7 +51,13 @@ try {
     $badging = Invoke-VerificationTool $aaptPath @('dump','badging',$ApkPath)
     $manifest = Invoke-VerificationTool $aaptPath @('dump','xmltree',$ApkPath,'AndroidManifest.xml')
     $projectVersion = (Get-Content -LiteralPath (Join-Path $projectPath 'package.json') -Raw | ConvertFrom-Json).version
-    Assert-Verification ($badging -match "package: name='local\.auralink\.mobile' versionCode='3' versionName='$([regex]::Escape($projectVersion))'") 'APK package/version does not match local.auralink.mobile and current project version'
+    [xml]$sourceManifest = Get-Content -LiteralPath (Join-Path $projectPath 'android/AndroidManifest.xml') -Raw
+    $sourceVersionCode = $sourceManifest.manifest.GetAttribute('versionCode', 'http://schemas.android.com/apk/res/android')
+    Assert-Verification ($sourceVersionCode -match '^[1-9][0-9]{0,9}$' -and [long]$sourceVersionCode -le 2100000000) 'Android source manifest versionCode must be a positive Android release number'
+    $expectedVersionCode = [int]$sourceVersionCode
+    $sourceVersionName = $sourceManifest.manifest.GetAttribute('versionName', 'http://schemas.android.com/apk/res/android')
+    Assert-Verification ($sourceVersionName -ceq $projectVersion) 'Android source manifest versionName does not match package.json'
+    Assert-Verification ($badging -match "package: name='local\.auralink\.mobile' versionCode='$expectedVersionCode' versionName='$([regex]::Escape($projectVersion))'") 'APK package/version does not match local.auralink.mobile and current project manifest'
     $actualVersionCode = [int][regex]::Match($badging, "versionCode='([0-9]+)'").Groups[1].Value
     Assert-Verification ($badging -match "sdkVersion:'29'") 'APK minimum Android SDK must be API29'
     Assert-Verification ($badging -match "targetSdkVersion:'36'") 'APK target Android SDK must be API36'
