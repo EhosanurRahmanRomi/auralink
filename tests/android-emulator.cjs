@@ -451,8 +451,21 @@ async function runUI(fixture) {
     assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/,'Attended control must keep the explicitly approved projection active');
     checkpoint('realRemoteHomeWithProjectionActive');
     const backgroundFrames=await fixture.page.locator('#received-screen').evaluate(video=>video.getVideoPlaybackQuality().totalVideoFrames);
-    await fixture.page.waitForFunction(first=>document.getElementById('received-screen')?.getVideoPlaybackQuality().totalVideoFrames>first+3,backgroundFrames,{timeout:20000});
-    checkpoint('screenFramesContinueWhilePhoneShowsHome');
+    const imageHash=async()=>crypto.createHash('sha256').update(await fixture.page.locator('#received-screen').evaluate(video=>{
+      const canvas=document.createElement('canvas');canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+      canvas.getContext('2d').drawImage(video,0,0);return canvas.toDataURL('image/png');
+    })).digest('hex');
+    const previousImage=await imageHash();
+    // MediaProjection delivers composed buffers, not a perpetual timer. A
+    // settled Home screen can remain static. Make a real owner-visible change
+    // AFTER the baseline, then require fresh decoded pixels in the receiver.
+    await adb(['shell','input','keyevent','24']);
+    await fixture.page.waitForFunction(first=>document.getElementById('received-screen')?.getVideoPlaybackQuality().totalVideoFrames>first,backgroundFrames,{timeout:20000});
+    const changedDeadline=Date.now()+10000;
+    while(await imageHash()===previousImage){assert.ok(Date.now()<changedDeadline,'Background screen pixels must change after the actual owner volume action');await delay(200);}
+    const backgroundResumed=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
+    assert.ok(backgroundResumed?.includes(homePackage),'The actual phone must still show Home while new screen pixels decode');
+    checkpoint('screenFramesContinueWhilePhoneShowsHome',{passed:true,ownerVisibleChange:'Android volume panel',newDecodedFrame:true,decodedPixelsChanged:true,homeRemainsForeground:true});
     await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
     await tap(await findNode(node=>node['content-desc']==='Stop remote control immediately',30000));
     await fixture.take('control-revoke',30000);
@@ -466,7 +479,7 @@ async function runUI(fixture) {
     const resumed=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
     assert.match(resumed || '',/local\.auralink\.mobile/,'Revoked input must not reopen Home');
     checkpoint('ownerControlRevokeAndStaleInputRejected');
-    control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','New screen frames still decode while the phone shows Home','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
+    control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','New decoded screen pixels after an actual owner volume action while Home remains foreground','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
   }
   await tapRoomAction(node=>/Stop sharing|Stop screen sharing/.test(node['content-desc']) || node.text==='Stop sharing',20000);
   await delay(1500);
