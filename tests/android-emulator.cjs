@@ -499,7 +499,8 @@ async function runUI(fixture) {
     checkpoint('ownerControlRevokeAndStaleInputRejected');
     control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','New decoded screen pixels after an actual owner volume action while Home remains foreground','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
   }
-  await tapRoomAction(node=>/Stop sharing|Stop screen sharing/.test(node['content-desc']) || node.text==='Stop sharing',20000);
+  phase='owner screen stop and projection cleanup';console.log(phase);
+  await tapRoomAction(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text),20000);
   await delay(1500);
   const stopped=await adb(['shell','dumpsys','media_projection']);
   assert.ok(!stopped.includes('local.auralink.mobile'),'Stopping share must remove MediaProjection');
