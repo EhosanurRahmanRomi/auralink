@@ -216,22 +216,34 @@ async function audioMode(expected,timeout=15000) {
   }while(Date.now()<deadline);
   throw new Error(`Android audio mode did not become ${expected}`);
 }
+async function rtcEvidence(page,predicate,arg,timeout=45000) {
+  // Await asynchronous browser statistics explicitly. waitForFunction's DOM
+  // polling can treat a returned Promise as truthy before its result resolves.
+  const deadline=Date.now()+timeout;
+  do {
+    const evidence=await page.evaluate(predicate,arg);
+    if(evidence)return evidence;
+    await delay(250);
+  }while(Date.now()<deadline);
+  throw new Error(`Verified RTC evidence did not arrive during ${phase}`);
+}
 async function startPhoneAudio(fixture) {
   phase='actual Android microphone permission and RTP';console.log(phase);
   await tapRoomAction(label('Turn microphone on'));
   const permission=await findNode(node=>node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
   await screenshot('android-emulator-microphone-permission.png');await tap(permission);
   await findNode(label('Turn microphone off'),30000);
-  await fixture.page.waitForFunction(async id=>{
+  await rtcEvidence(fixture.page,async id=>{
     const entry=rtc.peers.get(id);const stats=(await rtc.stats()).find(row=>row.peerId===id);
     return entry?.remoteTracks.get('audio')?.track.readyState==='live' && stats?.receivedAudioPackets>0;
-  },fixture.peerId,{timeout:45000});
+  },fixture.peerId);
   const first=await fixture.page.evaluate(async id=>(await rtc.stats()).find(row=>row.peerId===id).receivedAudioPackets,fixture.peerId);
-  await fixture.page.waitForFunction(async ({id,first})=>(await rtc.stats()).find(row=>row.peerId===id)?.receivedAudioPackets>first,{id:fixture.peerId,first},{timeout:15000});
+  await rtcEvidence(fixture.page,async ({id,first})=>(await rtc.stats()).find(row=>row.peerId===id)?.receivedAudioPackets>first,{id:fixture.peerId,first},15000);
   const incoming=await fixture.page.evaluate(async id=>{
     const row=(await rtc.stats()).find(row=>row.peerId===id);
     return {packetsReceived:row.receivedAudioPackets,codec:row.audioCodec,trackState:rtc.peers.get(id).remoteTracks.get('audio').track.readyState};
   },fixture.peerId);
+  assert.ok(incoming.packetsReceived>first && incoming.trackState==='live','Android microphone RTP must actually increase');
   checkpoint('phoneMicrophoneRtpReceived',incoming);
   assert.equal(await audioMode('MODE_IN_COMMUNICATION'),'MODE_IN_COMMUNICATION');
   checkpoint('androidCommunicationAudioMode');
@@ -242,16 +254,16 @@ async function startPhoneAudio(fixture) {
     runtimeTone.frequency.value=880;gain.gain.value=0.025;runtimeTone.connect(gain).connect(destination);runtimeTone.start();
     await runtimeToneContext.resume();await rtc.setTrack('audio',destination.stream.getAudioTracks()[0],destination.stream);
   });
-  const acknowledgedSnapshot=await fixture.page.waitForFunction(async id=>{
+  const outgoing=await rtcEvidence(fixture.page,async id=>{
     const entry=rtc.peers.get(id);if(!entry)return false;
     const rows=[...(await entry.pc.getStats()).values()];
     const sent=rows.find(row=>row.type==='outbound-rtp' && row.kind==='audio' && row.packetsSent>0);
     const acknowledged=rows.find(row=>row.type==='remote-inbound-rtp' && row.kind==='audio' && row.roundTripTimeMeasurements>0);
     return sent && acknowledged ? {packetsSent:sent.packetsSent,roundTripTimeMeasurements:acknowledged.roundTripTimeMeasurements,roundTripTime:acknowledged.roundTripTime} : false;
-  },fixture.peerId,{timeout:45000});
+  },fixture.peerId);
   // Keep the same successful stats snapshot. A later report can omit a
   // transient remote-inbound row while transceivers finish renegotiation.
-  const outgoing=await acknowledgedSnapshot.jsonValue();await acknowledgedSnapshot.dispose();
+  assert.ok(outgoing.packetsSent>0 && outgoing.roundTripTimeMeasurements>0,'Android must actually acknowledge outgoing host audio');
   checkpoint('syntheticHostAudioAcknowledgedByAndroid',outgoing);
   await screenshot('android-emulator-audio-active.png');
   return {passed:true,phoneToHost:incoming,syntheticHostToPhone:outgoing,mode:'MODE_IN_COMMUNICATION',checks:['Native Android microphone permission approved by the test owner','Live WebView microphone track sends increasing encrypted RTP packets','Synthetic host tone RTP acknowledged by actual Android receiver','Actual Android communication audio mode'],physicalMicrophoneAndSpeakerVerified:false};
@@ -397,7 +409,7 @@ async function runUI(fixture) {
     fixture.send({type:'control-request',to:fixture.peerId});
     await tapStable(label('Review and allow'),30000);
     await screenshot('android-emulator-native-control-consent.png');
-    await tapStable(node=>node['resource-id']==='android:id/button1' && node.text==='Allow control',30000);
+    await tapStable(node=>node['resource-id']==='android:id/button1' && /^allow control$/i.test(node.text),30000);
     const grant=await fixture.take('control-response',30000);
     assert.equal(grant.from,fixture.peerId);assert.equal(grant.accepted,true);
     await findNode(node=>node['content-desc']==='Stop remote control immediately',30000);
