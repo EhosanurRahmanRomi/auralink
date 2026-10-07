@@ -16,10 +16,15 @@ const browserPath = [process.env.AURALINK_TEST_BROWSER, 'C:/Program Files (x86)/
   '/usr/bin/chromium', '/usr/bin/google-chrome'].filter(Boolean).find(file => fs.existsSync(file));
 if (!browserPath) throw new Error('Install Edge/Chrome or set AURALINK_TEST_BROWSER.');
 
-async function hostFixture(broker) {
+async function hostFixture(broker, getPhase, reportError) {
   const ws = new WebSocket(broker.url.replace(/^http/, 'ws') + '/ws', { rejectUnauthorized: false });
-  const host = { ws, page: null, ready: false, inbox: [], waiters: [], signals: [], chain: Promise.resolve() };
-  host.send = packet => ws.send(JSON.stringify(packet));
+  const host = { ws, page: null, ready: false, stopping: false, inbox: [], waiters: [], signals: [], chain: Promise.resolve() };
+  host.send = packet => {
+    if (host.stopping) return false;
+    if (ws.readyState !== WebSocket.OPEN) { reportError(`${getPhase()}: fixture socket closed before signaling completed`); return false; }
+    ws.send(JSON.stringify(packet), error => { if (error) reportError(`${getPhase()}: fixture send failed: ${error.message}`); });
+    return true;
+  };
   host.take = type => {
     const index = host.inbox.findIndex(packet => packet.type === type);
     if (index >= 0) return Promise.resolve(host.inbox.splice(index, 1)[0]);
@@ -27,25 +32,41 @@ async function hostFixture(broker) {
       const waiter = { type, resolve }; waiter.timer = setTimeout(() => reject(new Error(`No ${type} received`)), 10000); host.waiters.push(waiter);
     });
   };
-  host.deliver = packet => { host.chain = host.chain.then(() => host.page.evaluate(packet => rtc.receive(packet.from, packet.data), packet)); };
-  ws.on('message', raw => {
+  host.deliver = packet => {
+    if (host.stopping) return;
+    const queuedPhase = getPhase();
+    host.chain = host.chain.then(() => host.page.evaluate(packet => rtc.receive(packet.from, packet.data), packet))
+      .catch(error => { reportError(`${queuedPhase}: fixture signal delivery failed: ${error.message}`); });
+  };
+  const receive = raw => {
     const packet = JSON.parse(raw.toString());
     if (packet.type === 'signal') { if (host.ready) host.deliver(packet); else host.signals.push(packet); return; }
     const index = host.waiters.findIndex(waiter => waiter.type === packet.type);
     if (index >= 0) { const waiter = host.waiters.splice(index, 1)[0]; clearTimeout(waiter.timer); waiter.resolve(packet); }
     else host.inbox.push(packet);
-  });
+  };
+  ws.on('message', receive);
+  ws.on('error', error => { if (!host.stopping) reportError(`${getPhase()}: fixture socket failed: ${error.message}`); });
+  host.stop = async () => {
+    host.stopping = true; host.ready = false; host.signals.length = 0;
+    ws.off('message', receive);
+    for (const waiter of host.waiters) clearTimeout(waiter.timer);
+    host.waiters.length = 0;
+    if (ws.readyState !== WebSocket.CLOSED) await new Promise(resolve => { ws.once('close', resolve); ws.terminate(); });
+    await host.chain;
+  };
   await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   host.send({ type: 'join', name: 'Desktop controller fixture', roomKey: broker.roomKey, hostToken: broker.hostToken }); host.id = (await host.take('welcome')).selfId; return host;
 }
 
 async function main() {
   const output = path.resolve(__dirname, '..', 'test-results'); fs.mkdirSync(output, { recursive: true });
-  let broker; let browser; let host; let phase = 'setup'; const errors = []; const contexts = [];
+  let broker; let browser; let host; let phone; let result; let failure; let phase = 'setup'; const errors = []; const contexts = [];
+  const reportError = message => { errors.push(message); console.error(message); };
   try {
     const cert = await selfsigned.generate([{ name: 'commonName', value: 'localhost' }], { keySize: 2048, algorithm: 'sha256' });
     broker = await createBroker({ host: '127.0.0.1', name: 'Phone screen QA', tls: { key: cert.private, cert: cert.cert }, assetsDir: path.resolve(__dirname, '..', 'src', 'renderer') });
-    host = await hostFixture(broker);
+    host = await hostFixture(broker, () => phase, reportError);
     browser = await chromium.launch({ executablePath: browserPath, headless: true, args: ['--autoplay-policy=no-user-gesture-required', '--disable-features=WebRtcHideLocalIpsWithMdns'] });
     const desktop = await browser.newContext({ ignoreHTTPSErrors: true });
     const mobile = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true }); contexts.push(desktop, mobile);
@@ -77,7 +98,7 @@ async function main() {
         onEmergencyStop: listener => { fixture.emergency = listener; return () => {}; },
       });
     });
-    host.page = await desktop.newPage(); const phone = await mobile.newPage();
+    host.page = await desktop.newPage(); phone = await mobile.newPage();
     for (const page of [host.page, phone]) page.on('pageerror', error => errors.push(error.message));
     await host.page.exposeFunction('fixtureSignal', (to, data) => host.send({ type: 'signal', to, data }));
     await host.page.goto(broker.url + '/health');
@@ -129,13 +150,26 @@ async function main() {
     await assert.rejects(phone.waitForFunction(() => qaPhone.inputs.length > 1, undefined, { timeout: 350 }), /Timeout/);
     phase = 'projection stop'; await phone.locator('#share-button').click(); await host.page.waitForFunction(() => !document.getElementById('phone-screen'));
     await phone.waitForFunction(() => !qaPhone.timer && !qaPhone.frame);
-    const result = { passed: true, environment: 'Real HTTPS broker and RTC engine; mobile UI; explicit native Android bridge fixture producing720x1280JPEG frames',
+    result = { passed: true, environment: 'Real HTTPS broker and RTC engine; mobile UI; explicit native Android bridge fixture producing720x1280JPEG frames',
       verified: ['no projection on join', 'phone share button calls native consent contract', 'quality and current microphone/camera flags passed', 'frames decode into canvas and ack',
         'desktop actually decodes portrait RTP video', 'bad JPEG acknowledged and following frames recover', 'phone accepts control only after explicit review', 'approved input bound to remote peer/session', 'owner revocation rejects late input', 'stop releases stream and frame subscription'],
       limitations: ['Native projection approval, Accessibility and Android background lifecycle are fixtures; a physical phone test is required'], decoded, errors };
     assert.deepEqual(errors, []); assert.deepEqual(await host.page.evaluate(() => fixtureErrors), []);
-    fs.writeFileSync(path.join(output, 'phone-share-browser.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
-  } catch (error) { throw new Error(`${phase}: ${error.stack}`); }
-  finally { for (const context of contexts) await context.close().catch(() => {}); await browser?.close(); host?.ws.terminate(); await broker?.stop(); }
+  } catch (error) { failure = new Error(`${phase}: ${error.stack}`); }
+  finally {
+    phase = 'fixture shutdown';
+    const cleanup = async (label, action) => { try { await action(); } catch (error) { reportError(`${phase}: ${label}: ${error.message}`); } };
+    // Stop frame and RTC producers while their pages still exist. Disconnect
+    // signaling and drain every already-enqueued delivery before closing pages.
+    if (phone && !phone.isClosed()) await cleanup('stop projection producer', () => phone.evaluate(() => { clearInterval(qaPhone.timer); qaPhone.timer = null; qaPhone.frame = null; }));
+    if (host?.page && !host.page.isClosed()) await cleanup('stop RTC producer', () => host.page.evaluate(() => window.rtc?.close()));
+    if (host) await cleanup('drain fixture signaling', () => host.stop());
+    for (const context of contexts) await cleanup('close browser context', () => context.close());
+    if (browser) await cleanup('close browser', () => browser.close());
+    if (broker) await cleanup('stop broker', () => broker.stop());
+  }
+  if (failure) throw failure;
+  assert.deepEqual(errors, [], 'No active-phase or shutdown fixture failures may be hidden');
+  fs.writeFileSync(path.join(output, 'phone-share-browser.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

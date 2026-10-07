@@ -116,6 +116,26 @@ async function tapStable(predicate,timeout=30000) {
   }while(Date.now()<deadline);
   throw new Error(`Android action did not expose stable visible bounds during ${phase}`);
 }
+async function tapRoomAction(predicate,timeout=30000) {
+  // A WebView accessibility node may extend below the fixed bottom navigation.
+  // Scroll the actual app until the whole action is visible, then recheck its
+  // bounds. Tapping a clipped node's centre can activate navigation instead.
+  const deadline=Date.now()+timeout;let previous;
+  do {
+    const nodes=await hierarchy();
+    const node=nodes.find(predicate);
+    const bounds=node?.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);
+    const navigation=nodes.find(value=>label('Rooms')(value) && value.class==='android.widget.Button')?.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);
+    const bottom=navigation ? +navigation[2]-8 : 1147;
+    if(bounds && visible(node) && +bounds[2]>=136 && +bounds[4]<=bottom) {
+      if(node.bounds===previous){await tap(node);return node;}
+      previous=node.bounds;await delay(300);continue;
+    }
+    previous=undefined;
+    await adb(['shell','input','swipe','670','1050','670','470','450']);await delay(600);
+  }while(Date.now()<deadline);
+  throw new Error(`Android room action did not become fully visible above navigation during ${phase}`);
+}
 async function keyboardShown() {
   const state=await adb(['shell','dumpsys','input_method']);
   const shown=state.match(/\bmInputShown=(true|false)\b/);
@@ -161,7 +181,7 @@ async function waitInvitationText(expected,timeout=5000) {
 async function typeInvitation(value) {
   assert.ok(/^[\x21-\x7e]+$/.test(value),'The private test invitation must use printable ASCII');
   const attempts=[];
-  for(const chunkSize of [8,1]) {
+  for(const verifyEvery of [8,1]) {
     await focusInvitation();
     if(attempts.length) {
       // Real Android keyboard events only; never write the WebView DOM or
@@ -171,13 +191,16 @@ async function typeInvitation(value) {
       assert.ok((await waitInvitationText('')).matched,'Android invitation field must clear before retrying text input');
     }
     let result={matched:false,actual:''};let submittedLength=0;
-    for(let offset=0;offset<value.length;offset+=chunkSize) {
-      const chunk=value.slice(offset,offset+chunkSize);await type(chunk);submittedLength+=chunk.length;
-      await delay(150);
+    for(let offset=0;offset<value.length;offset++) {
+      // Android's shell input text emits a whole string too quickly for this
+      // cold WebView. Pace real key events and verify bounded prefixes.
+      await type(value[offset]);submittedLength++;
+      await delay(100);
+      if(submittedLength%verifyEvery && submittedLength!==value.length)continue;
       result=await waitInvitationText(value.slice(0,submittedLength));
       if(!result.matched)break;
     }
-    const diagnostic={chunkSize,submittedLength,...invitationInputDiagnostic(value,result.actual)};attempts.push(diagnostic);
+    const diagnostic={charactersPerInput:1,verifyEvery,submittedLength,...invitationInputDiagnostic(value,result.actual)};attempts.push(diagnostic);
     runtimeDiagnostics.invitation={...diagnostic,inputAttempts:attempts};
     if(result.matched && submittedLength===value.length)return;
   }
@@ -195,7 +218,7 @@ async function audioMode(expected,timeout=15000) {
 }
 async function startPhoneAudio(fixture) {
   phase='actual Android microphone permission and RTP';console.log(phase);
-  await tap(await findNode(label('Turn microphone on')));
+  await tapRoomAction(label('Turn microphone on'));
   const permission=await findNode(node=>node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
   await screenshot('android-emulator-microphone-permission.png');await tap(permission);
   await findNode(label('Turn microphone off'),30000);
@@ -349,7 +372,7 @@ async function runUI(fixture) {
   const audio=await startPhoneAudio(fixture);
   checkpoint('actualAudioTransport',audio);
   phase='Android owner screen permission';console.log(phase);
-  await tap(await findNode(label('Share screen')));
+  await tapRoomAction(label('Share screen'));
   const systemCaptureButton=node=>node.package==='com.android.systemui' && node.class==='android.widget.Button' && /^(Start now|Start recording|Start sharing|Share screen)$/i.test(node.text);
   let permission=await findNode(node=>systemCaptureButton(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button',30000);
   if(permission['resource-id']==='com.android.permissioncontroller:id/permission_allow_button') {
@@ -380,11 +403,14 @@ async function runUI(fixture) {
     await findNode(node=>node['content-desc']==='Stop remote control immediately',30000);
     checkpoint('separateNativeControlApproved');
     phase='actual Android Accessibility input';console.log(phase);
+    const homeComponent=(await adb(['shell','cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.HOME'])).trim().split(/\r?\n/).find(line=>/^[\w.]+\//.test(line));
+    assert.ok(homeComponent,'The isolated Android emulator must expose a HOME activity');
+    const homePackage=homeComponent.split('/')[0];
     await fixture.page.evaluate(({peerId,sessionId})=>{
       const send=event=>rtc.sendData(peerId,{type:'input',sessionId,event});
       send({type:'keydown',code:'Home',seq:1});send({type:'keyup',code:'Home',seq:2});
     },{peerId:fixture.peerId,sessionId:grant.sessionId});
-    await findNode(node=>node.package==='com.google.android.apps.nexuslauncher',30000);
+    await findNode(node=>node.package===homePackage,30000);
     await screenshot('android-emulator-remotely-opened-home.png');
     assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/,'Attended control must keep the explicitly approved projection active');
     checkpoint('realRemoteHomeWithProjectionActive');
@@ -401,16 +427,16 @@ async function runUI(fixture) {
     checkpoint('ownerControlRevokeAndStaleInputRejected');
     control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
   }
-  await tap(await findNode(node=>/Stop sharing|Stop screen sharing/.test(node['content-desc']) || node.text==='Stop sharing',20000));
+  await tapRoomAction(node=>/Stop sharing|Stop screen sharing/.test(node['content-desc']) || node.text==='Stop sharing',20000);
   await delay(1500);
   const stopped=await adb(['shell','dumpsys','media_projection']);
   assert.ok(!stopped.includes('local.auralink.mobile'),'Stopping share must remove MediaProjection');
   checkpoint('ownerScreenStopReleasedProjection');
   phase='owner microphone stop and call audio cleanup';console.log(phase);
-  await tap(await findNode(label('Turn microphone off')));
+  await tapRoomAction(label('Turn microphone off'));
   await findNode(label('Turn microphone on'));
   await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.remoteState.audio===false,fixture.peerId,{timeout:15000});
-  await tap(await findNode(label('Leave room')));
+  await tapRoomAction(label('Leave room'));
   await findNode(label('Enter invitation'));
   await audioMode('MODE_NORMAL');
   audio.checks.push('Owner microphone stop updates receiver media state','Leaving the room releases Android communication audio mode');
