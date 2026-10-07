@@ -133,7 +133,56 @@ function visible(node) {
   return bounds && +bounds[3]>+bounds[1] && +bounds[4]>+bounds[2] && +bounds[2]<1147 && +bounds[4]>136;
 }
 async function screenshot(name) {fs.writeFileSync(path.join(output,name),await adb(['exec-out','screencap','-p'],{encoding:null}));}
-async function type(value) {assert.ok(!value.includes("'"));await adb(['shell',`input text '${value.replaceAll(' ','%s')}'`]);}
+async function type(value) {
+  assert.ok(!value.includes("'"));
+  try {await adb(['shell',`input text '${value.replaceAll(' ','%s')}'`]);}
+  catch {throw new Error('Android text injection command failed; private input omitted');}
+}
+function invitationInputDiagnostic(expected,actual) {
+  let firstMismatchIndex=0;
+  while(firstMismatchIndex<Math.min(expected.length,actual.length) && expected[firstMismatchIndex]===actual[firstMismatchIndex])firstMismatchIndex++;
+  let originMatches=false,keyLength=0,fingerprintLength=0;
+  try {
+    const parsed=new URL(actual);originMatches=parsed.origin===new URL(expected).origin;
+    const parameters=new URLSearchParams(parsed.hash.slice(1));keyLength=parameters.get('key')?.length || 0;fingerprintLength=parameters.get('fp')?.length || 0;
+  }catch{}
+  return {expectedLength:expected.length,enteredLength:actual.length,exactTextMatches:actual===expected,
+    firstMismatchIndex:actual===expected?null:firstMismatchIndex,enteredIsExpectedPrefix:expected.startsWith(actual),originMatches,keyLength,fingerprintLength};
+}
+async function waitInvitationText(expected,timeout=5000) {
+  const deadline=Date.now()+timeout;let actual='';
+  do {
+    const field=(await hierarchy()).find(node=>node['resource-id']==='join-invite');actual=field?.text || '';
+    if(actual===expected)return {matched:true,actual};
+    await delay(150);
+  }while(Date.now()<deadline);
+  return {matched:false,actual};
+}
+async function typeInvitation(value) {
+  assert.ok(/^[\x21-\x7e]+$/.test(value),'The private test invitation must use printable ASCII');
+  const attempts=[];
+  for(const chunkSize of [8,1]) {
+    await focusInvitation();
+    if(attempts.length) {
+      // Real Android keyboard events only; never write the WebView DOM or
+      // bypass the production invitation parser/native certificate check.
+      await adb(['shell','input','keycombination','113','29']);
+      await adb(['shell','input','keyevent','67']);
+      assert.ok((await waitInvitationText('')).matched,'Android invitation field must clear before retrying text input');
+    }
+    let result={matched:false,actual:''};let submittedLength=0;
+    for(let offset=0;offset<value.length;offset+=chunkSize) {
+      const chunk=value.slice(offset,offset+chunkSize);await type(chunk);submittedLength+=chunk.length;
+      await delay(150);
+      result=await waitInvitationText(value.slice(0,submittedLength));
+      if(!result.matched)break;
+    }
+    const diagnostic={chunkSize,submittedLength,...invitationInputDiagnostic(value,result.actual)};attempts.push(diagnostic);
+    runtimeDiagnostics.invitation={...diagnostic,inputAttempts:attempts};
+    if(result.matched && submittedLength===value.length)return;
+  }
+  throw new Error('Android text input must preserve the complete invitation exactly after paced input and one cleared retry');
+}
 async function audioMode(expected,timeout=15000) {
   const deadline=Date.now()+timeout;
   do {
@@ -281,11 +330,7 @@ async function runUI(fixture) {
   await screenshot('android-emulator-invitation-dialog.png');
   checkpoint('invitationDialogRendered');
   console.log('Production invitation dialog exposes both Android text inputs');
-  await focusInvitation();
-  await type(fixture.invite);
-  const typed=await hierarchy();const entered=typed.find(node=>node['resource-id']==='join-invite');
-  runtimeDiagnostics.invitation={expectedLength:fixture.invite.length,enteredLength:entered?.text?.length || 0,exactTextMatches:entered?.text===fixture.invite};
-  assert.ok(entered?.text===fixture.invite,'Android text input must preserve the complete invitation exactly');
+  await typeInvitation(fixture.invite);
   // Back may exit the Activity if a hardware keyboard suppressed the IME.
   // Dismiss it only when Android actually exposes its input view as visible.
   runtimeDiagnostics.invitation.keyboardVisible=await keyboardShown();
