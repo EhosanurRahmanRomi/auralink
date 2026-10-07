@@ -242,16 +242,16 @@ async function startPhoneAudio(fixture) {
     runtimeTone.frequency.value=880;gain.gain.value=0.025;runtimeTone.connect(gain).connect(destination);runtimeTone.start();
     await runtimeToneContext.resume();await rtc.setTrack('audio',destination.stream.getAudioTracks()[0],destination.stream);
   });
-  await fixture.page.waitForFunction(async id=>{
+  const acknowledgedSnapshot=await fixture.page.waitForFunction(async id=>{
     const entry=rtc.peers.get(id);if(!entry)return false;
-    return [...(await entry.pc.getStats()).values()].some(row=>row.type==='remote-inbound-rtp' && row.kind==='audio' && row.roundTripTimeMeasurements>0);
+    const rows=[...(await entry.pc.getStats()).values()];
+    const sent=rows.find(row=>row.type==='outbound-rtp' && row.kind==='audio' && row.packetsSent>0);
+    const acknowledged=rows.find(row=>row.type==='remote-inbound-rtp' && row.kind==='audio' && row.roundTripTimeMeasurements>0);
+    return sent && acknowledged ? {packetsSent:sent.packetsSent,roundTripTimeMeasurements:acknowledged.roundTripTimeMeasurements,roundTripTime:acknowledged.roundTripTime} : false;
   },fixture.peerId,{timeout:45000});
-  const outgoing=await fixture.page.evaluate(async id=>{
-    const rows=[...(await rtc.peers.get(id).pc.getStats()).values()];
-    const sent=rows.find(row=>row.type==='outbound-rtp' && row.kind==='audio');
-    const acknowledged=rows.find(row=>row.type==='remote-inbound-rtp' && row.kind==='audio');
-    return {packetsSent:sent.packetsSent,roundTripTimeMeasurements:acknowledged.roundTripTimeMeasurements,roundTripTime:acknowledged.roundTripTime};
-  },fixture.peerId);
+  // Keep the same successful stats snapshot. A later report can omit a
+  // transient remote-inbound row while transceivers finish renegotiation.
+  const outgoing=await acknowledgedSnapshot.jsonValue();await acknowledgedSnapshot.dispose();
   checkpoint('syntheticHostAudioAcknowledgedByAndroid',outgoing);
   await screenshot('android-emulator-audio-active.png');
   return {passed:true,phoneToHost:incoming,syntheticHostToPhone:outgoing,mode:'MODE_IN_COMMUNICATION',checks:['Native Android microphone permission approved by the test owner','Live WebView microphone track sends increasing encrypted RTP packets','Synthetic host tone RTP acknowledged by actual Android receiver','Actual Android communication audio mode'],physicalMicrophoneAndSpeakerVerified:false};
