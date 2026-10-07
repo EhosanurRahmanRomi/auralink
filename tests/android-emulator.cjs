@@ -414,18 +414,23 @@ async function runUI(fixture) {
     await screenshot('android-emulator-remotely-opened-home.png');
     assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/,'Attended control must keep the explicitly approved projection active');
     checkpoint('realRemoteHomeWithProjectionActive');
+    const backgroundFrames=await fixture.page.locator('#received-screen').evaluate(video=>video.getVideoPlaybackQuality().totalVideoFrames);
+    await fixture.page.waitForFunction(first=>document.getElementById('received-screen')?.getVideoPlaybackQuality().totalVideoFrames>first+3,backgroundFrames,{timeout:20000});
+    checkpoint('screenFramesContinueWhilePhoneShowsHome');
     await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
     await tap(await findNode(node=>node['content-desc']==='Stop remote control immediately',30000));
     await fixture.take('control-revoke',30000);
-    await fixture.page.evaluate(({peerId,sessionId})=>{
-      rtc.sendData(peerId,{type:'input',sessionId,event:{type:'keydown',code:'Home',seq:3}});
-      rtc.sendData(peerId,{type:'input',sessionId,event:{type:'keyup',code:'Home',seq:4}});
+    await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.channel?.readyState==='open',fixture.peerId,{timeout:15000});
+    const staleSent=await fixture.page.evaluate(({peerId,sessionId})=>{
+      return [rtc.sendData(peerId,{type:'input',sessionId,event:{type:'keydown',code:'Home',seq:3}}),
+        rtc.sendData(peerId,{type:'input',sessionId,event:{type:'keyup',code:'Home',seq:4}})];
     },{peerId:fixture.peerId,sessionId:grant.sessionId});
+    assert.deepEqual(staleSent,[true,true],'The stale-session test must actually send both input packets');
     await delay(1000);
     const resumed=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
     assert.match(resumed || '',/local\.auralink\.mobile/,'Revoked input must not reopen Home');
     checkpoint('ownerControlRevokeAndStaleInputRejected');
-    control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
+    control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','New screen frames still decode while the phone shows Home','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
   }
   await tapRoomAction(node=>/Stop sharing|Stop screen sharing/.test(node['content-desc']) || node.text==='Stop sharing',20000);
   await delay(1500);
@@ -445,7 +450,9 @@ async function runUI(fixture) {
   assert.match(processId,/^\d+$/,'The actual Android app must remain alive after sharing');
   const fatal=(await adb(['shell','logcat','-d',`--pid=${processId}`,'-s','AndroidRuntime:E'])).trim();
   assert.ok(!fatal.includes('FATAL EXCEPTION'),fatal);
+  await fixture.chain;
   assert.deepEqual(fixture.errors,[]);
+  assert.deepEqual(await fixture.page.evaluate(()=>runtimeErrors),[]);
   const sourceCheck=path.join(project,'.tools','runtime-source-check.json');
   return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,source:fs.existsSync(sourceCheck)?JSON.parse(fs.readFileSync(sourceCheck,'utf8')):null,diagnostics:runtimeDiagnostics,verifiedStages,screen,control,audio,
     verified:['Production non-debuggable APK installed and loaded','Native pinned TLS room admission','Owner Android system projection consent','Actual MediaProjection screen frames decoded over WebRTC','Foreground sharing service','Owner share stop releases projection','No fatal Android runtime exception'],
@@ -477,10 +484,16 @@ async function main() {
     }catch{}
     fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:safeError(error),verifiedStages,diagnostics:runtimeDiagnostics,network:fixture?.network,ui:diagnostics},null,2));throw new Error(safeError(error));
   }finally {
+    if(fixture){
+      // Stop accepting signaling before closing either endpoint, then finish
+      // every active-phase delivery while its receiver page is still alive.
+      fixture.ws.removeAllListeners('message');
+      try{fixture.ws.close();}catch{}
+      await fixture.chain;
+    }
     if(!process.argv.includes('--fixture-only')) await adb(['shell','am','force-stop','local.auralink.mobile']).catch(()=>{});
     if(fixture){
       for(const waiter of fixture.waiters)clearTimeout(waiter.timer);
-      try{fixture.ws.close();}catch{}
       await fixture.browser?.close().catch(()=>{});
       await fixture.broker.stop().catch(()=>{});
     }

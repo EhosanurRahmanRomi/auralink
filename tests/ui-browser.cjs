@@ -94,6 +94,34 @@ async function receiverProof(page, peerName) {
   return { receiverOf: peerName, video, statistics: statsText };
 }
 
+async function mobileCallActionsProof(page) {
+  const layouts = [];
+  for (const viewport of [{ width: 412, height: 915 }, { width: 360, height: 640 }, { width: 480, height: 730 }]) {
+    await page.setViewportSize(viewport);
+    const layout = await page.evaluate(() => {
+      const box = element => { const { top, right, bottom, left, width, height } = element.getBoundingClientRect(); return { top, right, bottom, left, width, height }; };
+      const buttons = ['mic-button', 'camera-button', 'share-button', 'request-control', 'end-button'].map(id => {
+        const element = document.getElementById(id); const bounds = box(element);
+        return { id, ...bounds, centreUnobstructed: element.contains(document.elementFromPoint((bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2)) };
+      });
+      return { width: innerWidth, height: innerHeight, scrollY, overflow: document.documentElement.scrollWidth - innerWidth,
+        navigation: box(document.querySelector('.sidebar')), controls: box(document.querySelector('.call-controls')), stage: box(document.getElementById('stage')), buttons };
+    });
+    assert.equal(layout.scrollY, 0, 'Admission must expose primary phone call actions without scrolling');
+    assert.ok(layout.overflow <= 1, 'The phone room must not overflow horizontally');
+    assert.ok(layout.controls.bottom <= layout.navigation.top, 'The call panel must remain above fixed phone navigation');
+    assert.ok(layout.controls.bottom <= layout.stage.top, 'Phone call actions must precede the large video stage');
+    for (const button of layout.buttons) {
+      assert.ok(button.top >= 0 && button.bottom <= layout.navigation.top && button.left >= 0 && button.right <= layout.width,
+        `${button.id} must be fully visible above phone navigation at ${viewport.width}x${viewport.height}`);
+      assert.ok(button.centreUnobstructed, `${button.id} must have an unobstructed touch target`);
+    }
+    layouts.push(layout);
+  }
+  await page.setViewportSize({ width: 412, height: 915 });
+  return layouts;
+}
+
 async function main() {
   let broker, browser;
   let phase = 'setup'; let desktopPage; let mobilePage;
@@ -133,6 +161,7 @@ async function main() {
     assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Mobile lobby overflows horizontally');
     phase = 'desktop UI admission'; await joinUI(desktop, invite, 'Desktop UI QA', host);
     phase = 'mobile UI admission'; await joinUI(mobile, invite, 'Mobile UI QA', host);
+    phase = 'mobile call actions above navigation'; const mobileCallActions = await mobileCallActionsProof(mobile);
     phase = 'fake camera activation';
     await desktop.locator('#camera-button').click(); await mobile.locator('#camera-button').click();
     await desktop.waitForFunction(() => document.getElementById('camera-button').getAttribute('aria-label') === 'Turn camera off');
@@ -200,7 +229,7 @@ async function main() {
         'no capture API requested before approval or automatically on admission; explicit camera click invokes capture',
         'both UI clients decode fake camera frames', 'DOM displays live received resolution and direct UDP route', 'four-person limit and fifth request refusal',
         'received codec displayed from actual stats', 'fullscreen enter/exit', 'fake camera and microphone equipment enumeration and camera preference saved locally',
-        'host rejection returns UI to lobby', '412x915 mobile layout has no horizontal overflow', 'no browser JavaScript errors'], received, errors };
+        'host rejection returns UI to lobby', '412x915 mobile layout has no horizontal overflow', 'phone microphone/share/leave actions visible above navigation without scrolling at three viewport sizes', 'no browser JavaScript errors'], received, mobileCallActions, errors };
     await fs.promises.writeFile(path.join(outputDir, 'ui-browser.json'), JSON.stringify(result, null, 2));
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {

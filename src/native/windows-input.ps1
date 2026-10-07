@@ -138,6 +138,12 @@ if ($ValidateOnly) {
     exit 0
 }
 [AuraInput]::Initialize()
+# Cold PowerShell can spend longer than the release-ack deadline loading JSON
+# cmdlets. Complete that startup work before advertising readiness. This only
+# releases the helper's empty tracking sets; it never injects a key or pointer.
+$warmPacket = '{"type":"release","id":0}' | ConvertFrom-Json
+$warmResponse = @{ type='ack'; id=$warmPacket.id; ok=$true } | ConvertTo-Json -Compress
+[AuraInput]::ReleaseAll()
 [Console]::Out.WriteLine('{"type":"ready","available":true}')
 [Console]::Out.Flush()
 try {
