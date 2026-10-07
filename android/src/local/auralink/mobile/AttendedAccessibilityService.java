@@ -35,6 +35,10 @@ public final class AttendedAccessibilityService extends AccessibilityService {
     private long pointerStarted;
     private boolean dragMoved;
     private int pointerPoints;
+    private boolean gestureBusy;
+    private long gestureGeneration;
+    private Path queuedGesture;
+    private long queuedDuration;
     private final Runnable expiry = () -> revoke("Control approval expired. Approve a new request to continue.");
 
     static AttendedAccessibilityService current() { return instance; }
@@ -63,7 +67,7 @@ public final class AttendedAccessibilityService extends AccessibilityService {
     String controller() { return policy.peerId(); }
     void revoke(String reason) {
         boolean wasActive = policy.peerId() != null;
-        policy.revoke(); main.removeCallbacks(expiry); keys.clear(); pointer = null; dragMoved = false;
+        policy.revoke(); gestureGeneration++; main.removeCallbacks(expiry); keys.clear(); pointer = null; dragMoved = false; queuedGesture = null;
         if (stopButton != null) { try { windows.removeView(stopButton); } catch (Exception ignored) { } stopButton = null; }
         StopListener previous = listener; listener = null;
         if (wasActive && previous != null) previous.stopped(reason);
@@ -105,7 +109,7 @@ public final class AttendedAccessibilityService extends AccessibilityService {
             if (pointer != null && Math.hypot(x - pointerX, y - pointerY) > 2) { pointer.lineTo(x, y); pointerX = x; pointerY = y; dragMoved = true; pointerPoints++; }
             if ("up".equals(type)) {
                 Path path = pointer; pointer = null;
-                long duration = Math.min(1500, Math.max(dragMoved ? 100 : 50, SystemClock.elapsedRealtime() - pointerStarted));
+                long duration = Math.min(500, Math.max(dragMoved ? 100 : 50, SystemClock.elapsedRealtime() - pointerStarted));
                 return gesture(path, duration);
             }
             return true;
@@ -128,7 +132,23 @@ public final class AttendedAccessibilityService extends AccessibilityService {
         return edit(code);
     }
     private boolean gesture(Path path, long duration) {
-        return dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path, 0, duration)).build(), null, main);
+        if (gestureBusy) { queuedGesture = path; queuedDuration = duration; return true; }
+        gestureBusy = true;
+        final long dispatchGeneration = gestureGeneration;
+        boolean sent = dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path, 0, duration)).build(), new GestureResultCallback() {
+            @Override public void onCompleted(GestureDescription gesture) {
+                gestureBusy = false;
+                if (queuedGesture != null && active() && confirmed() && ScreenShareService.activeFullDisplay() && !locked()) {
+                    Path next = queuedGesture; long time = queuedDuration; queuedGesture = null; gesture(next, time);
+                } else queuedGesture = null;
+            }
+            @Override public void onCancelled(GestureDescription gesture) {
+                gestureBusy = false; queuedGesture = null;
+                if (dispatchGeneration == gestureGeneration && active()) revoke("Phone interaction interrupted the remote gesture. Approve again to continue.");
+            }
+        }, main);
+        if (!sent) gestureBusy = false;
+        return sent;
     }
     private boolean supportedKey(String code) {
         return code.matches("Key[A-Z]|Digit[0-9]") || code.matches("ShiftLeft|ShiftRight|Space|Backspace|Delete|Enter|ArrowLeft|ArrowRight|Escape|Home|End|Minus|Equal|BracketLeft|BracketRight|Backslash|Semicolon|Quote|Comma|Period|Slash|Backquote");

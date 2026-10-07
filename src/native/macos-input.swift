@@ -134,7 +134,7 @@ if CommandLine.arguments.contains("--self-test") {
     let checks = [
         validPoint(CGPoint(x: -1920, y: 0)),
         validPoint(CGPoint(x: 262144, y: -262144)),
-        !validPoint(CGPoint(x: .infinity, y: 0)),
+        !validPoint(CGPoint(x: CGFloat.infinity, y: 0)),
         !validPoint(CGPoint(x: 262145, y: 0)),
         modifierFlags([]).isEmpty,
         modifierFlags(["MetaLeft"]).contains(.maskCommand),

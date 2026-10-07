@@ -104,6 +104,9 @@ async function sourcePolicies() {
   const transport = activity.slice(activity.indexOf('private boolean localDocument()'), activity.indexOf('private final class NativeBridge'));
   assert.match(transport, /localDocument\(\)\s*&&\s*\(ScreenShareService\.active\(\)\s*\|\|\s*projectionStarting\)/, 'Projection exception requires the exact bundled document and active or starting service');
   assert.match(activity, /main\.postDelayed\(projectionDeadline,\s*120000\)/, 'Owned projection prompt has a bounded deadline');
+  assert.match(activity, /Manifest\.permission\.POST_NOTIFICATIONS/, 'Screen sharing requests an optional visible stop notification');
+  assert.match(activity, /code\s*==\s*43\s*&&\s*projectionRequest\s*!=\s*null/, 'Notification result is bound to a still-pending owner screen request');
+  assert.match(activity, /notificationAvailable/, 'Native screen descriptor tells the renderer when the stop notification is unavailable');
   const approval = activity.slice(activity.indexOf('private void grantControl'), activity.indexOf('private void requestMedia'));
   assert.match(approval, /!trustedPage\(\)/, 'Native owner approval is unavailable in the background');
   assert.match(approval, /!approvedPeers\.contains\(peerId\)/, 'Native owner approval requires a broker-admitted peer');
@@ -129,7 +132,7 @@ async function sourcePolicies() {
   assert.match(manifest, /android:usesCleartextTraffic="false"/, 'Cleartext network traffic is disabled');
   assert.match(manifest, /android:allowBackup="false"/, 'Invitation/session data is excluded from backup');
   const permissions = [...manifest.matchAll(/<uses-permission\s+android:name="([^"]+)"/g)].map(match => match[1]);
-  for (const permission of permissions) assert.ok(['android.permission.INTERNET', 'android.permission.CAMERA', 'android.permission.RECORD_AUDIO', 'android.permission.MODIFY_AUDIO_SETTINGS', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION', 'android.permission.FOREGROUND_SERVICE_MICROPHONE', 'android.permission.FOREGROUND_SERVICE_CAMERA'].includes(permission), 'Unexpected Android privilege: ' + permission);
+  for (const permission of permissions) assert.ok(['android.permission.INTERNET', 'android.permission.CAMERA', 'android.permission.RECORD_AUDIO', 'android.permission.MODIFY_AUDIO_SETTINGS', 'android.permission.ACCESS_NETWORK_STATE', 'android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION', 'android.permission.FOREGROUND_SERVICE_MICROPHONE', 'android.permission.FOREGROUND_SERVICE_CAMERA', 'android.permission.POST_NOTIFICATIONS'].includes(permission), 'Unexpected Android privilege: ' + permission);
   for (const permission of ['android.permission.INTERNET', 'android.permission.CAMERA', 'android.permission.RECORD_AUDIO']) assert.ok(permissions.includes(permission), 'Required call permission missing');
   evidence.checks.sourcePolicies = { passed: true, label: 'Static source assertions, not WebView runtime verification', permissions, permissionPausePolicy: 'Exact local document; owned bounded screen consent or media prompt; active approved projection can continue existing transport and gated input; no background invitation, new capture or owner approval; input confirmation, expiry, rate and replay checks also exercised in production JVM policy' };
 }

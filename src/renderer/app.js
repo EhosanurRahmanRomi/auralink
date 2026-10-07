@@ -614,6 +614,7 @@ $('mic-button').addEventListener('click', () => toggleMedia('audio'));
 $('camera-button').addEventListener('click', () => toggleMedia('camera'));
 async function toggleMedia(kind) {
   if (!state.joined || state.mediaPending.has(kind)) return;
+  const rtc = state.rtc;
   state.mediaPending.add(kind);
   prepareListening();
   const button = $(kind === 'audio' ? 'mic-button' : 'camera-button'); button.disabled = true;
@@ -625,7 +626,7 @@ async function toggleMedia(kind) {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera and microphone require a trusted HTTPS connection and browser support.');
       const stream = await captureMedia(kind);
       const track = stream.getTracks()[0];
-      if (!state.joined) { stream.getTracks().forEach((item) => item.stop()); return; }
+      if (!state.joined || state.rtc !== rtc) { stream.getTracks().forEach((item) => item.stop()); return; }
       state.local.set(kind, { track, stream }); await state.rtc.setTrack(kind, track, stream);
       if (kind === 'audio') { stopMicrophoneMonitor(); state.microphoneMonitor = startMicrophoneMonitor(stream); await updatePhoneAudioRoute(); }
       await refreshDevices();
@@ -661,7 +662,10 @@ $('share-button').addEventListener('click', async () => {
     if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen capture is unavailable in this browser. Use the Android companion or a desktop app to share your screen.');
     if (bridge?.sources && bridge?.chooseScreen) await pickScreen();
     else await beginSharing();
-  } catch (error) { clearPhoneCapture(); await bridge?.stopScreenShare?.().catch(() => {}); toast(`Screen sharing: ${cleanError(error)}`, true); }
+  } catch (error) {
+    if (state.phoneScreen || state.local.has('screen')) await stopSharing().catch(() => { state.local.delete('screen'); clearPhoneCapture(); });
+    await bridge?.stopScreenShare?.().catch(() => {}); toast(`Screen sharing: ${cleanError(error)}`, true);
+  }
   finally { state.sharingPending = false; updateButtons(); }
 });
 async function pickScreen() {
@@ -690,8 +694,9 @@ function captureConstraints() {
   return { width: { ideal: width, max: width }, height: { ideal: height, max: height }, frameRate: { ideal: 30, max: 30 } };
 }
 async function beginSharing() {
+  const rtc = state.rtc;
   const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 } }, audio: false });
-  if (!state.joined) { stream.getTracks().forEach((track) => track.stop()); return; }
+  if (!state.joined || state.rtc !== rtc) { stream.getTracks().forEach((track) => track.stop()); return; }
   const track = stream.getVideoTracks()[0]; track.contentHint = 'detail';
   try { await track.applyConstraints(captureConstraints()); } catch { /* Use the source's actual capture mode; diagnostics reports it. */ }
   state.local.set('screen', { track, stream }); await state.rtc.setTrack('screen', track, stream);
@@ -701,9 +706,10 @@ async function beginSharing() {
 }
 async function beginPhoneSharing() {
   if (!HTMLCanvasElement.prototype.captureStream) throw new Error('Your Android WebView does not support screen streaming. Update Android System WebView and try again.');
+  const rtc = state.rtc;
   $('share-button').disabled = true;
   const screen = await bridge.startScreenShare({ quality: preferences.quality === '720' || preferences.quality === 'auto' ? '720p' : '1080p', microphone: state.local.has('audio'), camera: state.local.has('camera') });
-  if (!state.joined) { await bridge.stopScreenShare(); return; }
+  if (!state.joined || state.rtc !== rtc) { await bridge.stopScreenShare(); return; }
   const canvas = document.createElement('canvas'); canvas.width = screen.width; canvas.height = screen.height;
   const drawing = canvas.getContext('2d', { alpha: false }); drawing.fillStyle = '#07111c'; drawing.fillRect(0, 0, canvas.width, canvas.height);
   const stream = canvas.captureStream(Math.min(15, screen.fps || 12)); const track = stream.getVideoTracks()[0]; track.contentHint = 'detail';
@@ -1043,6 +1049,12 @@ async function initialize() {
   const browserPlatform = /Android/i.test(navigator.userAgent) ? 'Android browser' : /Macintosh/i.test(navigator.userAgent) ? 'Mac browser' : /Windows/i.test(navigator.userAgent) ? 'Windows browser' : 'Browser client';
   $('profile-platform').textContent = state.nativeInfo?.platform || bridge?.platform || browserPlatform;
   if (bridge?.platform === 'android') {
+    if (preferences.quality === '1440') { preferences.quality = '1080'; savePreferences(); }
+    for (const id of ['quality-select', 'settings-quality']) {
+      const select = $(id); select.value = preferences.quality;
+      const maximum = select.querySelector('option[value="1440"]'); if (maximum) { maximum.disabled = true; maximum.textContent = '1440p · desktop only'; }
+      const phoneMaximum = select.querySelector('option[value="1080"]'); if (phoneMaximum) phoneMaximum.textContent = '1080p · phone maximum';
+    }
     $('profile-platform').textContent = 'Android companion';
     $('host-button').disabled = true; $('host-button').title = 'Create rooms in Auralink for Windows or Mac';
     const caption = $('host-button').parentElement.querySelector('.card-caption');

@@ -60,14 +60,14 @@ try {
     Assert-Verification ($manifest -match 'android:usesCleartextTraffic\(.*?\)=\(type 0x12\)0x0') 'APK must disable cleartext network traffic'
     Assert-Verification ($manifest -match 'android:exported\(.*?\)=\(type 0x12\)0xffffffff') 'APK launcher must be exported'
     $permissions = @([regex]::Matches($badging, "uses-permission: name='([^']+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-    $expectedPermissions = @('android.permission.INTERNET','android.permission.CAMERA','android.permission.RECORD_AUDIO','android.permission.ACCESS_NETWORK_STATE','android.permission.MODIFY_AUDIO_SETTINGS','android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION','android.permission.FOREGROUND_SERVICE_MICROPHONE','android.permission.FOREGROUND_SERVICE_CAMERA' | Sort-Object)
+    $expectedPermissions = @('android.permission.INTERNET','android.permission.CAMERA','android.permission.RECORD_AUDIO','android.permission.ACCESS_NETWORK_STATE','android.permission.MODIFY_AUDIO_SETTINGS','android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION','android.permission.FOREGROUND_SERVICE_MICROPHONE','android.permission.FOREGROUND_SERVICE_CAMERA','android.permission.POST_NOTIFICATIONS' | Sort-Object)
     Assert-Verification (($permissions -join ',') -ceq ($expectedPermissions -join ',')) 'APK permissions differ from the expected calling, capture-service and audio-routing permissions'
     $optionalFeatures = @('android.hardware.camera.any','android.hardware.camera','android.hardware.camera.autofocus','android.hardware.microphone')
     foreach ($feature in $optionalFeatures) {
         Assert-Verification ($badging -match "uses-feature-not-required: name='$([regex]::Escape($feature))'") "APK hardware feature must be optional: $feature"
     }
     $evidence.Manifest = [ordered]@{ Package='local.auralink.mobile'; VersionName=$projectVersion; VersionCode=2; MinimumSDK=29; TargetSDK=36; MainActivity='local.auralink.mobile.MainActivity'; Debuggable=$false; AllowBackup=$false; UsesCleartextTraffic=$false; LauncherExported=$true; Permissions=$permissions; OptionalHardwareFeatures=$optionalFeatures }
-    $evidence.Checks += 'Actual binary manifest has expected package, launcher, SDK levels, non-debuggable/security flags and nine reviewed calling, capture-service and audio-routing permissions'
+    $evidence.Checks += 'Actual binary manifest has expected package, launcher, SDK levels, non-debuggable/security flags and ten reviewed calling, capture-service, notification and audio-routing permissions'
 
     $signature = Invoke-VerificationTool $javaPath @('-jar',$apksignerPath,'verify','--verbose','--print-certs','--min-sdk-version','29',$ApkPath)
     Assert-Verification ($signature -match 'Verified using v3 scheme .*: true') 'APK v3 signature verification failed'

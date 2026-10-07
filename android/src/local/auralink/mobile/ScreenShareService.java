@@ -78,6 +78,12 @@ public final class ScreenShareService extends Service {
     }
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null || STOP.equals(intent.getAction())) { stopSharing("Stopped from the Android notification."); return START_NOT_STICKY; }
+        if (stopping) {
+            Listener waiting;
+            synchronized (ScreenShareService.class) { waiting = pendingListener; cancelPreparation(); }
+            if (waiting != null) waiting.stopped("Previous screen sharing is stopping. Try sharing again in a moment.");
+            stopSelf(); return START_NOT_STICKY;
+        }
         synchronized (ScreenShareService.class) {
             if (running || pendingListener == null || !java.util.Objects.equals(pendingTicket, intent.getStringExtra("ticket"))) { stopSelf(); return START_NOT_STICKY; }
             listener = pendingListener; pendingListener = null; pendingTicket = null;

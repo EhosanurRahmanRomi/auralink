@@ -143,10 +143,10 @@ async function main() {
     phase = 'mobile received video'; const received = [desktopReceived, await receiverProof(mobile, 'Desktop UI QA')];
     phase = 'fullscreen control';
     await desktop.locator('#fullscreen-button').click();
-    await desktop.waitForFunction(() => document.fullscreenElement?.id === 'stage');
+    await desktop.waitForFunction(() => document.fullscreenElement?.id === 'stage' && document.getElementById('fullscreen-button').getAttribute('aria-label') === 'Exit fullscreen');
     assert.equal(await desktop.locator('#fullscreen-button').getAttribute('aria-label'), 'Exit fullscreen');
     await desktop.locator('#fullscreen-button').click();
-    await desktop.waitForFunction(() => !document.fullscreenElement);
+    await desktop.waitForFunction(() => !document.fullscreenElement && document.getElementById('fullscreen-button').getAttribute('aria-label') === 'Enter fullscreen');
     phase = 'media equipment preferences';
     await desktop.locator('[data-view="settings"]').click();
     await desktop.locator('#refresh-devices').click();

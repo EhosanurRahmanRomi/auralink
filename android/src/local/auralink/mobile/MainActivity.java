@@ -70,6 +70,7 @@ public final class MainActivity extends Activity {
     private JSONObject projectionOptions;
     private Intent deferredProjectionConsent;
     private boolean deferredProjectionResult;
+    private boolean notificationLaunchDeferred;
     private int deferredProjectionCode;
     private CallAudio callAudio;
     private AlertDialog controlDialog;
@@ -161,10 +162,9 @@ public final class MainActivity extends Activity {
     private void reject(String id, String error) { deliver(json("requestId", id, "ok", false, "error", error)); }
     private void dispatch(String value) {
         if (!trustedPage()) {
-            // Keep only already-scoped signaling writes and their responses
-            // during our own OS permission dialog. This prevents RPC timeout
-            // while the user reads the prompt; native capture grants still
-            // require foreground return. No new invitation/socket is allowed.
+            // An owned permission dialog or an explicitly active screen
+            // service can keep existing transport and approved input alive.
+            // New invitations, capture and owner grants require foreground.
             if (ownPermissionPause() || projectionSession()) {
                 try {
                     String method = new JSONObject(value).getString("method");
@@ -181,7 +181,7 @@ public final class MainActivity extends Activity {
             if ("getInfo".equals(method)) {
                 boolean enabled = AttendedAccessibilityService.current() != null;
                 reply(id, json("platform", "android", "version", "0.2.0", "nativeControl", true,
-                    "supports", new JSONArray(Arrays.asList("tap", "swipe", "wheel", "editable-text", "back", "home")), "accessibilityEnabled", enabled,
+                    "supports", new JSONArray(Arrays.asList("tap", "swipe", "wheel", "editable-text", "back", "home")), "accessibilityEnabled", enabled, "notificationAvailable", notificationsAvailable(),
                     "capabilities", json("hostRoom", false, "screenShare", true, "remoteInputHost", true, "accessibilityEnabled", enabled, "screenMaxEdge", 1920, "screenMaxFps", 12)));
             } else if ("startScreenShare".equals(method)) {
                 startProjection(id, args instanceof JSONObject ? (JSONObject)args : new JSONObject());
@@ -195,8 +195,10 @@ public final class MainActivity extends Activity {
                 revokeControl("Permission revoked in Auralink."); reply(id, json("ok", true));
             } else if ("applyInput".equals(method)) {
                 JSONObject input = (JSONObject)args; AttendedAccessibilityService service = AttendedAccessibilityService.current();
-                boolean ok = service != null && service.apply(input.getString("peerId"), input.getString("sessionId"), input.getJSONObject("event"));
-                reply(id, json("ok", ok, "reason", ok ? "" : "Phone input was not approved, unsupported, or unavailable in this app."));
+                String peer = input.getString("peerId"), session = input.getString("sessionId");
+                boolean authorized = service != null && service.matches(peer, session) && service.active() && service.confirmed();
+                boolean ok = authorized && service.apply(peer, session, input.getJSONObject("event"));
+                reply(id, json("ok", ok, "reason", ok ? "" : authorized ? "Unsupported phone input or this field is unavailable for accessibility editing." : "Control is not approved for this phone, participant and session."));
             } else if ("inputStatus".equals(method)) {
                 AttendedAccessibilityService service = AttendedAccessibilityService.current();
                 reply(id, json("available", service != null, "active", service != null && service.active(), "peerId", service == null || service.controller() == null ? JSONObject.NULL : service.controller()));
@@ -298,13 +300,30 @@ public final class MainActivity extends Activity {
     private void clearProjectionRequest() {
         main.removeCallbacks(projectionDeadline); ScreenShareService.cancelPreparation();
         projectionRequest = null; projectionOptions = null; projectionPermissionPending = false; projectionStarting = false;
-        deferredProjectionResult = false; deferredProjectionConsent = null;
+        deferredProjectionResult = false; deferredProjectionConsent = null; notificationLaunchDeferred = false;
     }
     private void startProjection(String requestId, JSONObject options) {
         if (!trustedPage() || socket == null || !socket.isOpen() || selfId == null) { reject(requestId, "Join an approved room before sharing the phone."); return; }
         if (projectionRequest != null || ScreenShareService.active()) { reject(requestId, "Phone screen sharing is already starting or active."); return; }
         projectionRequest = requestId; projectionGeneration = generation; projectionOptions = options; projectionPermissionPending = true;
         main.postDelayed(projectionDeadline, 120000);
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            // A visible stop notification matters while another app is being
+            // shared. Denial is respected and does not prevent screen consent.
+            try { requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 43); }
+            catch (Exception failure) { launchScreenConsent(); }
+        } else launchScreenConsent();
+    }
+    private boolean notificationsAvailable() {
+        return (Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) &&
+            ((android.app.NotificationManager)getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled();
+    }
+    private void launchScreenConsent() {
+        final String requestId = projectionRequest;
+        if (requestId == null) return;
+        if (!trustedPage() || projectionGeneration != generation || socket == null || !socket.isOpen() || selfId == null) {
+            clearProjectionRequest(); reject(requestId, "Return to the active room and try sharing again."); return;
+        }
         MediaProjectionManager manager = (MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
         try {
             // Full-display capture is required to map control coordinates safely.
@@ -330,7 +349,7 @@ public final class MainActivity extends Activity {
             public void started(int width, int height, int maxEdge) {
                 if (destroyed || generation != serial || !requestId.equals(projectionRequest)) { ScreenShareService.stopCurrent("Screen start was superseded."); return; }
                 projectionRequest = null; projectionOptions = null; projectionStarting = false; main.removeCallbacks(projectionDeadline);
-                reply(requestId, json("id", "android-screen", "name", "Phone display", "width", width, "height", height, "fps", 12, "maxEdge", maxEdge));
+                reply(requestId, json("id", "android-screen", "name", "Phone display", "width", width, "height", height, "fps", 12, "maxEdge", maxEdge, "notificationAvailable", notificationsAvailable()));
             }
             public void frame(long seq, String jpeg, int width, int height) {
                 if (generation == serial && localDocument()) deliver(json("event", "screen", "type", "frame", "seq", seq, "data", "data:image/jpeg;base64," + jpeg, "width", width, "height", height));
@@ -389,7 +408,7 @@ public final class MainActivity extends Activity {
         controlDialog.show();
     }
     private void requestMedia(PermissionRequest request) {
-        if (!trustedPage() || !"https".equals(request.getOrigin().getScheme()) || !HOST.equals(request.getOrigin().getHost()) ||
+        if (!trustedPage() || selfId == null || !"https".equals(request.getOrigin().getScheme()) || !HOST.equals(request.getOrigin().getHost()) ||
             request.getOrigin().getPort() != -1 || mediaRequest != null) { request.deny(); return; }
         ArrayList<String> needed = new ArrayList<>();
         for (String resource : request.getResources()) {
@@ -407,7 +426,7 @@ public final class MainActivity extends Activity {
     }
     private void completeMedia() {
         PermissionRequest request = mediaRequest; mediaRequest = null; if (request == null) return;
-        if (!trustedPage() || mediaGeneration != generation || socket == null || !socket.isOpen()) { request.deny(); return; }
+        if (!trustedPage() || selfId == null || mediaGeneration != generation || socket == null || !socket.isOpen()) { request.deny(); return; }
         ArrayList<String> granted = new ArrayList<>();
         for (String resource : request.getResources()) {
             if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource) && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) granted.add(resource);
@@ -432,6 +451,10 @@ public final class MainActivity extends Activity {
             // Grant only after our page has returned to the foreground.
             if (foreground) { runtimePermissionsPending = false; completeMedia(); }
             else permissionResultDeferred = true;
+        } else if (code == 43 && projectionRequest != null) {
+            // Notification permission is optional. Continue with a separately
+            // owned screen sharing consent when this document returns.
+            if (foreground) launchScreenConsent(); else notificationLaunchDeferred = true;
         }
     }
     private void exitFullscreen() {
@@ -465,6 +488,7 @@ public final class MainActivity extends Activity {
             else {
                 while (!pausedEvents.isEmpty()) pausedEvents.poll().run();
                 if (permissionResultDeferred) { permissionResultDeferred = false; runtimePermissionsPending = false; completeMedia(); }
+                if (notificationLaunchDeferred) { notificationLaunchDeferred = false; launchScreenConsent(); }
                 if (deferredProjectionResult) {
                     int code = deferredProjectionCode; Intent consent = deferredProjectionConsent; deferredProjectionResult = false; deferredProjectionConsent = null;
                     finishProjectionPermission(code, consent);

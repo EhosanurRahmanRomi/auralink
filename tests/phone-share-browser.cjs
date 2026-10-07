@@ -96,6 +96,8 @@ async function main() {
     const pending = await host.take('join-request'); host.send({ type: 'approve', peerId: pending.peerId });
     await host.page.evaluate(peer => rtc.addPeer(peer), { id: pending.peerId, name: 'Phone owner QA' }); host.ready = true; for (const signal of host.signals.splice(0)) host.deliver(signal);
     await phone.waitForFunction(() => !document.getElementById('share-button').disabled);
+    assert.equal(await phone.locator('#quality-select option[value="1440"]').isDisabled(), true);
+    assert.match(await phone.locator('#quality-select option[value="1080"]').textContent(), /phone maximum/);
     assert.equal(await phone.evaluate(() => qaPhone.started), 0);
     phase = 'native screen contract and RTP'; await phone.locator('#share-button').click();
     await phone.waitForFunction(() => document.getElementById('share-button').getAttribute('aria-label') === 'Stop sharing screen');

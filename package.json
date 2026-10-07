@@ -39,7 +39,8 @@
       "build/icon.png",
       "package.json",
       "README.md",
-      "LICENSE"
+      "LICENSE",
+      "build/icon.svg"
     ],
     "asarUnpack": [
       "src/native/**/*"
@@ -78,7 +79,7 @@
       "target": "dmg",
       "artifactName": "Auralink-${version}-Mac-arm64.dmg",
       "category": "public.app-category.productivity",
-      "icon": "build/icon.png",
+      "icon": "build/icon.svg",
       "extendInfo": {
         "NSCameraUsageDescription": "Use your camera only when you enable video in a room.",
         "NSMicrophoneUsageDescription": "Use your microphone only when you enable audio in a room.",
