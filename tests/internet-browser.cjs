@@ -72,12 +72,15 @@ async function mediaProof(page, name) {
   await page.waitForFunction(() => { const video = document.getElementById('stage-video'); return !video.hidden && video.videoWidth > 0 && video.readyState >= 2 && video.currentTime > 0; }, null, { timeout: 20000 });
   await page.locator('#diagnostics-toggle').click();
   await page.waitForFunction(() => document.getElementById('rtc-stats').textContent.includes('Audio received') && /Audio received\d+ packets/.test(document.getElementById('rtc-stats').textContent), null, { timeout: 20000 });
-  const audioReady = await page.waitForFunction(async before => {
-    const samples = (await Promise.all(qaRTCs.filter(pc => pc.connectionState === 'connected').map(async pc => [...(await pc.getStats()).values()].filter(row => row.type === 'inbound-rtp' && row.kind === 'audio').map(row => ({ packetsReceived: row.packetsReceived, totalAudioEnergy: row.totalAudioEnergy, decodedEnergyDuringCheck: row.totalAudioEnergy - (before[row.trackIdentifier] || 0), totalSamplesDuration: row.totalSamplesDuration, muted: pc.getReceivers().find(receiver => receiver.track.id === row.trackIdentifier)?.track.muted }))))).flat();
-    return samples.some(audio => audio.packetsReceived > 10 && audio.decodedEnergyDuringCheck > .00001 && audio.muted === false) ? samples : false;
-  }, audioBefore, { timeout: 20000 });
+  let audioProof;
+  const audioDeadline = Date.now() + 20000;
+  do {
+    audioProof = await page.evaluate(async before => (await Promise.all(qaRTCs.filter(pc => pc.connectionState === 'connected').map(async pc => [...(await pc.getStats()).values()].filter(row => row.type === 'inbound-rtp' && row.kind === 'audio').map(row => ({ packetsReceived: row.packetsReceived, totalAudioEnergy: row.totalAudioEnergy, decodedEnergyDuringCheck: row.totalAudioEnergy - (before[row.trackIdentifier] || 0), totalSamplesDuration: row.totalSamplesDuration, muted: pc.getReceivers().find(receiver => receiver.track.id === row.trackIdentifier)?.track.muted }))))).flat(), audioBefore);
+    if (audioProof.some(audio => audio.packetsReceived > 10 && audio.decodedEnergyDuringCheck > .00001 && audio.muted === false)) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  } while (Date.now() < audioDeadline);
   const proof = await page.evaluate(() => { const video = document.getElementById('stage-video'); return { width: video.videoWidth, height: video.videoHeight, currentTime: video.currentTime, stats: document.getElementById('rtc-stats').innerText, rtcConfiguration: qaRTCConfigs.map(config => ({ ...config, iceServers: config.iceServers.map(server => ({ urls: server.urls, hasRelayCredential: Boolean(server.credential) })) })) }; });
-  proof.audio = await audioReady.jsonValue(); await audioReady.dispose();
+  proof.audio = audioProof;
   assert.ok(proof.audio.some(audio => audio.decodedEnergyDuringCheck > .00001 && audio.muted === false), 'A received microphone must produce new decoded audio energy on an unmuted track');
   assert.ok(proof.rtcConfiguration.some(config => config.iceServers.some(server => String(server.urls).startsWith('stun:'))), 'Coordinator ICE configuration must be set before peer construction');
   await page.locator('#diagnostics-close').click(); return proof;
