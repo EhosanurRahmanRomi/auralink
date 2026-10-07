@@ -256,12 +256,19 @@ async function configureSpeakers(deviceId = preferences.speaker, warn = true) {
     if (deviceId && warn) toast(`Selected speaker unavailable; using system default. ${cleanError(error)}`, true);
   }
 }
+const deviceSelections = [['audioinput', 'microphone-device', 'microphone', 'Microphone'], ['videoinput', 'camera-device', 'camera', 'Camera'], ['audiooutput', 'speaker-device', 'speaker', 'Speaker']];
+const editedDeviceSelections = new Set();
+let deviceRefreshGeneration = 0;
+for (const [, selectId] of deviceSelections) $(selectId).addEventListener('change', () => editedDeviceSelections.add(selectId));
 async function refreshDevices(warn = false) {
   if (!navigator.mediaDevices?.enumerateDevices) { $('device-help').textContent = 'Device selection requires a trusted HTTPS connection and browser support.'; return; }
+  const generation = ++deviceRefreshGeneration;
+  $('refresh-devices').disabled = true; $('refresh-devices').setAttribute('aria-busy', 'true');
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
-    for (const [kind, selectId, key, label] of [['audioinput', 'microphone-device', 'microphone', 'Microphone'], ['videoinput', 'camera-device', 'camera', 'Camera'], ['audiooutput', 'speaker-device', 'speaker', 'Speaker']]) {
-      const select = $(selectId); const chosen = preferences[key]; select.replaceChildren();
+    if (generation !== deviceRefreshGeneration) return;
+    for (const [kind, selectId, key, label] of deviceSelections) {
+      const select = $(selectId); const chosen = editedDeviceSelections.has(selectId) ? select.value : preferences[key]; select.replaceChildren();
       const defaultOption = document.createElement('option'); defaultOption.value = ''; defaultOption.textContent = 'System default'; select.append(defaultOption);
       let number = 0;
       for (const device of devices.filter((item) => item.kind === kind && item.deviceId && item.deviceId !== 'default')) {
@@ -273,7 +280,12 @@ async function refreshDevices(warn = false) {
       select.value = chosen;
     }
     $('device-help').textContent = devices.some((device) => device.label) ? 'Available equipment refreshed. Input changes apply the next time you enable mic or camera.' : 'Device names appear after camera or microphone permission. Refreshing does not enable either.';
-  } catch (error) { $('device-help').textContent = 'Device list unavailable. You can still try the system default.'; if (warn) toast(cleanError(error), true); }
+  } catch (error) {
+    if (generation !== deviceRefreshGeneration) return;
+    $('device-help').textContent = 'Device list unavailable. You can still try the system default.'; if (warn) toast(cleanError(error), true);
+  } finally {
+    if (generation === deviceRefreshGeneration) { $('refresh-devices').disabled = false; $('refresh-devices').setAttribute('aria-busy', 'false'); }
+  }
   const canSelectOutput = typeof HTMLMediaElement.prototype.setSinkId === 'function';
   $('speaker-device').disabled = !canSelectOutput;
   $('speaker-help').textContent = canSelectOutput ? 'Save preferences to apply to current room audio. Your saved output is applied when you next create or join.' : 'This browser uses its system audio output. Change speakers in your device sound settings.';
@@ -287,6 +299,7 @@ $('save-settings').addEventListener('click', async () => {
   preferences.name = $('display-name').value.trim().slice(0, 48) || 'My device';
   preferences.quality = $('settings-quality').value; preferences.stun = stun;
   preferences.microphone = $('microphone-device').value; preferences.camera = $('camera-device').value; preferences.speaker = $('speaker-device').value;
+  editedDeviceSelections.clear();
   const speakers = configureSpeakers(preferences.speaker);
   $('quality-select').value = preferences.quality;
   savePreferences();

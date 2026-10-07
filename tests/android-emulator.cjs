@@ -363,7 +363,7 @@ async function runUI(fixture) {
   await screenshot('android-emulator-sharing.png');
   const service=await adb(['shell','dumpsys','activity','services','local.auralink.mobile']);
   assert.match(service,/ScreenShareService/);assert.match(service,/isForeground=true/);
-  const foregroundType=service.match(/isForeground=true[^\n]*\btypes=0x([a-f0-9]+)/i);
+  const foregroundType=service.match(/isForeground=true[^\n]*\btypes=(?:0x)?([a-f0-9]+)/i);
   assert.ok(foregroundType && (parseInt(foregroundType[1],16)&0x80)!==0,'Active screen sharing with microphone must declare the microphone foreground service type');
   audio.checks.push('Screen projection declares active microphone foreground service type');
   checkpoint('foregroundProjectionAndMicrophoneService');
@@ -372,9 +372,9 @@ async function runUI(fixture) {
     phase='separate attended phone control approval';console.log(phase);
     await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.channel?.readyState==='open',fixture.peerId,{timeout:30000});
     fixture.send({type:'control-request',to:fixture.peerId});
-    await tap(await findNode(label('Review and allow'),30000));
+    await tapStable(label('Review and allow'),30000);
     await screenshot('android-emulator-native-control-consent.png');
-    await tap(await findNode(node=>node['resource-id']==='android:id/button1' && node.text==='Allow control',30000));
+    await tapStable(node=>node['resource-id']==='android:id/button1' && node.text==='Allow control',30000);
     const grant=await fixture.take('control-response',30000);
     assert.equal(grant.from,fixture.peerId);assert.equal(grant.accepted,true);
     await findNode(node=>node['content-desc']==='Stop remote control immediately',30000);

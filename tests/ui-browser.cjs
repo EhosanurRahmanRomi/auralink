@@ -150,11 +150,31 @@ async function main() {
     phase = 'media equipment preferences';
     await desktop.locator('[data-view="settings"]').click();
     await desktop.locator('#refresh-devices').click();
-    await desktop.waitForFunction(() => document.getElementById('camera-device').options.length > 1 && document.getElementById('microphone-device').options.length > 1);
+    await desktop.waitForFunction(() => document.getElementById('refresh-devices').getAttribute('aria-busy') === 'false' && document.getElementById('camera-device').options.length > 1 && document.getElementById('microphone-device').options.length > 1);
     const mediaDevice = await desktop.locator('#camera-device').evaluate(select => select.options[1].value);
+    const microphoneDevice = await desktop.locator('#microphone-device').evaluate(select => select.options[1].value);
+    // Hold enumeration while the owner edits equipment. A late refresh must
+    // preserve both choices instead of restoring the last saved defaults.
+    await desktop.evaluate(() => {
+      const enumerate = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      window.qaDeviceRefreshes = [];
+      navigator.mediaDevices.enumerateDevices = async () => {
+        const devices = await enumerate();
+        return new Promise(resolve => qaDeviceRefreshes.push(() => resolve(devices)));
+      };
+      window.qaRestoreEnumeration = () => { navigator.mediaDevices.enumerateDevices = enumerate; };
+    });
+    await desktop.locator('#refresh-devices').click();
+    await desktop.waitForFunction(() => qaDeviceRefreshes.length > 0);
     await desktop.locator('#camera-device').selectOption(mediaDevice);
+    await desktop.locator('#microphone-device').selectOption(microphoneDevice);
+    await desktop.evaluate(() => { qaRestoreEnumeration(); qaDeviceRefreshes.splice(0).forEach(resolve => resolve()); });
+    await desktop.waitForFunction(() => document.getElementById('refresh-devices').getAttribute('aria-busy') === 'false');
+    assert.equal(await desktop.locator('#camera-device').inputValue(), mediaDevice, 'Late enumeration must preserve the pending camera choice');
+    assert.equal(await desktop.locator('#microphone-device').inputValue(), microphoneDevice, 'Late enumeration must preserve the pending microphone choice');
     await desktop.locator('#save-settings').click();
     assert.equal(await desktop.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).camera), mediaDevice);
+    assert.equal(await desktop.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).microphone), microphoneDevice);
     await desktop.locator('[data-view="rooms"]').click();
     assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Mobile room overflows horizontally');
     await mobile.waitForFunction(() => document.getElementById('toast-region').childElementCount === 0, undefined, { timeout: 10000 });
