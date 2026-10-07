@@ -299,13 +299,18 @@ async function nativeDevice() {
   checkpoint('separateNonSuppressingObserverInstalled');
   await adb(['shell','am','force-stop','local.auralink.mobile']);
   await adb(['shell','logcat','-c']);
-  if(process.argv.includes('--control')) {
-    // Enable the service only inside this verified throwaway emulator. Real
-    // phones always require the owner to enable it in Android Settings.
-    await adb(['shell','settings','put','secure','enabled_accessibility_services','local.auralink.mobile/local.auralink.mobile.AttendedAccessibilityService']);
-    await adb(['shell','settings','put','secure','accessibility_enabled','1']);
-  }
   await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
+}
+
+async function accessibilityBound(timeout=30000) {
+  const deadline=Date.now()+timeout;
+  do {
+    const dump=await adb(['shell','dumpsys','accessibility']);
+    const bound=dump.match(/Bound services:\{([\s\S]*?)\n\s*Enabled services:/i)?.[1];
+    if(bound?.includes('AttendedAccessibilityService'))return true;
+    await delay(500);
+  }while(Date.now()<deadline);
+  throw new Error('Android must actually bind the isolated emulator Accessibility service before testing attended control');
 }
 
 async function hostFixture() {
@@ -379,6 +384,14 @@ async function runUI(fixture) {
   phase='production APK lobby';console.log(phase);
   await findNode(node=>node.package==='local.auralink.mobile' && /Rooms|Your space|Settings/.test(node.text),60000);await screenshot('android-emulator-lobby.png');
   checkpoint('productionLobbyRendered');
+  if(process.argv.includes('--control')) {
+    // Start after cold WebView startup instead of racing the Accessibility
+    // binding deadline with first-launch provider initialization. Only this
+    // verified throwaway AVD uses ADB; real owners use Android Settings.
+    await adb(['shell','settings','put','secure','enabled_accessibility_services','local.auralink.mobile/local.auralink.mobile.AttendedAccessibilityService']);
+    await adb(['shell','settings','put','secure','accessibility_enabled','1']);
+    await accessibilityBound();checkpoint('actualAccessibilityServiceBound');
+  }
   let join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
   for(let count=0;!join && count<3;count++) {
     await adb(['shell','input','swipe','355','1060','355','470','450']);await delay(1000);join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
@@ -429,6 +442,7 @@ async function runUI(fixture) {
   let control=null;
   if(process.argv.includes('--control')) {
     phase='separate attended phone control approval';console.log(phase);
+    await accessibilityBound();checkpoint('accessibilityServiceStillBoundBeforeApproval');
     await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.channel?.readyState==='open',fixture.peerId,{timeout:30000});
     fixture.send({type:'control-request',to:fixture.peerId});
     await tapStable(label('Review and allow'),30000);
