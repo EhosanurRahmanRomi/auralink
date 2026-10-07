@@ -307,9 +307,13 @@ async function accessibilityBound(timeout=30000) {
   do {
     const dump=await adb(['shell','dumpsys','accessibility']);
     const bound=dump.match(/Bound services:\{([\s\S]*?)\n\s*Enabled services:/i)?.[1];
-    if(bound?.includes('AttendedAccessibilityService'))return true;
+    if(bound?.includes('label=Auralink attended control'))return true;
     await delay(500);
   }while(Date.now()<deadline);
+  const dump=await adb(['shell','dumpsys','accessibility']);
+  runtimeDiagnostics.accessibility={boundAuralinkService:/Bound services:\{[\s\S]*?label=Auralink attended control[^\n]*\n\s*Enabled services:/i.test(dump),
+    enabledSetting:(await adb(['shell','settings','get','secure','enabled_accessibility_services'])).trim().includes('local.auralink.mobile'),
+    safeSystemState:dump.split('\n').filter(line=>/Bound services:|Enabled services:|Binding services:|Crashed services:|UiAutomation|suppress/i.test(line)).map(line=>safeError(line)).join('\n').slice(0,3000)};
   throw new Error('Android must actually bind the isolated emulator Accessibility service before testing attended control');
 }
 
