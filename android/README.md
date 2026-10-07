@@ -1,10 +1,10 @@
 # Android test companion
 
-Auralink 0.2.0 uses a bundled Android WebView for WebRTC calls and the native Android platform for pinned room connections, screen consent, audio routing and attended input. Android 10 or newer is required. It joins a room hosted on Windows or macOS; Android does not host the signaling broker.
+Auralink 0.3.0 uses a bundled Android WebView for WebRTC calls and the native Android platform for room connections, screen consent, audio routing and attended input. Android 10 or newer is required. Android can create or join an **Internet** room through the private hosted coordinator after device pairing. In **Nearby** mode, it joins a room hosted on Windows or macOS; it does not host the local signaling broker. Nearby connections pin the invitation certificate, while Internet connections verify the service's normal certificate chain and hostname.
 
 ## Try phone screen sharing
 
-1. Install the APK, join the desktop invitation and wait for the room owner to approve you.
+1. Install the APK. Create an Internet room after pairing, or join an Internet/Nearby invitation and wait for the room owner to approve you.
 2. Tap **Share screen**. Android 13+ asks for optional notification permission so a visible **Stop sharing** action is available outside Auralink. Approve Android's separate screen sharing dialog. Full phone display sharing is requested so control coordinates match what the other participant sees.
 3. Open another app. The active screen sharing foreground service keeps the existing room connected. Android displays its capture status and Auralink provides a **Stop sharing** notification action.
 4. End sharing from Auralink, its notification or Android's screen sharing status. If you deny or disable notification permission, return to Auralink to stop sharing; recent Android versions also offer the system screen sharing status chip. This also ends any approved phone control. Moving Auralink to the background without active screen sharing ends its room and media session.

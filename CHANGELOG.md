@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — Private Internet beta (in development)
+## 0.3.0 — Private Internet beta
 
 - Added an optional **Internet** mode alongside existing **Nearby** rooms, with a Cloudflare Workers Free/SQLite Durable Object coordinator and a free public `workers.dev` address. A purchased domain is not required.
 - Added private device pairing, hashed device credentials, retained online/offline host status, device forget/revocation and a 32-device private-directory cap. Room admission still requires the owner, and rooms remain limited to four approved people.
@@ -12,6 +12,7 @@
 - Reserved dedicated audio/camera/screen transceivers and replaced their sources when devices change. This avoids repeated media-toggle negotiations; regression checks cover delayed signaling, bidirectional decoded audio and camera/screen separation.
 - Added optional expiring Metered relay configuration, disabled by default, with persisted daily/monthly issuance limits and a whole-room session deadline. These application guards do not guarantee provider free billing or a byte quota; provider-enforced expiry, free allowance and overage behavior must be verified before enabling relay.
 - Added free deployment instructions and a physical different-network test guide. Coordinator policy tests, real local workerd/SQLite/WebSocket checks and deployment dry run pass; the public Cloudflare service passed normal-TLS native and browser pairing/admission/consent tests. Two browser contexts on one Windows PC exchanged synthetic video and audio; physical different-network and platform tests remain outstanding.
+- Verified the final Windows and Mac packages in hosted launch/source checks, exact Android release/hosted payload parity, two actual Electron apps exchanging synthetic media, and the production APK's native screen capture, attended Home control, revocation and audio transport on Android 16/API36.
 
 The 0.2 hardware/input limits remain: a four-person mesh, Android 12fps capture with 1280/1920 maximum long-edge presets, microphone-only phone audio, ASCII-focused phone input and OS-protected surfaces. Installers remain test distribution without Windows signing or Apple notarization. Direct-only Internet connections do not cover every router/carrier pair, and unlimited free worldwide 2K streaming has not been established.
 
