@@ -16,7 +16,7 @@ try {
   const compiler=run('swiftc',['--version']);
   run('swiftc',['-O','-whole-module-optimization','-target','arm64-apple-macos13.0',source,'-framework','ApplicationServices','-o',output]);
   fs.chmodSync(output,0o755);
-  run('lipo',['-verify_arch','arm64',output]);
+  run('lipo',[output,'-verify_arch','arm64']);
   run('codesign',['--force','--sign','-',output]);
   const selfTest=JSON.parse(run(output,['--self-test']));
   assert.equal(selfTest.passed,true);

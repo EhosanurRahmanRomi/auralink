@@ -56,7 +56,7 @@ async function main() {
     assert.equal(metadata.CFBundleIdentifier,'local.auralink.desktop');
     assert.equal(metadata.CFBundleShortVersionString,pkg.version);
     for(const usage of ['NSMicrophoneUsageDescription','NSCameraUsageDescription','NSScreenCaptureUsageDescription','NSLocalNetworkUsageDescription']) assert.ok(metadata[usage]?.length>10,`${usage} must explain the local action`);
-    command('lipo',['-verify_arch','arm64',binary]);command('lipo',['-verify_arch','arm64',helper]);
+    command('lipo',[binary,'-verify_arch','arm64']);command('lipo',[helper,'-verify_arch','arm64']);
     command('codesign',['--verify','--deep','--strict',appBundle]);
     const selfTest=JSON.parse(command(helper,['--self-test']));
     assert.equal(selfTest.passed,true);assert.equal(selfTest.inputPosted,false);
