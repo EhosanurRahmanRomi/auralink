@@ -734,7 +734,7 @@ async function beginPhoneSharing() {
   state.local.set('screen', { track, stream }); await state.rtc.setTrack('screen', track, stream);
   state.selected = { peerId: state.selfId, kind: 'screen' }; track.addEventListener('ended', () => { if (state.phoneScreen === capture) void stopSharing(); });
   updateButtons(); renderParticipants(); renderStage();
-  toast('Your phone screen is shared. Android shows a sharing notification with a Stop action.');
+  toast(screen.notificationAvailable === false ? 'Your phone screen is shared. Notifications are disabled: return to Auralink to stop sharing, or use Android’s capture control.' : 'Your phone screen is shared. Use the Android sharing notification or return here to stop.');
 }
 function clearPhoneCapture() {
   const capture = state.phoneScreen; state.phoneScreen = null;
@@ -1057,12 +1057,13 @@ async function initialize() {
     }
     $('profile-platform').textContent = 'Android companion';
     $('host-button').disabled = true; $('host-button').title = 'Create rooms in Auralink for Windows or Mac';
+    $('host-button').closest('.action-card').hidden = true;
     const caption = $('host-button').parentElement.querySelector('.card-caption');
     if (caption) { caption.replaceChildren(document.createTextNode('Room hosting is available in the desktop app')); }
     document.querySelector('.primary-card p').textContent = 'Create a room on Windows or Mac, then join it here for calls, viewing and approved desktop control.';
     document.querySelector('.primary-card h2').textContent = 'A desktop hosts the room';
     const connectionText = $('lobby').querySelector('.connection-note p');
-    if (connectionText) connectionText.textContent = 'Join a desktop invitation, turn on sound, then share your phone through Android’s screen permission. To let someone help, enable Auralink Accessibility and approve their separate control request. The sharing notification always lets you stop.';
+    if (connectionText) connectionText.textContent = 'Join a desktop invitation, turn on sound, then share your phone through Android’s screen permission. To let someone help, enable Auralink Accessibility and approve their separate control request. Allow notifications to keep the Stop sharing action available outside the app.';
     $('share-button').title = 'Share your phone using Android screen-capture permission';
     $('phone-speaker-toggle').hidden = !bridge?.setAudioRoute;
   }

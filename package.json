@@ -30,7 +30,7 @@
   "build": {
     "appId": "local.auralink.desktop",
     "productName": "Auralink",
-    "compression": "store",
+    "compression": "normal",
     "directories": {
       "output": "release"
     },
