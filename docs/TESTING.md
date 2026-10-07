@@ -2,6 +2,8 @@
 
 Start with Windows and Android on the same Wi-Fi and matching release versions. Keep the desktop room host open, select its Wi-Fi address, paste the invitation on the phone and approve admission. Guest-network/client isolation can block this. Android joins a desktop-hosted room; closing that host ends the room.
 
+If Windows asks about network access, allow Auralink on your trusted private network. Both the room connection and WebRTC media need network access; keep Windows Firewall enabled. On the phone, the microphone, camera, sharing and leave controls appear above the presentation area as soon as admission completes.
+
 The release APK uses the retained development signing key and can update the project's 0.1.0 APK. An APK downloaded from a CI artifact uses a temporary key and cannot update that installation. Use the published release APK for this test.
 
 ## Audio
@@ -20,7 +22,7 @@ If the sender's meter is flat, check its selected microphone and system permissi
 
 Share a full desktop display. A window-only presentation does not accept native desktop control. Select the shared display on the other endpoint and request control. The owner confirms both app review and native consent. Test a harmless text editor: clicks, scroll, ASCII typing and Backspace. Revoke and verify further input stops.
 
-On the MacBook Air M4, use the Apple Silicon DMG. This test build is ad-hoc signed and unnotarized; use macOS's app review/open flow without disabling Gatekeeper globally. Grant **Microphone**, **Camera**, **Screen Recording** and **Accessibility** only for the features you test. Restart after permission changes when required. Test Mac hosting and joining separately. Its hosted build checks establish the packaged app starts, but physical Mac media and remote input still need this test.
+On the MacBook Air M4, open the Apple Silicon DMG, drag Auralink into **Applications**, and launch it from there. This test build is ad-hoc signed and unnotarized; use macOS's app review/open flow without disabling Gatekeeper globally. On macOS 15+, allow Auralink under **Privacy & Security → Local Network** when connecting nearby devices. Grant **Microphone**, **Camera**, **Screen Recording** and **Accessibility** only for the features you test. Restart after permission changes when required. Test Mac hosting and joining separately. Its hosted build checks establish the packaged app starts, but physical Mac media and remote input still need this test.
 
 ## Phone presentation and input
 

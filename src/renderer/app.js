@@ -718,15 +718,17 @@ async function beginSharing() {
   updateButtons(); renderParticipants(); renderStage();
 }
 async function beginPhoneSharing() {
-  if (!HTMLCanvasElement.prototype.captureStream) throw new Error('Your Android WebView does not support screen streaming. Update Android System WebView and try again.');
+  if (typeof MediaStreamTrackGenerator !== 'function' || typeof VideoFrame !== 'function') throw new Error('Update Android System WebView to enable phone screen streaming, including sharing while another app is open.');
   const rtc = state.rtc;
   $('share-button').disabled = true;
   const screen = await bridge.startScreenShare({ quality: preferences.quality === '720' || preferences.quality === 'auto' ? '720p' : '1080p', microphone: state.local.has('audio'), camera: state.local.has('camera') });
   if (!state.joined || state.rtc !== rtc) { await bridge.stopScreenShare(); return; }
-  const canvas = document.createElement('canvas'); canvas.width = screen.width; canvas.height = screen.height;
-  const drawing = canvas.getContext('2d', { alpha: false }); drawing.fillStyle = '#07111c'; drawing.fillRect(0, 0, canvas.width, canvas.height);
-  const stream = canvas.captureStream(Math.min(15, screen.fps || 12)); const track = stream.getVideoTracks()[0]; track.contentHint = 'detail';
-  const capture = { canvas, drawing, stream, active: true, busy: false, lastSeq: 0, unsubscribe: null };
+  // Canvas capture waits for compositor paints, which stop when Android hides
+  // the Activity. Feed explicitly decoded native frames into the media track
+  // instead, while the owner-approved foreground projection remains active.
+  const track = new MediaStreamTrackGenerator({ kind: 'video' }); track.contentHint = 'detail';
+  const writer = track.writable.getWriter(); const stream = new MediaStream([track]);
+  const capture = { writer, stream, active: true, busy: false, lastSeq: 0, timestamp: 0, unsubscribe: null };
   state.phoneScreen = capture; state.sourceId = screen.id || 'android-screen';
   capture.unsubscribe = bridge.onScreenFrame(async frame => {
     if (!capture.active || !state.joined || !frame || !Number.isSafeInteger(frame.seq) || frame.seq <= capture.lastSeq || typeof frame.data !== 'string' || !frame.data.startsWith('data:image/jpeg;base64,') || frame.data.length > 4000000) {
@@ -739,8 +741,9 @@ async function beginPhoneSharing() {
       await image.decode();
       if (!capture.active || state.phoneScreen !== capture) return;
       if (image.width < 1 || image.height < 1 || image.width > 1920 || image.height > 1920) throw new Error('Invalid phone frame size');
-      if (canvas.width !== image.width || canvas.height !== image.height) { canvas.width = image.width; canvas.height = image.height; }
-      drawing.drawImage(image, 0, 0); track.requestFrame?.();
+      capture.timestamp = Math.max(capture.timestamp + 1, Math.round(performance.now() * 1000));
+      const videoFrame = new VideoFrame(image, { timestamp: capture.timestamp });
+      try { await writer.write(videoFrame); } finally { videoFrame.close(); }
     } catch { /* A corrupt frame is skipped; the native capture can send the next. */ }
     finally { capture.busy = false; await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); }
   });
@@ -751,7 +754,10 @@ async function beginPhoneSharing() {
 }
 function clearPhoneCapture() {
   const capture = state.phoneScreen; state.phoneScreen = null;
-  if (capture) { capture.active = false; capture.unsubscribe?.(); capture.stream.getTracks().forEach(track => track.stop()); }
+  if (capture) {
+    capture.active = false; capture.unsubscribe?.(); capture.stream.getTracks().forEach(track => track.stop());
+    capture.writer.abort().catch(() => {}).finally(() => { try { capture.writer.releaseLock(); } catch {} });
+  }
 }
 bridge?.onScreenStopped?.(reason => { if (state.phoneScreen) { void stopSharing(); toast(reason || 'Phone screen sharing stopped.'); } });
 async function stopSharing() {

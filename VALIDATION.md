@@ -26,7 +26,7 @@ Mac hosted build checks do not grant the user's TCC permissions or prove physica
 ## Remaining limits
 
 - Direct same-network operation is the first target. No TURN relay or global directory is included.
-- Desktop presentation targets at most 1440p/30; Android initially caps the longest edge at 1280/1920 with at most about 12fps and JPEG/canvas conversion. Selection is a ceiling, not a measured-quality promise.
+- Desktop presentation targets at most 1440p/30; Android initially caps the longest edge at 1280/1920 with at most about 12fps and JPEG/video-frame conversion. Selection is a ceiling, not a measured-quality promise.
 - Voice uses microphone audio. Desktop/phone system playback capture is absent.
 - Normal desktop input and Android supported gestures/text cannot override UAC, lock screens, password fields, protected content or OS permission surfaces.
 - ASCII/host layout limits apply; arbitrary Unicode and complete OS keyboard support are absent.

@@ -38,6 +38,8 @@ Auralink connects Windows, Apple Silicon Macs and Android phones in a room hoste
 
 Get Windows Setup, the Android APK and the Apple Silicon DMG from [Releases](https://github.com/EhosanurRahmanRomi/auralink/releases). These are testing builds: Windows is unsigned, macOS is ad-hoc signed and not notarized, and Android uses the project's private development key. Review the publisher and SHA-256 checksums before installing.
 
+Each release includes `SHA256SUMS.txt`, a source archive and `RELEASE-VERIFICATION.json` describing the exact package hashes, build commit and completed checks. Hardware testing remains separate from browser, emulator and packaged-launch checks.
+
 1. Open Auralink on Windows or Mac and create a room. Start with both devices on the same Wi-Fi.
 2. Select the reachable Wi-Fi/Ethernet address and share the invitation privately.
 3. Paste it into **Join room** on the other device. The desktop owner approves admission.
@@ -46,7 +48,7 @@ Get Windows Setup, the Android APK and the Apple Silicon DMG from [Releases](htt
 6. Select the shared device and request control. The owner reviews and confirms native permission. Android also needs Auralink Accessibility enabled through system settings.
 7. Stop with the visible room controls or Android sharing notification. Desktop emergency stop: **Ctrl+Alt+Shift+Q** (Windows) / **Command+Option+Shift+Q** (Mac).
 
-Enabling Android Accessibility alone grants nobody control. Input still requires an approved session and active phone share. Android capture requests the full phone display so control coordinates map to the shared screen. On macOS grant Camera, Microphone, Screen Recording and Accessibility only for the associated feature; restart after permission changes if required. Use the OS review/open flow for the unnotarized DMG, rather than disabling Gatekeeper globally.
+Enabling Android Accessibility alone grants nobody control. Input still requires an approved session and active phone share. Android capture requests the full phone display so control coordinates map to the shared screen. On macOS 15+, allow Auralink's Local Network permission for nearby connections. Grant Camera, Microphone, Screen Recording and Accessibility only for the associated feature; restart after permission changes if required. Use the OS review/open flow for the unnotarized DMG, rather than disabling Gatekeeper globally.
 
 ## Capabilities and limits
 
@@ -54,12 +56,12 @@ Enabling Android Accessibility alone grants nobody control. Input still requires
 |---|---|---|---|
 | Host room | Yes | Yes | Joins a desktop room |
 | Audio/camera | WebRTC | WebRTC | WebView WebRTC + native audio route |
-| Present screen | Screen/window | Screen/window with OS permission | MediaProjection → canvas → WebRTC |
+| Present screen | Screen/window | Screen/window with OS permission | MediaProjection → video frames → WebRTC |
 | View / request control | Yes | Yes | Yes |
 | Accept input | Normal desktop native helper | Normal desktop, Accessibility | Gestures/navigation/supported text fields, Accessibility |
 | Separate approval / local stop | Yes | Yes | Yes |
 
-Desktop sharing targets up to **1440p/30 fps**; camera calls up to **1080p/30 fps**. Initial Android sharing uses bounded JPEG/canvas frames, up to 1280 or 1920 pixels on the longest edge at about 12 fps. It is not a 2K/30 native Android encoder. Actual quality can be lower; diagnostics show received resolution, fps, codec and route.
+Desktop sharing targets up to **1440p/30 fps**; camera calls up to **1080p/30 fps**. Initial Android sharing converts bounded native JPEGs into generated video frames, up to 1280 or 1920 pixels on the longest edge at about 12 fps. Update Android System WebView if prompted. It is not a 2K/30 native Android encoder. Actual quality can be lower; diagnostics show received resolution, fps, codec and route.
 
 Voice uses the microphone; shared system audio is not included. Text input currently targets English US ASCII. Arbitrary Unicode/IME, every OS shortcut, Windows UAC, locked screens, protected Android surfaces and system permission dialogs are outside current control support. See [device tests](docs/TESTING.md).
 
