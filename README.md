@@ -34,7 +34,7 @@ Get Windows Setup, the Android APK and the Apple Silicon DMG from [Releases](htt
 1. Open Auralink on Windows or Mac and create a room. Start with both devices on the same Wi-Fi.
 2. Select the reachable Wi-Fi/Ethernet address and share the invitation privately.
 3. Paste it into **Join room** on the other device. The desktop owner approves admission.
-4. Enable microphone/camera deliberately. Use Settings' audio checks if needed. Headphones help when devices are nearby.
+4. Enable microphone/camera deliberately. Select equipment in Settings and use the room's **Check sound** tests if needed. Headphones help when devices are nearby.
 5. Choose **Share screen** on the presenting device. Android displays the system capture prompt.
 6. Select the shared device and request control. The owner reviews and confirms native permission. Android also needs Auralink Accessibility enabled through system settings.
 7. Stop with the visible room controls or Android sharing notification. Desktop emergency stop: **Ctrl+Alt+Shift+Q** (Windows) / **Command+Option+Shift+Q** (Mac).

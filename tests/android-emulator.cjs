@@ -51,6 +51,20 @@ async function findNode(predicate,timeout=30000) {
   do {let nodes=[];try{nodes=await hierarchy();}catch{}const found=nodes.find(predicate);if(found)return found;await delay(800);}while(Date.now()<deadline);
   throw new Error(`Android UI element absent during ${phase}`);
 }
+async function invitationFields(timeout=30000) {
+  const deadline=Date.now()+timeout;
+  do {
+    const fields=(await hierarchy()).filter(node=>node.class==='android.widget.EditText' && visible(node));
+    if(fields.length===2)return fields;
+    await delay(800);
+  }while(Date.now()<deadline);
+  throw new Error('The production invitation dialog did not expose both text inputs');
+}
+function safeHierarchy(nodes) {
+  return nodes.map(node=>Object.fromEntries(['class','package','resource-id','bounds','clickable','enabled','focused','text','content-desc'].map(key=>[
+    key,(key==='text' || key==='content-desc') && node.class==='android.widget.EditText' ? '[editable content omitted]' : safeError(node[key] || '')
+  ])));
+}
 const label=(text)=>node=>node.text===text || node['content-desc']===text;
 function visible(node) {
   const bounds=node.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);
@@ -142,9 +156,10 @@ async function runUI(fixture) {
     await adb(['shell','input','swipe','355','1060','355','470','450']);await delay(1000);join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
   }
   assert.ok(join,'Scroll the production lobby to the invitation action');await tap(join);
-  console.log('Android native invitation dialog opened');
-  const fields=(await hierarchy()).filter(node=>node.class==='android.widget.EditText');
-  assert.equal(fields.length,2,'Join form must expose name and invitation text inputs');
+  phase='production invitation dialog';
+  const fields=await invitationFields();
+  await screenshot('android-emulator-invitation-dialog.png');
+  console.log('Production invitation dialog exposes both Android text inputs');
   await tap(fields[1]);await type(fixture.invite);await adb(['shell','input','keyevent','4']);
   console.log('Pinned invitation entered through the production Android text field');
   await tap(await findNode(label('Request to join')));
@@ -203,7 +218,8 @@ async function runUI(fixture) {
   const fatal=(await adb(['shell','logcat','-d',`--pid=${processId}`,'-s','AndroidRuntime:E'])).trim();
   assert.ok(!fatal.includes('FATAL EXCEPTION'),fatal);
   assert.deepEqual(fixture.errors,[]);
-  return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,screen,control,
+  const sourceCheck=path.join(project,'.tools','runtime-source-check.json');
+  return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,source:fs.existsSync(sourceCheck)?JSON.parse(fs.readFileSync(sourceCheck,'utf8')):null,screen,control,
     verified:['Production non-debuggable APK installed and loaded','Native pinned TLS room admission','Owner Android system projection consent','Actual MediaProjection screen frames decoded over WebRTC','Foreground sharing service','Owner share stop releases projection','No fatal Android runtime exception'],
     limitations:['Emulator has no physical microphone or speaker; physical audio route needs real-device test.',...(control?[]:['Phone Accessibility input requires a separate attended test.'])],errors:fixture.errors};
 }
@@ -221,8 +237,9 @@ async function main() {
   }catch(error) {
     // Failure screenshots and raw UI dumps can contain an invitation field.
     // Keep those local/ignored; the workflow publishes only the safe summary.
-    try{await screenshot('android-emulator-failure.png');fs.writeFileSync(path.join(output,'android-emulator-failure-ui.json'),JSON.stringify(await hierarchy(),null,2));}catch{}
-    fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:safeError(error)},null,2));throw new Error(safeError(error));
+    let diagnostics;
+    try{await screenshot('android-emulator-failure.png');const nodes=await hierarchy();fs.writeFileSync(path.join(output,'android-emulator-failure-ui.json'),JSON.stringify(nodes,null,2));diagnostics=safeHierarchy(nodes);}catch{}
+    fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:safeError(error),ui:diagnostics},null,2));throw new Error(safeError(error));
   }finally {
     if(!process.argv.includes('--fixture-only')) await adb(['shell','am','force-stop','local.auralink.mobile']).catch(()=>{});
     if(fixture){

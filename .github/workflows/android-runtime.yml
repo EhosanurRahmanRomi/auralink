@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
@@ -45,11 +46,18 @@ jobs:
           mkdir -p .tools
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > .tools/runtime-build-run.json
           node - <<'JS'
-          const assert=require('node:assert/strict');const run=require('./.tools/runtime-build-run.json');
-          assert.equal(run.head_sha,process.env.GITHUB_SHA,'The APK source commit must match this runtime workflow commit');
+          const assert=require('node:assert/strict');const fs=require('node:fs');const {spawnSync}=require('node:child_process');const run=require('./.tools/runtime-build-run.json');
+          assert.equal(run.repository.full_name,process.env.GITHUB_REPOSITORY,'The APK must belong to this repository');
+          assert.match(run.head_sha,/^[a-f0-9]{40}$/,'The build commit must be a full Git SHA');
           assert.equal(run.path,'.github/workflows/ci.yml','Only the installer verification workflow is accepted');
           assert.equal(run.status,'completed','The installer workflow must finish first');
           assert.equal(run.conclusion,'success','All installer workflow checks must pass before runtime testing');
+          const paths=['src','android','build','scripts','package.json','package-lock.json'];
+          const diff=spawnSync('git',['diff','--quiet',run.head_sha,process.env.GITHUB_SHA,'--',...paths],{encoding:'utf8'});
+          assert.equal(diff.status,0,'Production source, dependencies and build scripts must match the verified APK commit');
+          const source={installerRunId:run.id,installerCommit:run.head_sha,runtimeCommit:process.env.GITHUB_SHA,productionPaths:paths,productionSourcesMatch:true};
+          fs.writeFileSync('.tools/runtime-source-check.json',JSON.stringify(source,null,2));
+          console.log(JSON.stringify(source));
           JS
           gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name Auralink-Android-companion --dir .tools/runtime-build
           node - <<'JS'
@@ -90,6 +98,7 @@ jobs:
           path: |
             test-results/android-emulator.json
             test-results/android-emulator-lobby.png
+            test-results/android-emulator-invitation-dialog.png
             test-results/android-emulator-room.png
             test-results/android-emulator-projection-permission.png
             test-results/android-emulator-sharing.png
