@@ -137,7 +137,7 @@ function renderInternet() {
   $('internet-pairing-code').disabled = busy || internet.status === 'online';
   $('internet-service').disabled = busy || internet.status === 'online';
   $('internet-account-hint').textContent = internet.status === 'online' ? 'Paired on this device. Your private group can see this device online; nobody can join a room or control it without approval.' : 'Use the same service address and private pairing code on your devices. The code is cleared after pairing. Your device credential stays on this device.';
-  if (!state.joined && !state.joining) setStatus(internet.status === 'online' ? 'Internet ready' : internet.status === 'retrying' ? 'Internet reconnecting…' : internet.status === 'connecting' ? 'Going online…' : 'Ready on this device', busy ? 'waiting' : '');
+  if (!state.joined && !state.joining && !state.leaving) setStatus(internet.status === 'online' ? 'Internet ready' : internet.status === 'retrying' ? 'Internet reconnecting…' : internet.status === 'connecting' ? 'Going online…' : 'Ready on this device', busy ? 'waiting' : '');
   renderDevices();
 }
 internet.addEventListener('status', renderInternet);
@@ -734,6 +734,8 @@ function renderDevices() {
 
 function updateButtons() {
   const ready = state.joined;
+  $('host-button').disabled = state.joined || state.joining || state.leaving;
+  $('join-button').disabled = state.joined || state.joining || state.leaving;
   for (const id of ['mic-button', 'camera-button', 'share-button']) $(id).disabled = !ready;
   if (state.mediaPending.has('audio')) $('mic-button').disabled = true;
   if (state.mediaPending.has('camera')) $('camera-button').disabled = true;
@@ -1254,8 +1256,8 @@ async function leaveRoom(stopHost = true) {
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
   $('session').hidden = true; $('lobby').hidden = false; $('room-duration').textContent = '00:00';
   $('internet-relay-note').hidden = true;
-  setStatus(internet.status === 'online' ? 'Internet ready' : 'Ready on this device'); renderRequests(); renderParticipants(); renderStage(); renderDevices(); renderControl(); updateButtons();
   state.leaving = false;
+  setStatus(internet.status === 'online' ? 'Internet ready' : 'Ready on this device'); renderRequests(); renderParticipants(); renderStage(); renderDevices(); renderControl(); updateButtons();
 }
 window.addEventListener('beforeunload', () => { state.rtc?.close(); bridge?.revokeControl(); state.socket?.close(); internet.close(); });
 

@@ -40,7 +40,7 @@ export class RoomRTC extends EventTarget {
     const entry = {
       info: peer, pc, senders: new Map(), remoteKinds: {}, remoteMids: {}, remoteState: {},
       remoteTracks: new Map(), inactiveRemoteTracks: new Map(), polite: this.selfId.localeCompare(peer.id) > 0,
-      makingOffer: false, ignoreOffer: false, settingAnswer: false, queue: Promise.resolve(), channel: null,
+      makingOffer: false, ignoreOffer: false, settingAnswer: false, queue: Promise.resolve(), mediaQueue: Promise.resolve(), channel: null,
     };
     this.peers.set(peer.id, entry);
     pc.onicecandidate = ({ candidate }) => { if (candidate) this.send(peer.id, { candidate: candidate.toJSON() }); };
@@ -69,8 +69,17 @@ export class RoomRTC extends EventTarget {
       // keep the perfect-negotiation offer flag set after SDP has been sent.
       void this.setVideoLimits();
     };
-    for (const [kind, item] of this.localTracks) entry.senders.set(kind, pc.addTrack(item.track, item.stream));
-    if (this.selfId.localeCompare(peer.id) < 0) this.setupChannel(peer.id, pc.createDataChannel('auralink-input', { ordered: true }));
+    // One deterministic offerer establishes three permanent media slots. The
+    // answerer reuses those offered transceivers instead of creating duplicate
+    // m-lines. Toggling/restarting capture replaces a source without SDP glare.
+    if (!entry.polite) {
+      for (const kind of ['audio', 'camera', 'screen']) {
+        const transceiver = pc.addTransceiver(kind === 'audio' ? 'audio' : 'video', { direction: 'sendrecv' });
+        entry.senders.set(kind, transceiver.sender);
+      }
+      void this.syncSenders(entry).catch(error => this.emit('error', { peerId: peer.id, error }));
+      this.setupChannel(peer.id, pc.createDataChannel('auralink-input', { ordered: true }));
+    }
     this.emit('connection', { peerId: peer.id, state: 'new' });
   }
 
@@ -90,10 +99,11 @@ export class RoomRTC extends EventTarget {
   send(peerId, data) { if (!this.closed) this.signal(peerId, data); }
 
   sendDescription(entry) {
+    if (this.closed || this.peers.get(entry.info.id) !== entry) return;
     const trackKinds = {}; const midKinds = {};
     for (const [kind, item] of this.localTracks) trackKinds[item.track.id] = kind;
     for (const transceiver of entry.pc.getTransceivers()) {
-      const kind = trackKinds[transceiver.sender.track?.id];
+      const kind = [...entry.senders].find(([, sender]) => sender === transceiver.sender)?.[0];
       if (kind && transceiver.mid !== null) midKinds[transceiver.mid] = kind;
     }
     this.send(entry.info.id, {
@@ -122,6 +132,16 @@ export class RoomRTC extends EventTarget {
         finally { entry.settingAnswer = false; }
         if (this.closed || this.peers.get(peerId) !== entry) return;
         if (description.type === 'offer') {
+          if (!entry.senders?.size && entry.pc.getTransceivers) {
+            for (const transceiver of pc.getTransceivers()) {
+              const kind = entry.remoteMids[transceiver.mid];
+              if (!['audio', 'camera', 'screen'].includes(kind) || entry.senders.has(kind)) continue;
+              transceiver.direction = 'sendrecv'; entry.senders.set(kind, transceiver.sender);
+            }
+            if (entry.senders.size !== 3) throw new Error('Use matching Auralink versions for this media connection.');
+            await this.syncSenders(entry);
+            if (this.closed || this.peers.get(peerId) !== entry) return;
+          }
           await pc.setLocalDescription();
           if (!this.closed && this.peers.get(peerId) === entry) this.sendDescription(entry);
         }
@@ -173,13 +193,25 @@ export class RoomRTC extends EventTarget {
     const old = this.localTracks.get(kind);
     if (old?.track === track) return;
     if (track) this.localTracks.set(kind, { track, stream }); else this.localTracks.delete(kind);
+    const replacements = [];
     for (const entry of this.peers.values()) {
-      const sender = entry.senders.get(kind);
-      if (sender) { entry.pc.removeTrack(sender); entry.senders.delete(kind); }
-      if (track) entry.senders.set(kind, entry.pc.addTrack(track, stream));
+      replacements.push(this.syncSenders(entry));
       this.send(entry.info.id, { mediaState: this.mediaState() });
     }
+    await Promise.all(replacements);
     if (track?.kind === 'video') await this.setVideoLimits();
+  }
+
+  syncSenders(entry) {
+    entry.mediaQueue = (entry.mediaQueue || Promise.resolve()).catch(() => {}).then(async () => {
+      if (this.closed || this.peers.get(entry.info.id) !== entry) return;
+      for (const [kind, sender] of entry.senders) {
+        const desired = this.localTracks.get(kind)?.track || null;
+        if (sender.track !== desired) await sender.replaceTrack(desired);
+        if (this.closed || this.peers.get(entry.info.id) !== entry) return;
+      }
+    });
+    return entry.mediaQueue;
   }
 
   async setVideoLimits(quality = this.quality || 'auto') {
@@ -188,6 +220,7 @@ export class RoomRTC extends EventTarget {
     for (const entry of this.peers.values()) {
       for (const [kind, sender] of entry.senders) {
         if (kind !== 'screen' && kind !== 'camera') continue;
+        if (!sender.track) continue;
         try {
           const params = sender.getParameters();
           if (!params.encodings?.length) params.encodings = [{}];

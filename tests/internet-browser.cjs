@@ -64,11 +64,18 @@ async function review(page, accept) {
   await page.locator('#requests-dialog [data-close]').click();
 }
 async function mediaProof(page, name) {
+  const audioBefore = await page.evaluate(async () => {
+    const values = await Promise.all(qaRTCs.filter(pc => pc.connectionState === 'connected').map(async pc => [...(await pc.getStats()).values()].filter(row => row.type === 'inbound-rtp' && row.kind === 'audio').map(row => [row.trackIdentifier, row.totalAudioEnergy || 0])));
+    return Object.fromEntries(values.flat());
+  });
   await page.getByRole('button', { name: `View ${name}`, exact: true }).click();
   await page.waitForFunction(() => { const video = document.getElementById('stage-video'); return !video.hidden && video.videoWidth > 0 && video.readyState >= 2 && video.currentTime > 0; }, null, { timeout: 20000 });
   await page.locator('#diagnostics-toggle').click();
   await page.waitForFunction(() => document.getElementById('rtc-stats').textContent.includes('Audio received') && /Audio received\d+ packets/.test(document.getElementById('rtc-stats').textContent), null, { timeout: 20000 });
+  await page.waitForFunction(async before => (await Promise.all(qaRTCs.filter(pc => pc.connectionState === 'connected').map(pc => pc.getStats()))).some(report => [...report.values()].some(row => row.type === 'inbound-rtp' && row.kind === 'audio' && row.packetsReceived > 10 && row.totalAudioEnergy > (before[row.trackIdentifier] || 0) + .00001)), audioBefore, { timeout: 20000 });
   const proof = await page.evaluate(() => { const video = document.getElementById('stage-video'); return { width: video.videoWidth, height: video.videoHeight, currentTime: video.currentTime, stats: document.getElementById('rtc-stats').innerText, rtcConfiguration: qaRTCConfigs.map(config => ({ ...config, iceServers: config.iceServers.map(server => ({ urls: server.urls, hasRelayCredential: Boolean(server.credential) })) })) }; });
+  proof.audio = await page.evaluate(async () => (await Promise.all(qaRTCs.filter(pc => pc.connectionState === 'connected').map(async pc => [...(await pc.getStats()).values()].filter(row => row.type === 'inbound-rtp' && row.kind === 'audio').map(row => ({ packetsReceived: row.packetsReceived, totalAudioEnergy: row.totalAudioEnergy, totalSamplesDuration: row.totalSamplesDuration, muted: pc.getReceivers().find(receiver => receiver.track.id === row.trackIdentifier)?.track.muted }))))).flat());
+  assert.ok(proof.audio.some(audio => audio.totalAudioEnergy > 0 && audio.muted === false), 'A received microphone must produce actual decoded audio energy on an unmuted track');
   assert.ok(proof.rtcConfiguration.some(config => config.iceServers.some(server => String(server.urls).startsWith('stun:'))), 'Coordinator ICE configuration must be set before peer construction');
   await page.locator('#diagnostics-close').click(); return proof;
 }
@@ -86,6 +93,8 @@ async function forgetTestIdentity(origin, identity) {
 async function main() {
   fs.mkdirSync(output, { recursive: true }); let runtime, proxy, browser; let phase = 'setup'; const errors = []; const contexts = []; const proof = {};
   const publicMode = Boolean(process.env.AURALINK_PUBLIC_ORIGIN); const evidenceName = publicMode ? 'internet-public-browser' : 'internet-browser';
+  const signalDelay = Number(process.env.AURALINK_QA_SIGNAL_DELAY_MS || 0);
+  if (!Number.isInteger(signalDelay) || signalDelay < 0 || signalDelay > 1000) throw new Error('The test signaling delay must be an integer from 0 to 1000 ms.');
   const suffix = publicMode ? ` ${Date.now().toString(36)}` : ''; const hostName = `QA desktop${suffix}`; const guestName = `QA phone${suffix}`;
   try {
     if (publicMode) {
@@ -102,18 +111,24 @@ async function main() {
     }
     proxy = await secureProxy(runtime); const serviceOrigin = publicMode ? runtime.url : proxy.origin;
     browser = await chromium.launch({ executablePath: browserPath, headless: true, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', '--disable-features=WebRtcHideLocalIpsWithMdns', `--ignore-certificate-errors-spki-list=${proxy.spkiHash}`] });
+    proof.browser = { executable: path.basename(browserPath), version: browser.version() };
     const desktop = await browser.newContext({ permissions: ['camera', 'microphone'], viewport: { width: 1360, height: 940 } });
     const mobile = await browser.newContext({ permissions: ['camera', 'microphone'], viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true }); contexts.push(desktop, mobile);
     for (const context of contexts) {
-      await context.addInitScript(() => {
-        window.qaCaptureCalls = []; window.qaStreams = []; window.qaRTCConfigs = []; window.qaRTCs = []; window.qaChannels = []; window.qaReceivedInputs = []; window.qaNative = { grants: [], revokes: 0, inputs: [] }; window.qaWaiting = []; window.qaHolds = new Map();
+      await context.addInitScript(({ signalDelay }) => {
+        window.qaCaptureCalls = []; window.qaStreams = []; window.qaRTCConfigs = []; window.qaRTCs = []; window.qaChannels = []; window.qaReceivedInputs = []; window.qaTrackEvents = []; window.qaSignaling = []; window.qaNative = { grants: [], revokes: 0, inputs: [] }; window.qaWaiting = []; window.qaHolds = new Map();
         window.qaHold = label => qaHolds.set(label, { promise: new Promise(resolve => { window.qaPendingResolve = resolve; }), resolve: qaPendingResolve });
         window.qaRelease = label => { const hold = qaHolds.get(label); qaHolds.delete(label); hold?.resolve(); };
         window.qaPause = async label => { const hold = qaHolds.get(label); if (hold) { qaWaiting.push(label); await hold.promise; qaWaiting = qaWaiting.filter(item => item !== label); } };
         const NativeSocket = window.WebSocket;
-        window.WebSocket = new Proxy(NativeSocket, { construct(target, args) { const socket = Reflect.construct(target, args); const listen = socket.addEventListener.bind(socket); socket.addEventListener = (type, callback, options) => listen(type, type === 'message' ? async event => { try { if (JSON.parse(event.data).type === 'room-created') await qaPause('room-created'); } catch {} callback(event); } : callback, options); return socket; } });
+        function recordSignal(direction, packet) {
+          if (packet.type === 'welcome') qaSignaling.push({ direction, type: 'welcome', selfId: packet.selfId, peers: packet.peers.map(peer => peer.id), time: performance.now() });
+          if (packet.type === 'signal' && (packet.data.description || packet.data.mediaState)) qaSignaling.push({ direction, type: 'signal', peerId: packet.to || packet.from, descriptionType: packet.data.description?.type, trackKinds: packet.data.trackKinds, midKinds: packet.data.midKinds, mediaState: packet.data.mediaState, time: performance.now() });
+          if (qaSignaling.length > 300) qaSignaling.shift();
+        }
+        window.WebSocket = new Proxy(NativeSocket, { construct(target, args) { const socket = Reflect.construct(target, args); const listen = socket.addEventListener.bind(socket); const send = socket.send.bind(socket); socket.send = raw => { try { recordSignal('out', JSON.parse(raw)); } catch {} return send(raw); }; socket.addEventListener = (type, callback, options) => listen(type, type === 'message' ? async event => { try { const packet = JSON.parse(event.data); recordSignal('in', packet); if (['room-created', 'room-left'].includes(packet.type)) await qaPause(packet.type); if (packet.type === 'signal' && signalDelay) await new Promise(resolve => setTimeout(resolve, signalDelay)); } catch {} callback(event); } : callback, options); return socket; } });
         function recordChannel(channel) { qaChannels.push(channel); channel.addEventListener('message', ({ data }) => { try { const packet = JSON.parse(data); if (packet.type === 'input') qaReceivedInputs.push(packet); } catch {} }); }
-        const NativeRTC = window.RTCPeerConnection; window.RTCPeerConnection = new Proxy(NativeRTC, { construct(target, args) { qaRTCConfigs.push(args[0]); const pc = Reflect.construct(target, args); qaRTCs.push(pc); const createChannel = pc.createDataChannel.bind(pc); pc.createDataChannel = (...values) => { const channel = createChannel(...values); recordChannel(channel); return channel; }; pc.addEventListener('datachannel', ({ channel }) => recordChannel(channel)); return pc; } });
+        const NativeRTC = window.RTCPeerConnection; window.RTCPeerConnection = new Proxy(NativeRTC, { construct(target, args) { qaRTCConfigs.push(args[0]); const pc = Reflect.construct(target, args); qaRTCs.push(pc); pc.addEventListener('track', ({ track, transceiver }) => { qaTrackEvents.push({ type: 'track', id: track.id, kind: track.kind, mid: transceiver.mid, muted: track.muted }); for (const type of ['mute', 'unmute', 'ended']) track.addEventListener(type, () => qaTrackEvents.push({ type, id: track.id, kind: track.kind, muted: track.muted })); }); const createChannel = pc.createDataChannel.bind(pc); pc.createDataChannel = (...values) => { const channel = createChannel(...values); recordChannel(channel); return channel; }; pc.addEventListener('datachannel', ({ channel }) => recordChannel(channel)); return pc; } });
         const nativeCapture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
         navigator.mediaDevices.getUserMedia = async config => { qaCaptureCalls.push(config); const stream = await nativeCapture(config); qaStreams.push(stream); return stream; };
         navigator.mediaDevices.getDisplayMedia = async () => { await qaPause('display'); const canvas = document.createElement('canvas'); canvas.width = 960; canvas.height = 540; const context = canvas.getContext('2d'); let frame = 0;
@@ -122,7 +137,7 @@ async function main() {
         window.auralink = { platform: 'qa-browser-fixture', getInfo: async () => ({ platform: 'Browser test fixture' }), requestMedia: async () => { await qaPause('permission'); return { ok: true }; }, sources: async () => { await qaPause('sources'); return [{ id: 'screen:qa', name: 'Synthetic desktop' }]; }, chooseScreen: async () => { await qaPause('selection'); }, stopSharing: async () => {},
           onScreenStopped: listener => { window.qaScreenStopped = listener; return () => {}; },
           grantControl: async request => { qaNative.grants.push(request); await qaPause('grant'); return { ok: true }; }, revokeControl: async () => { qaNative.revokes++; }, applyInput: async input => { qaNative.inputs.push(input); } };
-      });
+      }, { signalDelay });
     }
     const host = await desktop.newPage(); const guest = await mobile.newPage();
     for (const page of [host, guest]) page.on('pageerror', error => errors.push(`${phase}: ${error.message}`));
@@ -131,7 +146,8 @@ async function main() {
     await hostCard.waitFor(); assert.match(await hostCard.innerText(), /Online/); assert.equal(await hostCard.getByRole('button', { name: 'Request connection' }).isDisabled(), true);
     if (!publicMode) { await host.screenshot({ path: path.join(output, 'internet-settings-desktop.png'), fullPage: true }); await guest.screenshot({ path: path.join(output, 'internet-devices-phone.png'), fullPage: true }); }
     phase = 'cancel an Internet room before its creation reply'; await visitRooms(host); await host.locator('#host-button').click(); await host.locator('#host-mode').selectOption('internet'); await host.locator('#host-name').fill('Cancelled Internet room'); await host.evaluate(() => qaHold('room-created')); await host.locator('#create-room').click(); await host.waitForFunction(() => qaWaiting.includes('room-created'));
-    await host.locator('#host-dialog [data-close]').click(); await host.waitForFunction(() => !document.getElementById('host-button').disabled); assert.equal(await host.locator('#internet-status').textContent(), 'Online');
+    await host.evaluate(() => qaHold('room-left')); await host.locator('#host-dialog [data-close]').click(); await host.waitForFunction(() => qaWaiting.includes('room-left')); assert.equal(await host.locator('#host-button').isDisabled(), true); assert.equal(await host.locator('#join-button').isDisabled(), true); await host.evaluate(() => qaRelease('room-left'));
+    await host.waitForFunction(() => !document.getElementById('host-button').disabled); assert.equal(await host.locator('#internet-status').textContent(), 'Online'); proof.roomExitDisablesReplacementAdmissionUntilAcknowledged = true;
     await host.evaluate(() => qaRelease('room-created')); await host.waitForFunction(() => !qaWaiting.includes('room-created')); assert.equal(await host.locator('#session').isVisible(), false); proof.cancelledInternetCreationCannotOpenRoom = true;
     phase = 'create and reject'; await host.locator('#host-button').click(); await host.locator('#host-mode').selectOption('internet'); await host.locator('#host-name').fill('Across the world QA'); await host.locator('#create-room').click();
     await host.waitForFunction(() => document.getElementById('invite-dialog').open); const invite = await host.locator('#invite-value').inputValue(); assert.match(invite, /#internet=1&room=.+&key=/); assert.equal(await host.locator('#invite-fingerprint-box').isVisible(), false); await host.locator('#invite-dialog [data-close]').click();
@@ -144,7 +160,13 @@ async function main() {
     await guest.waitForFunction(() => !document.getElementById('mic-button').disabled); assert.equal(await guest.evaluate(() => qaCaptureCalls.length), 0); assert.equal(await host.evaluate(() => qaCaptureCalls.length), 0);
     phase = 'real direct WebRTC'; await host.locator('#camera-button').click(); await guest.locator('#camera-button').click(); await host.locator('#mic-button').click(); await guest.locator('#mic-button').click();
     proof.hostReceiver = await mediaProof(host, guestName); proof.guestReceiver = await mediaProof(guest, hostName);
+    phase = 'repeat rapid mic and camera toggles';
+    await host.locator('#mic-button').click(); await guest.locator('#mic-button').click(); await host.locator('#camera-button').click(); await guest.locator('#camera-button').click();
+    await host.waitForFunction(() => document.getElementById('stage-video').hidden); await guest.waitForFunction(() => document.getElementById('stage-video').hidden);
+    await host.locator('#camera-button').click(); await guest.locator('#camera-button').click(); await host.locator('#mic-button').click(); await guest.locator('#mic-button').click();
+    proof.hostReceiverAfterToggles = await mediaProof(host, guestName); proof.guestReceiverAfterToggles = await mediaProof(guest, hostName); proof.rapidMediaTogglesPreserveDecodedVideoAndAudio = true;
     phase = 'screen and separate control consent'; await host.locator('#share-button').click(); await host.getByRole('button', { name: 'Synthetic desktop' }).click();
+    await guest.waitForFunction(() => { const video = document.getElementById('stage-video'); return video.videoWidth === 960 && video.videoHeight === 540 && document.getElementById('stage-label-text').textContent.includes('screen'); }, null, { timeout: 20000 }); proof.cameraAndScreenKeepSeparateMediaSlots = true;
     await guest.waitForFunction(() => !document.getElementById('request-control').disabled, null, { timeout: 20000 }); await guest.locator('#request-control').click();
     await host.waitForFunction(() => document.getElementById('control-dialog').open); assert.equal(await host.evaluate(() => qaNative.grants.length), 0); await host.locator('#deny-control').click();
     phase = 'control decline then renewed request';
@@ -243,9 +265,9 @@ async function main() {
   } catch (error) {
     const pages = [];
     for (const [i, context] of contexts.entries()) for (const page of context.pages()) {
-      try { if (!publicMode) await page.screenshot({ path: path.join(output, `internet-failure-${i}.png`), fullPage: true }); pages.push(await page.evaluate(async () => ({ status: document.getElementById('connection-pill')?.textContent, toast: document.getElementById('toast-region')?.textContent, dialog: [...document.querySelectorAll('dialog[open]')].map(el => el.id), native: { grantCount: qaNative.grants.length, revokeCount: qaNative.revokes, inputCount: qaNative.inputs.length }, controlLabel: document.getElementById('request-control')?.innerText, captures: qaCaptureCalls, streams: qaStreams.map(stream => stream.getTracks().map(track => ({ kind: track.kind, enabled: track.enabled, readyState: track.readyState }))), rtc: await Promise.all(qaRTCs.map(async pc => ({ state: pc.connectionState, ice: pc.iceConnectionState, signaling: pc.signalingState, transceivers: pc.getTransceivers().map(item => ({ mid: item.mid, direction: item.direction, currentDirection: item.currentDirection, receiver: { kind: item.receiver.track.kind, readyState: item.receiver.track.readyState, muted: item.receiver.track.muted }, sender: item.sender.track ? { kind: item.sender.track.kind, readyState: item.sender.track.readyState } : null })), inbound: [...(await pc.getStats()).values()].filter(row => row.type === 'inbound-rtp').map(row => ({ kind: row.kind, packetsReceived: row.packetsReceived, framesDecoded: row.framesDecoded, width: row.frameWidth, height: row.frameHeight })) }))) }))); } catch {}
+      try { if (!publicMode) await page.screenshot({ path: path.join(output, `internet-failure-${i}.png`), fullPage: true }); pages.push(await page.evaluate(async () => ({ status: document.getElementById('connection-pill')?.textContent, toast: document.getElementById('toast-region')?.textContent, dialog: [...document.querySelectorAll('dialog[open]')].map(el => el.id), native: { grantCount: qaNative.grants.length, revokeCount: qaNative.revokes, inputCount: qaNative.inputs.length }, controlLabel: document.getElementById('request-control')?.innerText, captures: qaCaptureCalls, streams: qaStreams.map(stream => stream.getTracks().map(track => ({ id: track.id, kind: track.kind, enabled: track.enabled, readyState: track.readyState }))), visibility: document.visibilityState, stage: { hidden: document.getElementById('stage-video').hidden, width: document.getElementById('stage-video').videoWidth, height: document.getElementById('stage-video').videoHeight, time: document.getElementById('stage-video').currentTime, readyState: document.getElementById('stage-video').readyState, paused: document.getElementById('stage-video').paused, tracks: document.getElementById('stage-video').srcObject?.getTracks().map(track => ({ id: track.id, kind: track.kind, muted: track.muted, readyState: track.readyState })) }, trackEvents: qaTrackEvents, signaling: qaSignaling, rtc: await Promise.all(qaRTCs.map(async pc => ({ state: pc.connectionState, ice: pc.iceConnectionState, signaling: pc.signalingState, transceivers: pc.getTransceivers().map(item => ({ mid: item.mid, direction: item.direction, currentDirection: item.currentDirection, receiver: { id: item.receiver.track.id, kind: item.receiver.track.kind, readyState: item.receiver.track.readyState, muted: item.receiver.track.muted }, sender: item.sender.track ? { kind: item.sender.track.kind, readyState: item.sender.track.readyState } : null })), inbound: [...(await pc.getStats()).values()].filter(row => row.type === 'inbound-rtp').map(row => ({ kind: row.kind, trackIdentifier: row.trackIdentifier, ssrc: row.ssrc, mid: row.mid, packetsReceived: row.packetsReceived, framesDecoded: row.framesDecoded, width: row.frameWidth, height: row.frameHeight })) }))) }))); } catch {}
     }
-    fs.writeFileSync(path.join(output, `${evidenceName}-failure.json`), JSON.stringify({ phase, message: error.message, errors, pages }, null, 2)); throw error;
+    fs.writeFileSync(path.join(output, `${evidenceName}-failure.json`), JSON.stringify({ phase, browser: proof.browser, message: error.message, errors, pages }, null, 2)); throw error;
   }
   finally {
     if (publicMode) for (const context of contexts) for (const page of context.pages()) {
