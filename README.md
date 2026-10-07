@@ -39,7 +39,7 @@ Get Windows Setup, the Android APK and the Apple Silicon DMG from [Releases](htt
 6. Select the shared device and request control. The owner reviews and confirms native permission. Android also needs Auralink Accessibility enabled through system settings.
 7. Stop with the visible room controls or Android sharing notification. Desktop emergency stop: **Ctrl+Alt+Shift+Q** (Windows) / **Command+Option+Shift+Q** (Mac).
 
-Enabling Android Accessibility alone grants nobody control. Input still requires an approved session and active phone share. Choose the entire display for phone control; app-only capture is for presentations. On macOS grant Camera, Microphone, Screen Recording and Accessibility only for the associated feature; restart after permission changes if required. Use the OS review/open flow for the unnotarized DMG, rather than disabling Gatekeeper globally.
+Enabling Android Accessibility alone grants nobody control. Input still requires an approved session and active phone share. Android capture requests the full phone display so control coordinates map to the shared screen. On macOS grant Camera, Microphone, Screen Recording and Accessibility only for the associated feature; restart after permission changes if required. Use the OS review/open flow for the unnotarized DMG, rather than disabling Gatekeeper globally.
 
 ## Capabilities and limits
 

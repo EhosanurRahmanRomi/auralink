@@ -105,6 +105,24 @@ public final class MainActivity extends Activity {
         webView.setBackgroundColor(0xff0b111a);
         webView.addJavascriptInterface(new NativeBridge(), "AuralinkNative");
         webView.setWebViewClient(new WebViewClient() {
+            @Override public boolean onRenderProcessGone(WebView failed, android.webkit.RenderProcessGoneDetail detail) {
+                // A terminated renderer cannot be reused. Close native consent
+                // before removing it, and offer a fresh page without rejoining.
+                if (failed != webView) return true;
+                generation++; foreground = false; invitation = null;
+                webView = null; mediaRequest = null; pausedEvents.clear();
+                runtimePermissionsPending = false; permissionResultDeferred = false;
+                clearProjectionRequest(); closeSocket(); revokeControl("Android display process stopped.");
+                if (callAudio != null) callAudio.stop();
+                if (fullscreen != null) { root.removeView(fullscreen); fullscreen = null; fullscreenCallback = null; }
+                root.removeView(failed); failed.destroy();
+                new AlertDialog.Builder(MainActivity.this).setTitle("Display stopped")
+                    .setMessage("Android stopped the display process. Your room, screen share and control approval have ended. Reopen Auralink to connect again.")
+                    .setPositiveButton("Reopen", (dialog, which) -> recreate())
+                    .setNegativeButton("Close", (dialog, which) -> finish())
+                    .setOnCancelListener(dialog -> finish()).show();
+                return true;
+            }
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) { return !PAGE.equals(request.getUrl().toString().split("#", 2)[0]); }
             @Override public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) { handler.cancel(); }
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {

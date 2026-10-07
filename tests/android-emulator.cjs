@@ -26,13 +26,18 @@ const apk=path.join(project,'release',`Auralink-${pkg.version}-Android.apk`);
 const browserPath=[process.env.AURALINK_TEST_BROWSER,'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Google/Chrome/Application/chrome.exe','/usr/bin/chromium','/usr/bin/google-chrome'].filter(Boolean).find(file=>fs.existsSync(file));
 const delay=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 let phase='setup';
+let installedApkHash;
+function safeError(error) {
+  return String(error?.message || error).replace(/https?:\/\/[^\s'"<>]+(?:#|%23)key=[^\s'"<>]+/g,'[private test invitation redacted]')
+    .replace(/((?:roomKey|hostToken|key)\s*[=:]\s*["']?)[A-Za-z0-9_-]{16,}/g,'$1[redacted]');
+}
 async function adb(args,options={}) {
   const result=await exec(adbPath,['-s',serial,...args],{encoding:'utf8',timeout:30000,maxBuffer:16*1024*1024,windowsHide:true,...options});
   return result.stdout;
 }
 function decodeXML(value) {return value.replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');}
 async function hierarchy() {
-  await adb(['shell','uiautomator','dump','/sdcard/auralink-qa.xml']);
+  await adb(['shell','uiautomator','dump','--compressed','/sdcard/auralink-qa.xml'],{timeout:60000});
   const xml=await adb(['exec-out','cat','/sdcard/auralink-qa.xml']);
   return [...xml.matchAll(/<node\b([^>]*?)(?:\/>|>)/g)].map(match=>Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(pair=>[pair[1],decodeXML(pair[2])])));
 }
@@ -43,10 +48,14 @@ function coordinates(node) {
 async function tap(node) {const [x,y]=coordinates(node);await adb(['shell','input','tap',String(x),String(y)]);}
 async function findNode(predicate,timeout=30000) {
   const deadline=Date.now()+timeout;
-  do {const nodes=await hierarchy();const found=nodes.find(predicate);if(found)return found;await delay(800);}while(Date.now()<deadline);
+  do {let nodes=[];try{nodes=await hierarchy();}catch{}const found=nodes.find(predicate);if(found)return found;await delay(800);}while(Date.now()<deadline);
   throw new Error(`Android UI element absent during ${phase}`);
 }
 const label=(text)=>node=>node.text===text || node['content-desc']===text;
+function visible(node) {
+  const bounds=node.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);
+  return bounds && +bounds[3]>+bounds[1] && +bounds[4]>+bounds[2] && +bounds[2]<1147 && +bounds[4]>136;
+}
 async function screenshot(name) {fs.writeFileSync(path.join(output,name),await adb(['exec-out','screencap','-p'],{encoding:null}));}
 async function type(value) {assert.ok(!value.includes("'"));await adb(['shell',`input text '${value.replaceAll(' ','%s')}'`]);}
 
@@ -61,9 +70,19 @@ async function nativeDevice() {
   assert.equal((await adb(['shell','getprop','ro.boot.qemu.avd_name'])).trim(),'AuralinkAPI36','Refusing a different AVD');
   assert.equal((await adb(['shell','getprop','ro.build.version.sdk'])).trim(),'36');
   await adb(['shell','input','keyevent','82']);
+  installedApkHash=crypto.createHash('sha256').update(fs.readFileSync(apk)).digest('hex');
   await adb(['install','--no-incremental','-r',apk],{timeout:120000});
+  const installedPath=(await adb(['shell','pm','path','local.auralink.mobile'])).trim().replace(/^package:/,'');
+  assert.match(installedPath,/^\/data\/app\/[A-Za-z0-9_~=/.-]+\/base\.apk$/);
+  assert.equal((await adb(['shell',`sha256sum '${installedPath}'`])).split(/\s+/)[0],installedApkHash,'The installed APK must match the actual tested file');
   await adb(['shell','am','force-stop','local.auralink.mobile']);
   await adb(['shell','logcat','-c']);
+  if(process.argv.includes('--control')) {
+    // Enable the service only inside this verified throwaway emulator. Real
+    // phones always require the owner to enable it in Android Settings.
+    await adb(['shell','settings','put','secure','enabled_accessibility_services','local.auralink.mobile/local.auralink.mobile.AttendedAccessibilityService']);
+    await adb(['shell','settings','put','secure','accessibility_enabled','1']);
+  }
   await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
 }
 
@@ -117,17 +136,26 @@ async function hostFixture() {
 
 async function runUI(fixture) {
   phase='production APK lobby';console.log(phase);
-  await findNode(label('Enter invitation'),60000);await screenshot('android-emulator-lobby.png');
-  await tap(await findNode(label('Enter invitation')));
+  await findNode(node=>node.package==='local.auralink.mobile' && /Rooms|Your space|Settings/.test(node.text),60000);await screenshot('android-emulator-lobby.png');
+  let join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
+  for(let count=0;!join && count<3;count++) {
+    await adb(['shell','input','swipe','355','1060','355','470','450']);await delay(1000);join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
+  }
+  assert.ok(join,'Scroll the production lobby to the invitation action');await tap(join);
+  console.log('Android native invitation dialog opened');
   const fields=(await hierarchy()).filter(node=>node.class==='android.widget.EditText');
   assert.equal(fields.length,2,'Join form must expose name and invitation text inputs');
   await tap(fields[1]);await type(fixture.invite);await adb(['shell','input','keyevent','4']);
+  console.log('Pinned invitation entered through the production Android text field');
   await tap(await findNode(label('Request to join')));
   await fixture.take('join-request',45000);
   await findNode(label('Turn microphone on'),45000);await screenshot('android-emulator-room.png');
   phase='Android owner screen permission';console.log(phase);
   await tap(await findNode(label('Share screen')));
-  const permission=await findNode(node=>/Start now|Start recording|Start sharing/i.test(node.text),30000);
+  let permission=await findNode(node=>/Start now|Start recording|Start sharing/i.test(node.text) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button',30000);
+  if(permission['resource-id']==='com.android.permissioncontroller:id/permission_allow_button') {
+    await tap(permission);permission=await findNode(node=>/Start now|Start recording|Start sharing/i.test(node.text),30000);
+  }
   await screenshot('android-emulator-projection-permission.png');await tap(permission);
   phase='actual Android screen frames over WebRTC';console.log(phase);
   await fixture.page.waitForFunction(()=>{const video=document.getElementById('received-screen');return video && video.videoWidth>0 && video.currentTime>0 && video.readyState>=2;},undefined,{timeout:60000});
@@ -135,16 +163,49 @@ async function runUI(fixture) {
   await screenshot('android-emulator-sharing.png');
   const service=await adb(['shell','dumpsys','activity','services','local.auralink.mobile']);
   assert.match(service,/ScreenShareService/);assert.match(service,/isForeground=true/);
+  let control=null;
+  if(process.argv.includes('--control')) {
+    phase='separate attended phone control approval';console.log(phase);
+    await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.channel?.readyState==='open',fixture.peerId,{timeout:30000});
+    fixture.send({type:'control-request',to:fixture.peerId});
+    await tap(await findNode(label('Allow control'),30000));
+    await screenshot('android-emulator-native-control-consent.png');
+    await tap(await findNode(node=>node['resource-id']==='android:id/button1' && node.text==='Allow control',30000));
+    const grant=await fixture.take('control-response',30000);
+    assert.equal(grant.from,fixture.peerId);assert.equal(grant.accepted,true);
+    await findNode(node=>node['content-desc']==='Stop remote control immediately',30000);
+    phase='actual Android Accessibility input';console.log(phase);
+    await fixture.page.evaluate(({peerId,sessionId})=>{
+      const send=event=>rtc.sendData(peerId,{type:'input',sessionId,event});
+      send({type:'keydown',code:'Home',seq:1});send({type:'keyup',code:'Home',seq:2});
+    },{peerId:fixture.peerId,sessionId:grant.sessionId});
+    await findNode(node=>node.package==='com.google.android.apps.nexuslauncher',30000);
+    await screenshot('android-emulator-remotely-opened-home.png');
+    assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/,'Attended control must keep the explicitly approved projection active');
+    await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
+    await tap(await findNode(node=>node['content-desc']==='Stop remote control immediately',30000));
+    await fixture.take('control-revoke',30000);
+    await fixture.page.evaluate(({peerId,sessionId})=>{
+      rtc.sendData(peerId,{type:'input',sessionId,event:{type:'keydown',code:'Home',seq:3}});
+      rtc.sendData(peerId,{type:'input',sessionId,event:{type:'keyup',code:'Home',seq:4}});
+    },{peerId:fixture.peerId,sessionId:grant.sessionId});
+    await delay(1000);
+    const resumed=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
+    assert.match(resumed || '',/local\.auralink\.mobile/,'Revoked input must not reopen Home');
+    control={passed:true,checks:['Separate in-app and native owner approval','Real encrypted RTC input received by Accessibility service','Remote Home action changes actual Android app','Foreground sharing remains during approved background control','Owner floating Stop control revokes broker grant','Stale session input rejected after stop']};
+  }
   await tap(await findNode(node=>/Stop sharing|Stop screen sharing/.test(node['content-desc']) || node.text==='Stop sharing',20000));
   await delay(1500);
   const stopped=await adb(['shell','dumpsys','media_projection']);
   assert.ok(!stopped.includes('local.auralink.mobile'),'Stopping share must remove MediaProjection');
-  const fatal=(await adb(['shell','logcat','-d','-s','AndroidRuntime:E'])).trim();
+  const processId=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
+  assert.match(processId,/^\d+$/,'The actual Android app must remain alive after sharing');
+  const fatal=(await adb(['shell','logcat','-d',`--pid=${processId}`,'-s','AndroidRuntime:E'])).trim();
   assert.ok(!fatal.includes('FATAL EXCEPTION'),fatal);
   assert.deepEqual(fixture.errors,[]);
-  return {passed:true,version:pkg.version,serial,api:36,apkSha256:crypto.createHash('sha256').update(fs.readFileSync(apk)).digest('hex'),screen,
+  return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,screen,control,
     verified:['Production non-debuggable APK installed and loaded','Native pinned TLS room admission','Owner Android system projection consent','Actual MediaProjection screen frames decoded over WebRTC','Foreground sharing service','Owner share stop releases projection','No fatal Android runtime exception'],
-    limitations:['Emulator has no physical microphone or speaker; physical audio route needs real-device test.','Phone Accessibility input requires a separate attended test.'],errors:fixture.errors};
+    limitations:['Emulator has no physical microphone or speaker; physical audio route needs real-device test.',...(control?[]:['Phone Accessibility input requires a separate attended test.'])],errors:fixture.errors};
 }
 
 async function main() {
@@ -158,11 +219,18 @@ async function main() {
       await new Promise(resolve=>{process.once('SIGINT',resolve);process.once('SIGTERM',resolve);});clearInterval(interval);
     }else {const result=await runUI(fixture);fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));}
   }catch(error) {
+    // Failure screenshots and raw UI dumps can contain an invitation field.
+    // Keep those local/ignored; the workflow publishes only the safe summary.
     try{await screenshot('android-emulator-failure.png');fs.writeFileSync(path.join(output,'android-emulator-failure-ui.json'),JSON.stringify(await hierarchy(),null,2));}catch{}
-    fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:error.message},null,2));throw error;
+    fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:safeError(error)},null,2));throw new Error(safeError(error));
   }finally {
     if(!process.argv.includes('--fixture-only')) await adb(['shell','am','force-stop','local.auralink.mobile']).catch(()=>{});
-    if(fixture){for(const waiter of fixture.waiters)clearTimeout(waiter.timer);fixture.ws.close();await fixture.browser?.close();await fixture.broker.stop();}
+    if(fixture){
+      for(const waiter of fixture.waiters)clearTimeout(waiter.timer);
+      try{fixture.ws.close();}catch{}
+      await fixture.browser?.close().catch(()=>{});
+      await fixture.broker.stop().catch(()=>{});
+    }
   }
 }
-main().catch(error=>{console.error(`Android emulator check failed during ${phase}: ${error.message}`);process.exitCode=1;});
+main().catch(error=>{console.error(`Android emulator check failed during ${phase}: ${safeError(error)}`);process.exitCode=1;});
