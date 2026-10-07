@@ -20,6 +20,13 @@ Auralink connects Windows, Apple Silicon Macs and Android phones in a room hoste
 
 ![Auralink desktop workspace](docs/assets/desktop-ui.png)
 
+<details>
+<summary>See the Android interface</summary>
+
+<p align="center"><img src="docs/assets/android-ui.png" width="360" alt="The production Android APK running on Android 16, with its gradient room invitation interface"></p>
+
+</details>
+
 - Audio and camera calls for up to four participants.
 - Desktop screen/window presentation with adaptive quality and connection diagnostics.
 - Android display sharing through native system capture consent.

@@ -100,6 +100,8 @@ jobs:
             test-results/android-emulator-lobby.png
             test-results/android-emulator-invitation-dialog.png
             test-results/android-emulator-room.png
+            test-results/android-emulator-microphone-permission.png
+            test-results/android-emulator-audio-active.png
             test-results/android-emulator-projection-permission.png
             test-results/android-emulator-sharing.png
             test-results/android-emulator-native-control-consent.png
