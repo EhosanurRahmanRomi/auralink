@@ -1,0 +1,9 @@
+# Local development only. Copy to .dev.vars and replace this placeholder.
+# Generate 32 random bytes encoded as base64url; never commit your real key.
+PAIRING_KEY="REPLACE_ME"
+
+# Optional relay. Leave disabled for a zero-relay-cost direct-only deployment.
+RELAY_ENABLED="false"
+# METERED_APP_DOMAIN="your-app.metered.live"
+# METERED_API_KEY="credential-scoped-key-from-your-dashboard"
+# METERED_CREDENTIAL_EXPIRES_AT="2026-10-07T23:00:00Z"

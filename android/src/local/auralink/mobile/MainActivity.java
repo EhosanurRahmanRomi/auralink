@@ -43,11 +43,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import javax.net.ssl.HttpsURLConnection;
 
-/** Pinned local room client with explicitly attended Android screen sharing and control. */
+/** Pinned LAN or normal-PKI Internet signaling with explicitly attended device control. */
 public final class MainActivity extends Activity {
     private static final String PAGE = "https://appassets.androidplatform.net/assets/index.html";
     private static final String HOST = "appassets.androidplatform.net";
-    private static final Set<String> ASSETS = new HashSet<>(Arrays.asList("index.html", "styles.css", "app.js", "rtc.js", "android-bridge.js"));
+    private static final Set<String> ASSETS = new HashSet<>(Arrays.asList("index.html", "styles.css", "app.js", "rtc.js", "android-bridge.js", "internet.js", "desktop-internet.js"));
     private final ExecutorService workers = Executors.newSingleThreadExecutor();
     private WebView webView;
     private FrameLayout root;
@@ -56,15 +56,18 @@ public final class MainActivity extends Activity {
     private volatile boolean foreground, destroyed;
     private long generation = 0;
     private Invitation invitation;
+    private InternetServiceEndpoint internetService;
     private PinnedRoomClient socket;
     private String socketId;
     private PermissionRequest mediaRequest;
     private long mediaGeneration;
+    private int nextPermissionCode = 1000, mediaPermissionCode, notificationPermissionCode, projectionPermissionCode;
     private boolean runtimePermissionsPending, permissionResultDeferred;
     private final java.util.ArrayDeque<Runnable> pausedEvents = new java.util.ArrayDeque<>();
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final Set<String> approvedPeers = new HashSet<>();
-    private String selfId, projectionRequest;
+    private final RoomMembership roomMembership = new RoomMembership();
+    private String projectionRequest;
+    private String projectionId;
     private long projectionGeneration, controlGeneration;
     private boolean projectionPermissionPending, projectionStarting;
     private JSONObject projectionOptions;
@@ -109,7 +112,7 @@ public final class MainActivity extends Activity {
                 // A terminated renderer cannot be reused. Close native consent
                 // before removing it, and offer a fresh page without rejoining.
                 if (failed != webView) return true;
-                generation++; foreground = false; invitation = null;
+                generation++; foreground = false; invitation = null; internetService = null;
                 webView = null; mediaRequest = null; pausedEvents.clear();
                 runtimePermissionsPending = false; permissionResultDeferred = false;
                 clearProjectionRequest(); closeSocket(); revokeControl("Android display process stopped.");
@@ -142,7 +145,7 @@ public final class MainActivity extends Activity {
         });
         webView.setWebChromeClient(new WebChromeClient() {
             @Override public void onPermissionRequest(PermissionRequest request) { runOnUiThread(() -> requestMedia(request)); }
-            @Override public void onPermissionRequestCanceled(PermissionRequest request) { runOnUiThread(() -> { if (mediaRequest == request) mediaRequest = null; }); }
+            @Override public void onPermissionRequestCanceled(PermissionRequest request) { runOnUiThread(() -> { if (mediaRequest == request) { mediaRequest = null; mediaPermissionCode = 0; runtimePermissionsPending = false; permissionResultDeferred = false; } }); }
             @Override public void onShowCustomView(View view, CustomViewCallback callback) {
                 if (fullscreen != null || !trustedPage()) { callback.onCustomViewHidden(); return; }
                 fullscreen = view; fullscreenCallback = callback; root.addView(view, new FrameLayout.LayoutParams(-1, -1)); webView.setVisibility(View.INVISIBLE);
@@ -156,6 +159,16 @@ public final class MainActivity extends Activity {
     }
     private boolean localDocument() { return !destroyed && webView != null && PAGE.equals(webView.getUrl() == null ? "" : webView.getUrl().split("#", 2)[0]); }
     private boolean trustedPage() { return foreground && localDocument(); }
+    private String installedVersion() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; }
+        catch (PackageManager.NameNotFoundException missing) { return "unknown"; }
+    }
+    private int newPermissionCode() {
+        // Activity result codes are 16-bit. Keep separate codes for each owned
+        // prompt so an old result can never complete a replacement request.
+        if (nextPermissionCode > 65535) throw new IllegalStateException("Reopen Auralink before requesting another permission.");
+        return nextPermissionCode++;
+    }
     private boolean projectionSession() { return localDocument() && (ScreenShareService.active() || projectionStarting); }
     private boolean transportPage() { return trustedPage() || ownPermissionPause() || projectionSession(); }
     private boolean ownPermissionPause() {
@@ -198,14 +211,24 @@ public final class MainActivity extends Activity {
             String method = request.getString("method"); Object args = request.opt("args");
             if ("getInfo".equals(method)) {
                 boolean enabled = AttendedAccessibilityService.current() != null;
-                reply(id, json("platform", "android", "version", "0.2.0", "nativeControl", true,
+                reply(id, json("platform", "android", "version", installedVersion(), "nativeControl", true,
                     "supports", new JSONArray(Arrays.asList("tap", "swipe", "wheel", "editable-text", "back", "home")), "accessibilityEnabled", enabled, "notificationAvailable", notificationsAvailable(),
                     "capabilities", json("hostRoom", false, "screenShare", true, "remoteInputHost", true, "accessibilityEnabled", enabled, "screenMaxEdge", 1920, "screenMaxFps", 12)));
             } else if ("startScreenShare".equals(method)) {
                 startProjection(id, args instanceof JSONObject ? (JSONObject)args : new JSONObject());
             } else if ("stopScreenShare".equals(method)) {
+                // A delayed renderer continuation may clean up only the capture
+                // it started, never a newer owner-approved replacement.
+                if (args instanceof JSONObject && ((JSONObject)args).has("captureId") &&
+                    !java.util.Objects.equals(projectionId, ((JSONObject)args).optString("captureId"))) {
+                    reply(id, json("ok", false, "reason", "That screen share has already ended.")); return;
+                }
                 reply(id, json("ok", true)); clearProjectionRequest(); ScreenShareService.stopCurrent("Stopped in Auralink."); revokeControl("Screen sharing stopped.");
             } else if ("ackScreenFrame".equals(method)) {
+                if (((JSONObject)args).has("captureId") &&
+                    !java.util.Objects.equals(projectionId, ((JSONObject)args).optString("captureId"))) {
+                    reply(id, json("ok", false)); return;
+                }
                 ScreenShareService.acknowledge(((JSONObject)args).getLong("seq")); reply(id, json("ok", true));
             } else if ("grantControl".equals(method)) {
                 grantControl(id, (JSONObject)args);
@@ -214,7 +237,7 @@ public final class MainActivity extends Activity {
             } else if ("applyInput".equals(method)) {
                 JSONObject input = (JSONObject)args; AttendedAccessibilityService service = AttendedAccessibilityService.current();
                 String peer = input.getString("peerId"), session = input.getString("sessionId");
-                boolean authorized = service != null && service.matches(peer, session) && service.active() && service.confirmed();
+                boolean authorized = roomMembership.allows(peer) && service != null && service.matches(peer, session) && service.active() && service.confirmed();
                 boolean ok = authorized && service.apply(peer, session, input.getJSONObject("event"));
                 reply(id, json("ok", ok, "reason", ok ? "" : authorized ? "Unsupported phone input or this field is unavailable for accessibility editing." : "Control is not approved for this phone, participant and session."));
             } else if ("inputStatus".equals(method)) {
@@ -231,7 +254,7 @@ public final class MainActivity extends Activity {
                 if (!(args instanceof String)) throw new IllegalArgumentException("Invalid invitation.");
                 final Invitation candidate = Invitation.parse((String)args);
                 if (socket != null) throw new IllegalArgumentException("Leave your room before checking another invitation.");
-                final long serial = ++generation; invitation = null; final String requestId = id;
+                final long serial = ++generation; invitation = null; internetService = null; final String requestId = id;
                 workers.execute(() -> {
                     try {
                         HttpsURLConnection connection = (HttpsURLConnection)new URL(candidate.origin + "/health").openConnection();
@@ -249,22 +272,55 @@ public final class MainActivity extends Activity {
                         });
                     } catch (Exception failure) { runOnUiThread(() -> { if (generation == serial) reject(requestId, "Could not verify the host. Check the full invitation and Wi-Fi connection."); }); }
                 });
+            } else if ("trustInternetService".equals(method)) {
+                if (!(args instanceof String)) throw new IllegalArgumentException("Invalid Internet service address.");
+                final InternetServiceEndpoint candidate = InternetServiceEndpoint.parse((String)args);
+                if (socket != null) throw new IllegalArgumentException("Disconnect before selecting another service.");
+                final long serial = ++generation; invitation = null; internetService = null; final String requestId = id;
+                workers.execute(() -> {
+                    try {
+                        // Default platform CA and hostname checks apply. A redirect may
+                        // not turn the selected service into a different authority.
+                        HttpsURLConnection connection = (HttpsURLConnection)new URL(candidate.origin + "/internet/health").openConnection();
+                        connection.setConnectTimeout(7000); connection.setReadTimeout(7000); connection.setInstanceFollowRedirects(false);
+                        try { if (connection.getResponseCode() != 200) throw new IllegalArgumentException("Service did not return a healthy response."); }
+                        finally { connection.disconnect(); }
+                        runOnUiThread(() -> {
+                            if (!trustedPage() || generation != serial) return;
+                            internetService = candidate;
+                            try { reply(requestId, json("url", candidate.origin, "socketUrl", candidate.socketUri().toString(), "mode", "internet")); }
+                            catch (Exception failure) { internetService = null; reject(requestId, "Invalid Internet service endpoint."); }
+                        });
+                    } catch (Exception failure) { runOnUiThread(() -> { if (generation == serial) reject(requestId, "Could not verify the Internet service. Check its HTTPS address, certificate and connection."); }); }
+                });
             } else if ("openSocket".equals(method)) {
                 JSONObject options = (JSONObject)args; String nextId = options.getString("socketId");
-                if (!nextId.matches("socket-[0-9]{1,16}") || invitation == null || socket != null || !invitation.matchesSocket(options.getString("url")))
-                    throw new IllegalArgumentException("Socket address is not the verified invitation.");
+                String address = options.getString("url");
+                boolean verifiedLan = invitation != null && internetService == null && invitation.matchesSocket(address);
+                boolean verifiedInternet = internetService != null && invitation == null && internetService.matchesSocket(address);
+                if (!nextId.matches("socket-[0-9]{1,16}") || socket != null || !(verifiedLan || verifiedInternet))
+                    throw new IllegalArgumentException("Socket address is not the verified invitation or Internet service.");
                 final long serial = generation; final String activeId = nextId;
-                PinnedRoomClient client = new PinnedRoomClient(invitation, new PinnedRoomClient.Listener() {
+                final boolean internet = verifiedInternet;
+                PinnedRoomClient.Listener listener = new PinnedRoomClient.Listener() {
                     public void opened() { event(serial, activeId, "open", null, 0, null); }
                     public void message(String data) { event(serial, activeId, "message", data, 0, null); }
                     public void closed(int code, String reason) { event(serial, activeId, "close", null, code, reason); }
-                    public void failed(Exception error) { event(serial, activeId, "error", null, 0, "Host connection failed or certificate changed."); }
-                });
+                    public void failed(Exception error) { event(serial, activeId, "error", null, 0, internet ? "Internet service connection or certificate verification failed." : "Host connection failed or certificate changed."); }
+                };
+                PinnedRoomClient client = verifiedInternet ? new PinnedRoomClient(internetService, listener) : new PinnedRoomClient(invitation, listener);
                 socket = client; socketId = activeId; reply(id, json("ok", true)); client.connect();
             } else if ("sendSocket".equals(method)) {
                 JSONObject options = (JSONObject)args;
                 if (socket == null || !socket.isOpen() || !socketId.equals(options.getString("socketId"))) throw new IllegalArgumentException("Socket is not open.");
                 String data = options.getString("data"); if (data.length() > 65536) throw new IllegalArgumentException("Message is too large.");
+                if (internetService != null) {
+                    JSONObject outgoing = new JSONObject(data); String operation = outgoing.optString("type");
+                    if (roomMembership.endForOutbound(operation)) {
+                        clearRoomState("Internet room changed locally.");
+                        if ("join".equals(operation) || "join-device".equals(operation)) roomMembership.expectAdmission(outgoing.optString("roomId"), "join-device".equals(operation));
+                    }
+                }
                 socket.send(data); reply(id, json("ok", true));
             } else if ("closeSocket".equals(method)) {
                 JSONObject options = (JSONObject)args;
@@ -276,12 +332,15 @@ public final class MainActivity extends Activity {
     private void event(long serial, String id, String type, String data, int code, String reason) {
         runOnUiThread(() -> {
             if (destroyed || generation != serial || !id.equals(socketId)) return;
+            // A disconnected background session cannot retain WebView media or
+            // projection consent, even while an approved projection was active.
+            if (!foreground && ("close".equals(type) || "error".equals(type))) { stopSession(); return; }
             if (!foreground && ownPermissionPause() && !projectionSession()) {
                 if (pausedEvents.size() >= 64) { stopSession(); return; }
                 pausedEvents.add(() -> event(serial, id, type, data, code, reason)); return;
             }
             if (!transportPage()) return;
-            if ("message".equals(type)) observeBroker(data);
+            if ("message".equals(type) && !observeBroker(data)) return;
             deliver(json("event", "socket", "socketId", id, "type", type, "data", data == null ? JSONObject.NULL : data,
                 "code", code, "reason", reason == null ? "" : reason, "message", reason == null ? "" : reason));
             if ("close".equals(type)) { closeSocket(); }
@@ -289,46 +348,64 @@ public final class MainActivity extends Activity {
         });
     }
     private void closeSocket() {
-        PinnedRoomClient previous = socket; socket = null; socketId = null; selfId = null; approvedPeers.clear();
-        revokeControl("Room connection closed."); ScreenShareService.stopCurrent("Room connection closed.");
+        PinnedRoomClient previous = socket; socket = null; socketId = null;
+        clearRoomState("Room connection closed.");
         if (previous != null) previous.cancel();
     }
-    private void observeBroker(String data) {
+    private void clearRoomState(String reason) {
+        roomMembership.clear(); String pendingProjection = projectionRequest; clearProjectionRequest();
+        if (pendingProjection != null) reject(pendingProjection, reason);
+        revokeControl(reason); ScreenShareService.stopCurrent(reason);
+        if (mediaRequest != null) { mediaRequest.deny(); mediaRequest = null; }
+        mediaPermissionCode = 0; runtimePermissionsPending = false; permissionResultDeferred = false;
+        if (callAudio != null) callAudio.stop();
+    }
+    private boolean observeBroker(String data) {
         try {
             JSONObject message = new JSONObject(data); String type = message.optString("type");
             if ("welcome".equals(type)) {
-                selfId = message.getString("selfId"); approvedPeers.clear(); JSONArray peers = message.optJSONArray("peers");
-                if (peers != null) for (int index = 0; index < peers.length(); index++) approvedPeers.add(peers.getJSONObject(index).getString("id"));
-            } else if ("peer-joined".equals(type)) approvedPeers.add(message.getJSONObject("peer").getString("id"));
+                if (internetService != null && !roomMembership.acceptsWelcome(message.optString("selfId"), message.optJSONObject("room") == null ? "" : message.optJSONObject("room").optString("id"))) return false;
+                clearRoomState("Room admission changed.");
+                JSONArray peers = message.optJSONArray("peers"); ArrayList<String> identities = new ArrayList<>();
+                if (peers != null) for (int index = 0; index < peers.length(); index++) identities.add(peers.getJSONObject(index).getString("id"));
+                roomMembership.begin(message.getString("selfId"), identities);
+            } else if ("pending".equals(type) && internetService != null) {
+                if (!roomMembership.observePending(message.optString("selfId"), message.optJSONObject("room") == null ? "" : message.optJSONObject("room").optString("id"))) return false;
+            } else if ("peer-joined".equals(type)) roomMembership.add(message.getJSONObject("peer").getString("id"));
             else if ("peer-left".equals(type)) {
-                String peer = message.optString("peerId", message.optString("id")); approvedPeers.remove(peer);
+                String peer = message.optString("peerId", message.optString("id")); roomMembership.remove(peer);
                 AttendedAccessibilityService service = AttendedAccessibilityService.current();
                 if (service != null && peer.equals(service.controller())) revokeControl("Controller disconnected.");
             } else if ("control-granted".equals(type)) {
                 AttendedAccessibilityService service = AttendedAccessibilityService.current();
-                if (service != null && selfId != null && selfId.equals(message.optString("targetId"))) service.confirm(message.optString("peerId"), message.optString("sessionId"));
+                if (service != null && roomMembership.hasRoom() && roomMembership.selfId().equals(message.optString("targetId")) && roomMembership.allows(message.optString("peerId"))) service.confirm(message.optString("peerId"), message.optString("sessionId"));
             } else if ("control-revoked".equals(type)) {
                 AttendedAccessibilityService service = AttendedAccessibilityService.current();
                 if (service != null && service.matches(message.optString("peerId"), message.optString("sessionId"))) revokeControl(message.optString("reason", "Room owner revoked control."));
-            } else if ("room-ended".equals(type) || "rejected".equals(type)) {
-                revokeControl("Room ended."); ScreenShareService.stopCurrent("Room ended.");
+            } else if (roomMembership.endForEvent(type)) {
+                // The Internet directory socket can stay online after leaving;
+                // no native media or control approval may survive that room.
+                clearRoomState("Room ended.");
             }
         } catch (Exception ignored) { /* Renderer handles malformed/unrecognized room messages. */ }
+        return true;
     }
     private void clearProjectionRequest() {
-        main.removeCallbacks(projectionDeadline); ScreenShareService.cancelPreparation();
+        main.removeCallbacks(projectionDeadline); ScreenShareService.cancelPreparation(projectionId);
         projectionRequest = null; projectionOptions = null; projectionPermissionPending = false; projectionStarting = false;
+        projectionId = null;
+        projectionPermissionCode = 0; notificationPermissionCode = 0;
         deferredProjectionResult = false; deferredProjectionConsent = null; notificationLaunchDeferred = false;
     }
     private void startProjection(String requestId, JSONObject options) {
-        if (!trustedPage() || socket == null || !socket.isOpen() || selfId == null) { reject(requestId, "Join an approved room before sharing the phone."); return; }
+        if (!trustedPage() || socket == null || !socket.isOpen() || !roomMembership.hasRoom()) { reject(requestId, "Join an approved room before sharing the phone."); return; }
         if (projectionRequest != null || ScreenShareService.active()) { reject(requestId, "Phone screen sharing is already starting or active."); return; }
-        projectionRequest = requestId; projectionGeneration = generation; projectionOptions = options; projectionPermissionPending = true;
+        projectionRequest = requestId; projectionId = java.util.UUID.randomUUID().toString(); projectionGeneration = roomMembership.epoch(); projectionOptions = options; projectionPermissionPending = true;
         main.postDelayed(projectionDeadline, 120000);
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             // A visible stop notification matters while another app is being
             // shared. Denial is respected and does not prevent screen consent.
-            try { requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 43); }
+            try { notificationPermissionCode = newPermissionCode(); requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, notificationPermissionCode); }
             catch (Exception failure) { launchScreenConsent(); }
         } else launchScreenConsent();
     }
@@ -338,45 +415,46 @@ public final class MainActivity extends Activity {
     }
     private void launchScreenConsent() {
         final String requestId = projectionRequest;
-        if (requestId == null) return;
-        if (!trustedPage() || projectionGeneration != generation || socket == null || !socket.isOpen() || selfId == null) {
+        if (requestId == null || projectionPermissionCode != 0) return;
+        if (!trustedPage() || projectionGeneration != roomMembership.epoch() || socket == null || !socket.isOpen() || !roomMembership.hasRoom()) {
             clearProjectionRequest(); reject(requestId, "Return to the active room and try sharing again."); return;
         }
         MediaProjectionManager manager = (MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
         try {
             // Full-display capture is required to map control coordinates safely.
             Intent captureIntent = Build.VERSION.SDK_INT >= 34 ? manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay()) : manager.createScreenCaptureIntent();
-            startActivityForResult(captureIntent, 42);
+            projectionPermissionCode = newPermissionCode(); startActivityForResult(captureIntent, projectionPermissionCode);
         } catch (Exception failure) { clearProjectionRequest(); reject(requestId, "Android could not open screen sharing permission."); }
     }
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != 42 || projectionRequest == null) return;
+        if (requestCode != projectionPermissionCode || projectionRequest == null) return;
+        projectionPermissionCode = 0;
         if (!foreground) { deferredProjectionResult = true; deferredProjectionCode = resultCode; deferredProjectionConsent = data; return; }
         finishProjectionPermission(resultCode, data);
     }
     private void finishProjectionPermission(int resultCode, Intent data) {
         final String requestId = projectionRequest; final long serial = projectionGeneration;
         if (requestId == null) return;
-        if (resultCode != RESULT_OK || data == null || !trustedPage() || serial != generation || socket == null || !socket.isOpen() || selfId == null) {
+        if (resultCode != RESULT_OK || data == null || !trustedPage() || serial != roomMembership.epoch() || socket == null || !socket.isOpen() || !roomMembership.hasRoom()) {
             clearProjectionRequest(); reject(requestId, "Screen sharing was canceled or the room ended."); return;
         }
         projectionPermissionPending = false; projectionStarting = true;
-        final JSONObject options = projectionOptions; String ticket = java.util.UUID.randomUUID().toString();
+        final JSONObject options = projectionOptions; final String ticket = projectionId;
         ScreenShareService.prepare(ticket, new ScreenShareService.Listener() {
             public void started(int width, int height, int maxEdge) {
-                if (destroyed || generation != serial || !requestId.equals(projectionRequest)) { ScreenShareService.stopCurrent("Screen start was superseded."); return; }
+                if (destroyed || roomMembership.epoch() != serial || !ticket.equals(projectionId) || !requestId.equals(projectionRequest)) { ScreenShareService.stopCurrent(ticket, "Screen start was superseded."); return; }
                 projectionRequest = null; projectionOptions = null; projectionStarting = false; main.removeCallbacks(projectionDeadline);
-                reply(requestId, json("id", "android-screen", "name", "Phone display", "width", width, "height", height, "fps", 12, "maxEdge", maxEdge, "notificationAvailable", notificationsAvailable()));
+                reply(requestId, json("id", "android-screen", "captureId", ticket, "name", "Phone display", "width", width, "height", height, "fps", 12, "maxEdge", maxEdge, "notificationAvailable", notificationsAvailable()));
             }
             public void frame(long seq, String jpeg, int width, int height) {
-                if (generation == serial && localDocument()) deliver(json("event", "screen", "type", "frame", "seq", seq, "data", "data:image/jpeg;base64," + jpeg, "width", width, "height", height));
+                if (roomMembership.epoch() == serial && roomMembership.hasRoom() && ticket.equals(projectionId) && localDocument()) deliver(json("event", "screen", "type", "frame", "captureId", ticket, "seq", seq, "data", "data:image/jpeg;base64," + jpeg, "width", width, "height", height));
             }
             public void stopped(String reason) {
-                if (destroyed || generation != serial) return;
+                if (destroyed || roomMembership.epoch() != serial || !ticket.equals(projectionId)) return;
                 String pending = projectionRequest; clearProjectionRequest();
                 if (pending != null) reject(pending, reason);
-                if (foreground) deliver(json("event", "screen", "type", "stopped", "reason", reason));
+                if (foreground) deliver(json("event", "screen", "type", "stopped", "captureId", ticket, "reason", reason));
                 else stopSession();
             }
         });
@@ -394,7 +472,7 @@ public final class MainActivity extends Activity {
     private void grantControl(String requestId, JSONObject options) {
         String peerId = options.optString("peerId"), sessionId = options.optString("sessionId");
         if (!trustedPage() || !"android-screen".equals(options.optString("screenId")) || !ScreenShareService.activeFullDisplay() ||
-            !approvedPeers.contains(peerId) || !AttendedControlPolicy.validIdentity(peerId) || !AttendedControlPolicy.validIdentity(sessionId) || sessionId.length() < 16) {
+            !roomMembership.allows(peerId) || !AttendedControlPolicy.validIdentity(peerId) || !AttendedControlPolicy.validIdentity(sessionId) || sessionId.length() < 16) {
             reply(requestId, json("ok", false, "reason", "Share your full phone display and select an approved room member first.")); return;
         }
         final AttendedAccessibilityService service = AttendedAccessibilityService.current();
@@ -413,7 +491,7 @@ public final class MainActivity extends Activity {
             .setMessage("They can tap, swipe, scroll and enter text into ordinary apps for up to 15 minutes. Escape means Back; Home opens the phone Home screen. Password fields, the lock screen and protected screen content remain restricted. A floating Stop control button and the screen sharing notification let you end this immediately.")
             .setPositiveButton("Allow control", (dialog, which) -> {
                 controlDialog = null;
-                if (!trustedPage() || generation != serial || controlGeneration != approval || !approvedPeers.contains(peerId) || !ScreenShareService.activeFullDisplay()) { reply(requestId, json("ok", false, "reason", "Approval expired or the room changed.")); return; }
+                if (!trustedPage() || generation != serial || controlGeneration != approval || !roomMembership.allows(peerId) || !ScreenShareService.activeFullDisplay()) { reply(requestId, json("ok", false, "reason", "Approval expired or the room changed.")); return; }
                 boolean granted = service.grant(peerId, sessionId, displayName, reason -> {
                     deliver(json("event", "control-stop", "reason", reason));
                 });
@@ -426,7 +504,7 @@ public final class MainActivity extends Activity {
         controlDialog.show();
     }
     private void requestMedia(PermissionRequest request) {
-        if (!trustedPage() || selfId == null || !"https".equals(request.getOrigin().getScheme()) || !HOST.equals(request.getOrigin().getHost()) ||
+        if (!trustedPage() || !roomMembership.hasRoom() || !"https".equals(request.getOrigin().getScheme()) || !HOST.equals(request.getOrigin().getHost()) ||
             request.getOrigin().getPort() != -1 || mediaRequest != null) { request.deny(); return; }
         ArrayList<String> needed = new ArrayList<>();
         for (String resource : request.getResources()) {
@@ -435,16 +513,16 @@ public final class MainActivity extends Activity {
             if (permission == null) { request.deny(); return; }
             if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) needed.add(permission);
         }
-        mediaRequest = request; mediaGeneration = generation;
+        mediaRequest = request; mediaGeneration = roomMembership.epoch();
         if (needed.isEmpty()) completeMedia(); else {
             runtimePermissionsPending = true;
-            try { requestPermissions(needed.toArray(new String[0]), 41); }
+            try { mediaPermissionCode = newPermissionCode(); requestPermissions(needed.toArray(new String[0]), mediaPermissionCode); }
             catch (Exception failure) { runtimePermissionsPending = false; mediaRequest = null; request.deny(); }
         }
     }
     private void completeMedia() {
         PermissionRequest request = mediaRequest; mediaRequest = null; if (request == null) return;
-        if (!trustedPage() || selfId == null || mediaGeneration != generation || socket == null || !socket.isOpen()) { request.deny(); return; }
+        if (!trustedPage() || !roomMembership.hasRoom() || mediaGeneration != roomMembership.epoch() || socket == null || !socket.isOpen()) { request.deny(); return; }
         ArrayList<String> granted = new ArrayList<>();
         for (String resource : request.getResources()) {
             if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource) && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) granted.add(resource);
@@ -464,12 +542,14 @@ public final class MainActivity extends Activity {
     }
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(code, permissions, results);
-        if (code == 41) {
+        if (code == mediaPermissionCode && mediaRequest != null) {
+            mediaPermissionCode = 0;
             // Android may pause this Activity for its own permission dialog.
             // Grant only after our page has returned to the foreground.
             if (foreground) { runtimePermissionsPending = false; completeMedia(); }
             else permissionResultDeferred = true;
-        } else if (code == 43 && projectionRequest != null) {
+        } else if (code == notificationPermissionCode && projectionRequest != null) {
+            notificationPermissionCode = 0;
             // Notification permission is optional. Continue with a separately
             // owned screen sharing consent when this document returns.
             if (foreground) launchScreenConsent(); else notificationLaunchDeferred = true;
@@ -485,7 +565,7 @@ public final class MainActivity extends Activity {
         // not guarantee MediaStream tracks or peer data channels are stopped.
         if (webView != null) {
             deliver(json("event", "session-stop", "reason", "Android app moved to the background."));
-            foreground = false; generation++; invitation = null; closeSocket();
+            foreground = false; generation++; invitation = null; internetService = null; closeSocket();
             clearProjectionRequest(); revokeControl("Android session ended."); if (callAudio != null) callAudio.stop();
             runtimePermissionsPending = false; permissionResultDeferred = false; pausedEvents.clear();
             if (mediaRequest != null) { mediaRequest.deny(); mediaRequest = null; }

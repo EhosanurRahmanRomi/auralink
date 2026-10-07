@@ -5,6 +5,16 @@ contextBridge.exposeInMainWorld('auralink', {
   hostRoom: args => invoke('host', args),
   stopRoom: () => invoke('stop'),
   trustInvite: invite => invoke('trust-invite', invite),
+  trustInternetService: origin => invoke('trust-internet-service', origin),
+  internetOpen: args => invoke('internet-open', args),
+  internetSend: args => invoke('internet-send', args),
+  internetClose: args => invoke('internet-close', args),
+  onInternetEvent: listener => {
+    if (typeof listener !== 'function') return;
+    const handler = (_event, message) => listener(message);
+    ipcRenderer.on('auralink:internet-event', handler);
+    return () => ipcRenderer.removeListener('auralink:internet-event', handler);
+  },
   sources: () => invoke('sources'),
   chooseScreen: id => invoke('choose-screen', id),
   grantControl: args => invoke('grant-control', args),

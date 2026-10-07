@@ -1,4 +1,6 @@
 import { RoomRTC } from './rtc.js';
+import { InternetDirectory, internetOrigin, internetInvitation } from './internet.js';
+import { createDesktopInternetSocket } from './desktop-internet.js';
 
 const icons = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/>',
@@ -26,6 +28,7 @@ const icons = {
   minimize: '<path d="M3 8h5V3m8 0v5h5m0 8h-5v5m-8 0v-5H3"/>',
   refresh: '<path d="M20 7a9 9 0 0 0-15-2L3 8m0-5v5h5m-4 9a9 9 0 0 0 15 2l2-3m0 5v-5h-5"/>',
   keyboard: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M7 16h10"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a17 17 0 0 1 0 18 17 17 0 0 1 0-18Z"/>',
 };
 function icon(name) { return `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name] || icons.info}</svg>`; }
 function paintIcons(root = document) { root.querySelectorAll('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon); }); }
@@ -38,12 +41,13 @@ const state = {
   room: null, selected: null, sourceId: null, grant: null, controlling: null, controlRequest: null,
   pendingControl: null, controlTimer: null, grantTimer: null, audioElements: new Map(), speakerPool: [], nativeInfo: null,
   audioContext: null, silentOutput: null, microphoneMonitor: null, microphoneTest: null, speaker: true, phoneScreen: null,
-  mediaPending: new Set(), sharingPending: false,
+  mediaPending: new Map(), sharingPending: false,
+  leaving: false, epoch: 0, preparing: null, preparingHost: false, preparingInternet: false,
   started: 0, lastMove: 0, seq: 0, pressed: new Set(), pressedButtons: new Set(), lastPoint: { x: .5, y: .5 }, statsTimer: null, durationTimer: null,
 };
 let preferences;
 try { preferences = JSON.parse(localStorage.getItem('auralink.preferences') || '{}'); } catch { preferences = {}; }
-preferences = { name: 'My device', quality: 'auto', stun: '', microphone: '', camera: '', speaker: '', ...preferences };
+preferences = { name: 'My device', quality: 'auto', stun: '', microphone: '', camera: '', speaker: '', internetOrigin: '', internetOnline: false, ...preferences };
 if (!['auto', '720', '1080', '1440'].includes(preferences.quality)) preferences.quality = 'auto';
 preferences.name = String(preferences.name).slice(0, 48) || 'My device';
 preferences.stun = String(preferences.stun || '');
@@ -53,6 +57,11 @@ $('join-name').value = preferences.name;
 $('settings-quality').value = preferences.quality;
 $('quality-select').value = preferences.quality;
 $('stun-server').value = preferences.stun;
+$('internet-service').value = String(preferences.internetOrigin || '').slice(0, 256);
+const internet = new InternetDirectory({
+  trust: origin => bridge?.trustInternetService ? bridge.trustInternetService(origin) : Promise.resolve(),
+  socketFactory: url => bridge?.internetOpen ? createDesktopInternetSocket(bridge, url) : bridge?.createInternetSocket ? bridge.createInternetSocket(url) : bridge?.createSocket ? bridge.createSocket(url) : new WebSocket(url),
+});
 
 function savePreferences() {
   try { localStorage.setItem('auralink.preferences', JSON.stringify(preferences)); } catch { /* Private-browser storage can be unavailable. */ }
@@ -61,6 +70,13 @@ function savePreferences() {
 }
 function initials(name) { return String(name).trim().split(/\s+/).slice(0, 2).map((part) => part[0] || '').join('').toUpperCase() || '?'; }
 function cleanError(error) { return String(error?.message || error || 'Something went wrong').slice(0, 260); }
+function roomCurrent(epoch, rtc) { return state.joined && !state.leaving && state.epoch === epoch && state.rtc === rtc && !rtc?.closed; }
+function admissionCurrent(epoch) { return !state.leaving && state.epoch === epoch && state.joining; }
+function beginAdmission(dialog = null, mode = null) {
+  if (state.joined || state.joining || state.leaving) return null;
+  state.joining = true; state.preparing = dialog; state.preparingHost = dialog === 'host-dialog' && mode === 'nearby'; state.preparingInternet = mode === 'internet'; const epoch = ++state.epoch;
+  updateButtons(); renderDevices(); return epoch;
+}
 function toast(message, error = false, duration = 6500) {
   const el = document.createElement('div'); el.className = `toast${error ? ' error' : ''}`;
   el.textContent = message; $('toast-region').append(el);
@@ -85,15 +101,81 @@ document.querySelectorAll('.nav-item').forEach((button) => button.addEventListen
 document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showView('rooms'); });
 $('help-button').addEventListener('click', () => openDialog('help-dialog'));
 $('host-button').addEventListener('click', () => {
-  if (!bridge?.hostRoom) { toast('Create a room in the desktop app. This browser can join a host invitation.', false); return; }
+  if (!bridge?.hostRoom) $('host-mode').value = 'internet';
+  updateHostMode();
   openDialog('host-dialog');
 });
 $('join-button').addEventListener('click', () => { $('join-name').value = preferences.name; openDialog('join-dialog'); });
 $('invite-button').addEventListener('click', () => {
   prepareInvite();
   $('invite-value').value = state.room?.invite || '';
-  $('invite-fingerprint').textContent = state.room?.fingerprint || 'No fingerprint available';
+  updateInviteDetails();
   openDialog('invite-dialog');
+});
+function updateInviteDetails() {
+  const globalRoom = state.room?.internet === true;
+  $('invite-fingerprint-box').hidden = globalRoom;
+  $('invite-fingerprint').textContent = state.room?.fingerprint || 'No fingerprint available';
+  $('invite-help').textContent = globalRoom ? 'The guest pairs with your private Internet service first. This invitation requests entry; you still approve them.' : 'Start with devices on the same Wi-Fi. Browser users must trust the host certificate; verify its fingerprint before proceeding.';
+}
+function updateHostMode() {
+  const globalRoom = $('host-mode').value === 'internet';
+  $('host-port-field').hidden = globalRoom; $('host-port').required = !globalRoom;
+  $('create-room').disabled = !globalRoom && !bridge?.hostRoom;
+  $('host-mode-help').textContent = globalRoom ? 'Connect through your private Internet service. Keep this device online; you approve every guest. Relay availability depends on the free allowance.' : 'Nearby rooms use the same Wi-Fi or private network. Windows may ask you to allow Auralink on your private network.';
+}
+$('host-mode').addEventListener('change', updateHostMode);
+document.querySelectorAll('[data-internet-settings]').forEach(button => button.addEventListener('click', () => { showView('settings'); $('internet-settings').scrollIntoView({ block: 'start', behavior: 'smooth' }); $('internet-service').focus(); }));
+function renderInternet() {
+  const labels = { offline: 'Offline', connecting: 'Connecting…', online: 'Online', retrying: 'Reconnecting…' };
+  $('internet-status').textContent = labels[internet.status]; $('internet-status').dataset.status = internet.status;
+  $('internet-lobby-status').textContent = internet.status === 'online' ? 'Your private devices are online' : internet.status === 'retrying' ? 'Reconnecting to your private devices' : 'Connect beyond your Wi-Fi';
+  const busy = ['connecting', 'retrying'].includes(internet.status);
+  $('internet-go-online').disabled = busy || internet.status === 'online';
+  $('internet-go-offline').disabled = internet.status === 'offline';
+  $('internet-forget').disabled = !internet.identity($('internet-service').value.trim()) && !internet.deviceId;
+  $('internet-pairing-code').disabled = busy || internet.status === 'online';
+  $('internet-service').disabled = busy || internet.status === 'online';
+  $('internet-account-hint').textContent = internet.status === 'online' ? 'Paired on this device. Your private group can see this device online; nobody can join a room or control it without approval.' : 'Use the same service address and private pairing code on your devices. The code is cleared after pairing. Your device credential stays on this device.';
+  if (!state.joined && !state.joining) setStatus(internet.status === 'online' ? 'Internet ready' : internet.status === 'retrying' ? 'Internet reconnecting…' : internet.status === 'connecting' ? 'Going online…' : 'Ready on this device', busy ? 'waiting' : '');
+  renderDevices();
+}
+internet.addEventListener('status', renderInternet);
+internet.addEventListener('presence', renderDevices);
+internet.addEventListener('notice', ({ detail }) => toast(detail.message, true));
+internet.addEventListener('message', ({ detail }) => {
+  if (state.room?.internet && state.socket === internet.socket) void handleMessage(detail).catch(error => toast(cleanError(error), true));
+});
+internet.addEventListener('disconnected', () => {
+  if (state.room?.internet) { void leaveRoom(false); toast('Internet connection lost. Sharing and control stopped. Reconnect to start a new room.', true); }
+});
+async function ensureInternetOnline(origin = $('internet-service').value) {
+  origin = internetOrigin(origin);
+  // Names stay fixed during a room. If preferences changed while in the
+  // directory, reconnect before admission so the host sees the new name.
+  if (internet.status === 'online' && internet.origin === origin && internet.name === preferences.name) return;
+  if (!internet.identity(origin) && !$('internet-pairing-code').value.trim()) { $('internet-service').value = origin; showView('settings'); throw new Error('Pair this device in Internet connections, then try the invitation again.'); }
+  await internet.open(origin, { pairingKey: $('internet-pairing-code').value, name: preferences.name });
+  $('internet-pairing-code').value = ''; preferences.internetOrigin = origin; preferences.internetOnline = true; $('internet-service').value = origin; savePreferences(); renderInternet();
+}
+$('internet-go-online').addEventListener('click', async () => {
+  if (state.joined || state.joining) { toast('Leave your room before changing its Internet connection.'); return; }
+  try { await ensureInternetOnline(); toast('This device is online in your private group.'); }
+  catch (error) { toast(cleanError(error), true); }
+  finally { $('internet-pairing-code').value = ''; renderInternet(); }
+});
+for (const dialog of ['host-dialog', 'join-dialog']) $(dialog).addEventListener('close', () => { if (state.preparing === dialog) void leaveRoom(); });
+$('internet-service').addEventListener('input', renderInternet);
+$('internet-go-offline').addEventListener('click', async () => {
+  if (state.room?.internet) await leaveRoom(); internet.close(); preferences.internetOnline = false; savePreferences(); renderInternet();
+});
+$('internet-forget').addEventListener('click', async () => {
+  $('internet-forget').disabled = true;
+  try {
+    if (state.room?.internet || state.preparingInternet) await leaveRoom();
+    await internet.forget(); preferences.internetOnline = false; $('internet-pairing-code').value = ''; savePreferences(); toast('The service removed this device. Pair again before going online.');
+  } catch (error) { toast(cleanError(error), true); }
+  finally { renderInternet(); }
 });
 function prepareInvite() {
   $('invite-address').replaceChildren();
@@ -316,6 +398,7 @@ function send(message) {
   state.socket.send(JSON.stringify(message)); return true;
 }
 function validInvitation(value) {
+  const globalRoom = internetInvitation(value); if (globalRoom) return globalRoom;
   const url = new URL(value.trim());
   if (url.protocol !== 'https:') throw new Error('Use the complete HTTPS invitation from the host.');
   const hash = new URLSearchParams(url.hash.slice(1));
@@ -325,34 +408,42 @@ function validInvitation(value) {
 }
 $('host-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (state.joining || state.joined) return;
+  const globalRoom = $('host-mode').value === 'internet';
+  const epoch = beginAdmission('host-dialog', globalRoom ? 'internet' : 'nearby'); if (epoch === null) return;
   prepareListening();
   $('create-room').disabled = true;
   try {
     await configureSpeakers();
-    const result = await bridge.hostRoom({ name: $('host-name').value.trim() || 'My workspace', port: Number($('host-port').value) });
+    if (!admissionCurrent(epoch)) return;
+    if (globalRoom) await ensureInternetOnline();
+    if (!admissionCurrent(epoch)) return;
+    const result = globalRoom ? await internet.createRoom($('host-name').value) : await bridge.hostRoom({ name: $('host-name').value.trim() || 'My workspace', port: Number($('host-port').value) });
+    if (!admissionCurrent(epoch)) { if (!globalRoom && !state.joined && !state.joining) await bridge?.stopRoom?.(); return; }
     const resultURL = result.url || new URL(result.invite).origin;
     const inviteData = result.invite ? validInvitation(result.invite) : null;
     state.room = { ...result, url: resultURL, roomKey: result.roomKey || inviteData?.roomKey, name: result.name || $('host-name').value, invite: result.invite };
-    $('host-dialog').close();
+    state.preparing = null; state.preparingHost = false; state.preparingInternet = false; $('host-dialog').close();
     await connect(state.room, true);
-  } catch (error) { toast(`Could not create the room: ${cleanError(error)}`, true); if (!state.joined) await leaveRoom(); }
+  } catch (error) { if (state.epoch === epoch) { toast(`Could not create the room: ${cleanError(error)}`, true); if (!state.joined) await leaveRoom(); } }
   finally { $('create-room').disabled = false; }
 });
 $('join-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (state.joining || state.joined) { toast('Leave the current room before joining another.'); return; }
+  const epoch = beginAdmission('join-dialog'); if (epoch === null) { toast('Leave the current room before joining another.'); return; }
   prepareListening();
   $('join-submit').disabled = true;
   try {
     await configureSpeakers();
+    if (!admissionCurrent(epoch)) return;
     preferences.name = $('join-name').value.trim().slice(0, 48) || 'My device'; $('display-name').value = preferences.name; savePreferences();
     let room = validInvitation($('join-invite').value);
-    if (bridge?.trustInvite) room = { ...room, ...await bridge.trustInvite(room.invite) };
+    if (room.internet) await ensureInternetOnline(room.url);
+    else if (bridge?.trustInvite) room = { ...room, ...await bridge.trustInvite(room.invite) };
+    if (!admissionCurrent(epoch)) return;
     state.room = { ...room, name: 'Private room' };
-    $('join-dialog').close();
+    state.preparing = null; $('join-dialog').close();
     await connect(state.room, false);
-  } catch (error) { toast(`Could not request access: ${cleanError(error)}`, true); if (!state.joined) await leaveRoom(); }
+  } catch (error) { if (state.epoch === epoch) { toast(`Could not request access: ${cleanError(error)}`, true); if (!state.joined) await leaveRoom(); } }
   finally { $('join-submit').disabled = false; }
 });
 
@@ -365,13 +456,21 @@ async function connect(room, isHost) {
   $('session-subtitle').textContent = 'Connecting to the room host…';
   $('stage-empty-text').textContent = isHost ? 'Invite someone, then choose what you want to share.' : 'The host must approve your request before the session starts.';
   setStatus('Connecting…', 'waiting'); updateButtons();
+  if (room.internet) {
+    state.socket = internet.socket;
+    if (room.deviceId) internet.joinDevice(room.deviceId); else internet.joinRoom(room, isHost);
+    setStatus(isHost ? 'Opening Internet room…' : 'Awaiting host approval', 'waiting');
+    return;
+  }
   const socketURL = new URL('/ws', room.url); socketURL.protocol = 'wss:';
   const socket = bridge?.createSocket ? bridge.createSocket(socketURL.href) : new WebSocket(socketURL.href); state.socket = socket;
   socket.addEventListener('open', () => {
+    if (state.socket !== socket || state.leaving || !state.joining) return;
     send({ type: 'join', name: preferences.name, roomKey: room.roomKey, ...(isHost ? { hostToken: room.hostToken } : {}) });
     setStatus(isHost ? 'Opening room…' : 'Awaiting host approval', 'waiting');
   });
   socket.addEventListener('message', (event) => {
+    if (state.socket !== socket || state.leaving) return;
     try { const message = JSON.parse(event.data); handleMessage(message).catch((error) => toast(cleanError(error), true)); }
     catch { toast('An invalid room message was ignored.', true); }
   });
@@ -385,16 +484,25 @@ async function connect(room, isHost) {
 }
 
 async function handleMessage(message) {
+  if (state.leaving) return;
   switch (message.type) {
     case 'pending':
+      if (!state.joining || state.joined) return;
+      if (state.room?.internet && state.room.roomId && message.room?.id !== state.room.roomId) return;
+      if (message.selfId) state.room.pendingSelfId = message.selfId;
       if (message.room?.name) $('room-title').textContent = message.room.name;
       $('session-subtitle').textContent = 'Your request is waiting for the host.'; setStatus('Awaiting host approval', 'waiting'); break;
     case 'welcome':
+      if (!state.joining || state.joined) return;
+      if (state.room?.internet && state.room.roomId && message.room?.id !== state.room.roomId) return;
+      if (state.room?.pendingSelfId && message.selfId !== state.room.pendingSelfId) return;
       state.selfId = message.selfId; state.hostId = message.hostId; state.joined = true; state.joining = false;
       $('stage-empty-text').textContent = 'Turn on your microphone for a conversation, or share a camera or screen.';
       void updatePhoneAudioRoute().catch(error => toast(`Audio output: ${cleanError(error)}`, true));
       if (message.room?.name || message.name || message.roomName) $('room-title').textContent = message.room?.name || message.roomName || message.name;
-      state.rtc = new RoomRTC({ selfId: state.selfId, signal: (to, data) => send({ type: 'signal', to, data }), iceServers: preferences.stun ? [{ urls: preferences.stun }] : [] });
+      state.rtc = new RoomRTC({ selfId: state.selfId, signal: (to, data) => send({ type: 'signal', to, data }), iceServers: state.room?.internet ? message.iceServers || [] : preferences.stun ? [{ urls: preferences.stun }] : [], relaySecondsLimit: state.room?.internet ? message.relaySecondsLimit : 0, relayBytesLimit: state.room?.internet ? message.relayBytesLimit : 0, iceTransportPolicy: message.iceTransportPolicy || 'all' });
+      $('internet-relay-note').hidden = !state.room?.internet;
+      $('internet-relay-note').textContent = message.relayEnabled ? 'Direct connection first. Relay availability depends on the free allowance; this test room stops when its relay safety limit is reached.' : 'Direct connection only. Relay is unavailable, so some mobile and restricted networks cannot connect.';
       state.rtc.setVideoLimits(preferences.quality);
       bindRTC();
       for (const peer of message.peers || []) addPeer(peer);
@@ -402,7 +510,7 @@ async function handleMessage(message) {
       state.statsTimer = setInterval(refreshStats, 2000);
       state.durationTimer = setInterval(updateDuration, 1000);
       setStatus('Room connected'); updateRoomSubtitle(); updateButtons(); renderParticipants(); renderDevices();
-      if (state.isHost) { prepareInvite(); $('invite-value').value = state.room.invite; $('invite-fingerprint').textContent = state.room.fingerprint || ''; openDialog('invite-dialog'); }
+      if (state.isHost) { prepareInvite(); $('invite-value').value = state.room.invite; updateInviteDetails(); openDialog('invite-dialog'); }
       else toast('The host accepted your request. Choose when to turn on your microphone or camera.');
       break;
     case 'join-request':
@@ -448,9 +556,12 @@ async function handleMessage(message) {
       toast(message.reason || 'The host declined your join request.', true); await leaveRoom(); break;
     case 'room-ended':
       toast(message.reason || 'The host closed the room.'); await leaveRoom(); break;
+    case 'left': case 'room-left':
+      if (state.room?.internet) await leaveRoom(false); break;
     case 'error':
       if (state.grant && !state.grant.confirmed) await revokeControl('The room did not confirm desktop control.');
-      toast(message.message || message.reason || 'The room could not complete that request.', true); break;
+      toast(message.message || message.reason || 'The room could not complete that request.', true);
+      if (state.room?.internet && state.joining && !state.joined) await leaveRoom(); break;
   }
 }
 
@@ -470,22 +581,25 @@ async function removePeer(peerId) {
   renderParticipants(); renderStage(); renderDevices(); renderRequests(); updateRoomSubtitle(); updateButtons();
 }
 function bindRTC() {
-  state.rtc.addEventListener('track', ({ detail }) => {
+  const rtc = state.rtc; const epoch = state.epoch;
+  const on = (type, listener) => rtc.addEventListener(type, event => { if (state.rtc === rtc && state.epoch === epoch && !state.leaving) void listener(event); });
+  on('relay-budget', ({ detail }) => { toast(detail.reason || 'The relay safety limit was reached. Your room has stopped.', true, 12000); void leaveRoom(); });
+  on('track', ({ detail }) => {
     const tracks = state.tracks.get(detail.peerId); if (!tracks) return;
     tracks.set(detail.kind, { track: detail.track, stream: new MediaStream([detail.track]) });
     if (detail.kind === 'audio') attachAudio(detail.peerId, detail.track);
     if (detail.kind === 'screen') state.selected = { peerId: detail.peerId, kind: 'screen' };
     renderParticipants(); renderStage(); updateButtons();
   });
-  state.rtc.addEventListener('track-removed', async ({ detail }) => {
+  on('track-removed', async ({ detail }) => {
     state.tracks.get(detail.peerId)?.delete(detail.kind);
     if (detail.kind === 'audio') { const audio = state.audioElements.get(detail.peerId); if (audio) { audio.srcObject = null; audio.dataset.blocked = 'false'; updateAudioBanner(); } }
     if (detail.kind === 'screen' && state.controlling?.peerId === detail.peerId) clearControlling('Screen sharing ended.');
     if (state.selected?.peerId === detail.peerId && state.selected.kind === detail.kind) state.selected = null;
     renderParticipants(); renderStage(); updateButtons();
   });
-  state.rtc.addEventListener('media-state', ({ detail }) => { const peer = state.peers.get(detail.peerId); if (peer) peer.media = detail.state; renderParticipants(); });
-  state.rtc.addEventListener('connection', ({ detail }) => {
+  on('media-state', ({ detail }) => { const peer = state.peers.get(detail.peerId); if (peer) peer.media = detail.state; renderParticipants(); });
+  on('connection', ({ detail }) => {
     const peer = state.peers.get(detail.peerId); if (peer) peer.connection = detail.state;
     if (['failed', 'closed', 'disconnected'].includes(detail.state)) {
       if (state.grant?.peerId === detail.peerId) revokeControl('The controller connection was interrupted.');
@@ -493,7 +607,7 @@ function bindRTC() {
     }
     renderDevices(); updateRoomSubtitle();
   });
-  state.rtc.addEventListener('channel', ({ detail }) => {
+  on('channel', ({ detail }) => {
     if (detail.open) return;
     if (state.grant?.peerId === detail.peerId) revokeControl('The desktop control channel closed.');
     if (state.controlling?.peerId === detail.peerId) {
@@ -501,14 +615,14 @@ function bindRTC() {
       send({ type: 'signal', to: peerId, data: { controlStop: { sessionId } } }); clearControlling('The desktop control channel closed.');
     }
   });
-  state.rtc.addEventListener('error', ({ detail }) => { console.warn('WebRTC negotiation:', detail.peerId, cleanError(detail.error)); toast('A media connection could not negotiate. Check Connection details and the network.', true); });
-  state.rtc.addEventListener('data', async ({ detail }) => {
+  on('error', ({ detail }) => { console.warn('WebRTC negotiation:', detail.peerId, cleanError(detail.error)); toast('A media connection could not negotiate. Check Connection details and the network.', true); });
+  on('data', async ({ detail }) => {
     const { peerId, data } = detail;
     if (data?.type !== 'input' || !state.grant?.confirmed || state.grant.peerId !== peerId || state.grant.sessionId !== data.sessionId || !state.local.has('screen')) return;
     if (!data.event || !Number.isSafeInteger(data.event.seq) || data.event.seq <= state.grant.lastSeq || !['move', 'down', 'up', 'wheel', 'keydown', 'keyup'].includes(data.event.type)) return;
-    state.grant.lastSeq = data.event.seq;
-    try { const result = await bridge?.applyInput({ peerId, sessionId: data.sessionId, event: data.event }); if (result?.ok === false && /not approved|expired|native input/i.test(result.reason || '')) await revokeControl('Desktop control authorization ended.'); }
-    catch { await revokeControl('The desktop input service stopped.'); }
+    const grant = state.grant; grant.lastSeq = data.event.seq;
+    try { const result = await bridge?.applyInput({ peerId, sessionId: data.sessionId, event: data.event }); if (state.grant === grant && result?.ok === false && /not approved|expired|native input/i.test(result.reason || '')) await revokeControl('Desktop control authorization ended.'); }
+    catch { if (state.grant === grant) await revokeControl('The desktop input service stopped.'); }
   });
 }
 function attachAudio(peerId, track) {
@@ -597,6 +711,25 @@ function renderDevices() {
     const statusLabel = peer.connection === 'connected' ? 'Connected' : peer.local ? 'Ready on this device' : `Media ${peer.connection || 'connecting'}`;
     status.append(dot, document.createTextNode(statusLabel)); card.append(glyph, name, detail, status); $('device-list').append(card);
   }
+  $('online-device-list').replaceChildren();
+  const paired = internet.devices.filter(device => device.id !== internet.deviceId);
+  $('online-devices-empty').hidden = paired.length > 0;
+  $('online-devices-empty').textContent = internet.status === 'online' ? 'Pair your other devices with the same private service to see them here.' : 'Go online in Settings to see your private group. Devices stay offline until their app connects.';
+  for (const device of paired) {
+    const card = document.createElement('article'); card.className = `device-card internet-device${device.online ? '' : ' offline'}`;
+    const glyph = document.createElement('span'); glyph.className = 'device-icon'; glyph.innerHTML = icon('globe');
+    const name = document.createElement('h3'); name.textContent = device.name;
+    const detail = document.createElement('p'); detail.textContent = device.hosting && device.online ? 'Hosting a private room' : device.online ? 'App online · waiting for a room' : 'App offline';
+    const status = document.createElement('div'); status.className = 'device-status'; status.append(document.createElement('span'), document.createTextNode(device.online ? 'Online' : 'Offline')); status.firstChild.className = device.online ? 'local-dot' : 'offline-dot';
+    const request = document.createElement('button'); request.className = 'button button-secondary button-compact device-connect'; request.textContent = 'Request connection'; request.disabled = !device.online || !device.hosting || state.joined || state.joining || internet.status !== 'online';
+    request.addEventListener('click', async () => {
+      const epoch = beginAdmission(); if (epoch === null) return;
+      prepareListening();
+      try { await configureSpeakers(); if (!admissionCurrent(epoch)) return; await ensureInternetOnline(internet.origin); if (!admissionCurrent(epoch)) return; state.room = { internet: true, url: internet.origin, deviceId: device.id, roomId: device.roomId, name: `${device.name}’s room` }; await connect(state.room, false); }
+      catch (error) { if (state.epoch === epoch) { toast(cleanError(error), true); await leaveRoom(); } }
+    });
+    card.append(glyph, name, detail, status, request); $('online-device-list').append(card);
+  }
 }
 
 function updateButtons() {
@@ -627,32 +760,34 @@ $('mic-button').addEventListener('click', () => toggleMedia('audio'));
 $('camera-button').addEventListener('click', () => toggleMedia('camera'));
 async function toggleMedia(kind) {
   if (!state.joined || state.mediaPending.has(kind)) return;
-  const rtc = state.rtc;
-  state.mediaPending.add(kind);
+  const rtc = state.rtc; const epoch = state.epoch; const operation = {};
+  state.mediaPending.set(kind, operation);
   prepareListening();
   const button = $(kind === 'audio' ? 'mic-button' : 'camera-button'); button.disabled = true;
   try {
     if (state.local.has(kind)) {
-      const item = state.local.get(kind); state.local.delete(kind); await state.rtc.setTrack(kind, null); item.stream.getTracks().forEach((track) => track.stop());
+      const item = state.local.get(kind); state.local.delete(kind); item.stream.getTracks().forEach((track) => track.stop()); await rtc.setTrack(kind, null);
       if (kind === 'audio') stopMicrophoneMonitor();
     } else {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera and microphone require a trusted HTTPS connection and browser support.');
-      const stream = await captureMedia(kind);
+      const stream = await captureMedia(kind, () => roomCurrent(epoch, rtc));
       const track = stream.getTracks()[0];
-      if (!state.joined || state.rtc !== rtc) { stream.getTracks().forEach((item) => item.stop()); return; }
-      state.local.set(kind, { track, stream }); await state.rtc.setTrack(kind, track, stream);
+      if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach((item) => item.stop()); return; }
+      state.local.set(kind, { track, stream }); await rtc.setTrack(kind, track, stream);
+      if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
       if (kind === 'audio') { stopMicrophoneMonitor(); state.microphoneMonitor = startMicrophoneMonitor(stream); await updatePhoneAudioRoute(); }
       await refreshDevices();
       track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); state.rtc?.setTrack(kind, null); if (kind === 'audio') { stopMicrophoneMonitor(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; } updateButtons(); renderParticipants(); renderStage(); } });
     }
-  } catch (error) { const message = mediaError(error, kind); if (kind === 'audio') { $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; } toast(`${kind === 'audio' ? 'Microphone' : 'Camera'}: ${message}`, true, 12000); }
-  finally { state.mediaPending.delete(kind); updateButtons(); renderParticipants(); renderStage(); }
+  } catch (error) { if (roomCurrent(epoch, rtc)) { const message = mediaError(error, kind); if (kind === 'audio') { $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; } toast(`${kind === 'audio' ? 'Microphone' : 'Camera'}: ${message}`, true, 12000); } }
+  finally { if (state.mediaPending.get(kind) === operation) state.mediaPending.delete(kind); updateButtons(); renderParticipants(); renderStage(); }
 }
-async function captureMedia(kind) {
+async function captureMedia(kind, current = () => true) {
   if (bridge?.requestMedia) {
     const permission = await bridge.requestMedia(kind === 'audio' ? 'microphone' : 'camera');
     if (permission?.ok === false || permission?.granted === false || permission === false) throw new DOMException(permission?.reason || 'Device permission denied.', 'NotAllowedError');
   }
+  if (!current()) throw new DOMException('The capture request was cancelled.', 'AbortError');
   const source = kind === 'audio' ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 } } : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 }, facingMode: { ideal: 'user' } };
   const deviceId = preferences[kind === 'audio' ? 'microphone' : 'camera'];
   const constraints = kind === 'audio' ? { audio: source, video: false } : { audio: false, video: source };
@@ -660,6 +795,7 @@ async function captureMedia(kind) {
   try { return await navigator.mediaDevices.getUserMedia(constraints); }
   catch (error) {
     if (!deviceId || !['NotFoundError', 'OverconstrainedError'].includes(error.name)) throw error;
+    if (!current()) throw new DOMException('The capture request was cancelled.', 'AbortError');
     delete source.deviceId; toast(`Selected ${kind === 'audio' ? 'microphone' : 'camera'} unavailable; trying system default.`);
     preferences[kind === 'audio' ? 'microphone' : 'camera'] = ''; savePreferences();
     return navigator.mediaDevices.getUserMedia(constraints);
@@ -669,20 +805,21 @@ async function captureMedia(kind) {
 $('share-button').addEventListener('click', async () => {
   if (!state.joined || state.sharingPending) return;
   if (state.local.has('screen')) { await stopSharing(); return; }
-  state.sharingPending = true; updateButtons();
+  const epoch = state.epoch; const rtc = state.rtc; const operation = {}; state.sharingPending = operation; updateButtons();
   try {
     if (bridge?.platform === 'android' && bridge?.startScreenShare) { await beginPhoneSharing(); return; }
     if (!navigator.mediaDevices?.getDisplayMedia) throw new Error('Screen capture is unavailable in this browser. Use the Android companion or a desktop app to share your screen.');
-    if (bridge?.sources && bridge?.chooseScreen) await pickScreen();
+    if (bridge?.sources && bridge?.chooseScreen) await pickScreen(epoch, rtc);
     else await beginSharing();
   } catch (error) {
-    if (state.phoneScreen || state.local.has('screen')) await stopSharing().catch(() => { state.local.delete('screen'); clearPhoneCapture(); });
-    await bridge?.stopScreenShare?.().catch(() => {}); toast(`Screen sharing: ${cleanError(error)}`, true);
+    if (roomCurrent(epoch, rtc)) { if (state.phoneScreen || state.local.has('screen')) await stopSharing().catch(() => { if (roomCurrent(epoch, rtc)) { state.local.delete('screen'); clearPhoneCapture(); } });
+    if (roomCurrent(epoch, rtc)) toast(`Screen sharing: ${cleanError(error)}`, true); }
   }
-  finally { state.sharingPending = false; updateButtons(); }
+  finally { if (state.sharingPending === operation) state.sharingPending = false; updateButtons(); }
 });
-async function pickScreen() {
+async function pickScreen(epoch = state.epoch, rtc = state.rtc) {
   const sources = await bridge.sources();
+  if (!roomCurrent(epoch, rtc)) return;
   if (!sources?.length) throw new Error('No displays or windows were available. Check screen-capture permissions.');
   $('screen-source-list').replaceChildren();
   for (const source of sources) {
@@ -690,12 +827,12 @@ async function pickScreen() {
     if (typeof source.thumbnail === 'string' && source.thumbnail.startsWith('data:image/')) { const thumb = document.createElement('img'); thumb.src = source.thumbnail; thumb.alt = ''; button.append(thumb); }
     const name = document.createElement('span'); name.textContent = source.name; button.append(name);
     button.addEventListener('click', async () => {
-      if (state.sharingPending) return;
-      state.sharingPending = true; updateButtons();
+      if (state.sharingPending || !roomCurrent(epoch, rtc)) return;
+      const operation = {}; state.sharingPending = operation; updateButtons();
       $('screen-source-list').querySelectorAll('button').forEach(sourceButton => { sourceButton.disabled = true; });
-      try { await bridge.chooseScreen(source.id); state.sourceId = source.id; $('screen-dialog').close(); await beginSharing(); }
-      catch (error) { state.sourceId = null; try { await bridge?.stopSharing?.(); } catch {} toast(`Screen sharing: ${cleanError(error)}`, true); }
-      finally { state.sharingPending = false; updateButtons(); $('screen-source-list').querySelectorAll('button').forEach(sourceButton => { sourceButton.disabled = false; }); }
+      try { await bridge.chooseScreen(source.id); if (!roomCurrent(epoch, rtc)) return; state.sourceId = source.id; $('screen-dialog').close(); await beginSharing(epoch, rtc); }
+      catch (error) { if (roomCurrent(epoch, rtc)) { state.sourceId = null; try { await bridge?.stopSharing?.(); } catch {} toast(`Screen sharing: ${cleanError(error)}`, true); } }
+      finally { if (state.sharingPending === operation) state.sharingPending = false; updateButtons(); $('screen-source-list').querySelectorAll('button').forEach(sourceButton => { sourceButton.disabled = false; }); }
     });
     $('screen-source-list').append(button);
   }
@@ -706,35 +843,40 @@ function captureConstraints() {
   const [width, height] = sizes[preferences.quality];
   return { width: { ideal: width, max: width }, height: { ideal: height, max: height }, frameRate: { ideal: 30, max: 30 } };
 }
-async function beginSharing() {
-  const rtc = state.rtc;
+async function beginSharing(epoch = state.epoch, rtc = state.rtc) {
+  if (!roomCurrent(epoch, rtc)) return;
   const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 } }, audio: false });
-  if (!state.joined || state.rtc !== rtc) { stream.getTracks().forEach((track) => track.stop()); return; }
+  if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach((track) => track.stop()); return; }
   const track = stream.getVideoTracks()[0]; track.contentHint = 'detail';
   try { await track.applyConstraints(captureConstraints()); } catch { /* Use the source's actual capture mode; diagnostics reports it. */ }
-  state.local.set('screen', { track, stream }); await state.rtc.setTrack('screen', track, stream);
+  if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
+  state.local.set('screen', { track, stream }); await rtc.setTrack('screen', track, stream);
+  if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
   state.selected = { peerId: state.selfId, kind: 'screen' };
-  track.addEventListener('ended', () => stopSharing());
+  track.addEventListener('ended', () => { if (state.local.get('screen')?.track === track) void stopSharing(); });
   updateButtons(); renderParticipants(); renderStage();
 }
 async function beginPhoneSharing() {
   if (typeof MediaStreamTrackGenerator !== 'function' || typeof VideoFrame !== 'function' || typeof createImageBitmap !== 'function') throw new Error('Update Android System WebView to enable phone screen streaming, including sharing while another app is open.');
-  const rtc = state.rtc;
+  const rtc = state.rtc; const epoch = state.epoch;
   $('share-button').disabled = true;
   const screen = await bridge.startScreenShare({ quality: preferences.quality === '720' || preferences.quality === 'auto' ? '720p' : '1080p', microphone: state.local.has('audio'), camera: state.local.has('camera') });
-  if (!state.joined || state.rtc !== rtc) { await bridge.stopScreenShare(); return; }
+  const captureId = phoneCaptureId(screen?.captureId);
+  if (!roomCurrent(epoch, rtc)) { if (captureId) await bridge.stopScreenShare({ captureId }); return; }
+  try {
   // Canvas capture waits for compositor paints, which stop when Android hides
   // the Activity. Feed explicitly decoded native frames into the media track
   // instead, while the owner-approved foreground projection remains active.
   const track = new MediaStreamTrackGenerator({ kind: 'video' }); track.contentHint = 'detail';
   const writer = track.writable.getWriter(); const stream = new MediaStream([track]);
-  const capture = { writer, stream, active: true, busy: false, lastSeq: 0, timestamp: 0, unsubscribe: null };
+  const capture = { captureId, writer, stream, active: true, busy: false, lastSeq: 0, timestamp: 0, unsubscribe: null };
   state.phoneScreen = capture; state.sourceId = screen.id || 'android-screen';
   capture.unsubscribe = bridge.onScreenFrame(async frame => {
-    if (!capture.active || !state.joined || !frame || !Number.isSafeInteger(frame.seq) || frame.seq <= capture.lastSeq || typeof frame.data !== 'string' || !frame.data.startsWith('data:image/jpeg;base64,') || frame.data.length > 4000000) {
-      if (Number.isSafeInteger(frame?.seq)) await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); return;
+    if (captureId && phoneCaptureId(frame?.captureId) !== captureId) { await acknowledgePhoneFrame(frame, false); return; }
+    if (!capture.active || state.phoneScreen !== capture || !roomCurrent(epoch, rtc) || !frame || !Number.isSafeInteger(frame.seq) || frame.seq <= capture.lastSeq || typeof frame.data !== 'string' || !frame.data.startsWith('data:image/jpeg;base64,') || frame.data.length > 4000000) {
+      await acknowledgePhoneFrame(frame, !captureId); return;
     }
-    if (capture.busy) { await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); return; }
+    if (capture.busy) { await acknowledgePhoneFrame(frame, !captureId); return; }
     capture.busy = true; capture.lastSeq = frame.seq;
     let image;
     try {
@@ -744,18 +886,33 @@ async function beginPhoneSharing() {
       const bytes = new Uint8Array(binary.length);
       for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
       image = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
-      if (!capture.active || state.phoneScreen !== capture) return;
+      if (!capture.active || state.phoneScreen !== capture || !roomCurrent(epoch, rtc)) return;
       if (image.width < 1 || image.height < 1 || image.width > 1920 || image.height > 1920) throw new Error('Invalid phone frame size');
       capture.timestamp = Math.max(capture.timestamp + 1, Math.round(performance.now() * 1000));
       const videoFrame = new VideoFrame(image, { timestamp: capture.timestamp });
       try { await writer.write(videoFrame); } finally { videoFrame.close(); }
     } catch { /* A corrupt frame is skipped; the native capture can send the next. */ }
-    finally { image?.close(); capture.busy = false; await bridge.ackScreenFrame({ seq: frame.seq }).catch(() => {}); }
+    finally { image?.close(); capture.busy = false; await acknowledgePhoneFrame(frame, !captureId); }
   });
-  state.local.set('screen', { track, stream }); await state.rtc.setTrack('screen', track, stream);
+  state.local.set('screen', { track, stream }); await rtc.setTrack('screen', track, stream);
+  if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
   state.selected = { peerId: state.selfId, kind: 'screen' }; track.addEventListener('ended', () => { if (state.phoneScreen === capture) void stopSharing(); });
   updateButtons(); renderParticipants(); renderStage();
   toast(screen.notificationAvailable === false ? 'Your phone screen is shared. Notifications are disabled: return to Auralink to stop sharing, or use Android’s capture control.' : 'Your phone screen is shared. Use the Android sharing notification or return here to stop.');
+  } catch (error) {
+    // Native permission can complete after a room has been replaced. Cleanup
+    // may only address that projection, never whichever projection is newest.
+    if (captureId) { try { await bridge.stopScreenShare({ captureId }); } catch {} }
+    else if (roomCurrent(epoch, rtc)) { try { await bridge.stopScreenShare(); } catch {} }
+    throw error;
+  }
+}
+function phoneCaptureId(value) { return typeof value === 'string' && value.length > 0 && value.length <= 128 ? value : ''; }
+async function acknowledgePhoneFrame(frame, allowUnscoped) {
+  if (!Number.isSafeInteger(frame?.seq)) return;
+  const captureId = phoneCaptureId(frame.captureId);
+  if (!captureId && !allowUnscoped) return;
+  try { await bridge.ackScreenFrame({ seq: frame.seq, ...(captureId ? { captureId } : {}) }); } catch { /* Capture may already have stopped. */ }
 }
 function clearPhoneCapture() {
   const capture = state.phoneScreen; state.phoneScreen = null;
@@ -764,17 +921,30 @@ function clearPhoneCapture() {
     capture.writer.abort().catch(() => {}).finally(() => { try { capture.writer.releaseLock(); } catch {} });
   }
 }
-bridge?.onScreenStopped?.(reason => { if (state.phoneScreen) { void stopSharing(); toast(reason || 'Phone screen sharing stopped.'); } });
+bridge?.onScreenStopped?.((reason, metadata) => {
+  const capture = state.phoneScreen;
+  if (!capture || (capture.captureId && phoneCaptureId(metadata?.captureId) !== capture.captureId)) return;
+  void stopSharing(); toast(reason || 'Phone screen sharing stopped.');
+});
 async function stopSharing() {
+  const rtc = state.rtc; const epoch = state.epoch; const operation = state.sharingPending || {}; const ownedOperation = !state.sharingPending;
+  if (ownedOperation) state.sharingPending = operation;
+  const captureId = state.phoneScreen?.captureId; const item = state.local.get('screen'); state.local.delete('screen'); state.sourceId = null;
+  item?.stream.getTracks().forEach(track => track.stop()); clearPhoneCapture();
+  const request = state.controlRequest; state.controlRequest = null; $('control-dialog').close();
+  if (request) send({ type: 'control-response', to: request.peerId, accepted: false, requestId: request.requestId });
+  updateButtons(); renderParticipants(); renderStage();
+  try {
   if (state.grant) await revokeControl('Screen sharing stopped.');
-  const item = state.local.get('screen'); state.local.delete('screen');
-  await state.rtc?.setTrack('screen', null); item?.stream.getTracks().forEach((track) => track.stop());
-  clearPhoneCapture();
-  state.sourceId = null;
-  try { await bridge?.stopScreenShare?.(); } catch { /* Android may already have stopped projection. */ }
-  try { await bridge?.stopSharing?.(); } catch { /* Capture source may already be cleared. */ }
+  await rtc?.setTrack('screen', null);
+  if (state.epoch !== epoch || state.rtc !== rtc) return;
+  try { await bridge?.stopScreenShare?.(captureId ? { captureId } : undefined); } catch { /* Android may already have stopped projection. */ }
+  if (state.epoch !== epoch || state.rtc !== rtc) return;
+  try { await bridge?.stopSharing?.(captureId ? { captureId } : undefined); } catch { /* Capture source may already be cleared. */ }
+  if (state.epoch !== epoch || state.rtc !== rtc) return;
   if (state.selected?.peerId === state.selfId && state.selected.kind === 'screen') state.selected = null;
   updateButtons(); renderParticipants(); renderStage();
+  } finally { if (ownedOperation && state.sharingPending === operation) state.sharingPending = false; updateButtons(); }
 }
 async function updateQuality() {
   const track = state.local.get('screen')?.track;
@@ -795,35 +965,36 @@ async function receiveControlRequest(message) {
   const peerId = message.from || message.peerId; const peer = state.peers.get(peerId);
   if (!peer) return;
   if (!bridge?.grantControl || !state.local.has('screen') || !(state.sourceId?.startsWith('screen:') || state.sourceId === 'android-screen') || state.grant || state.controlRequest) {
-    send({ type: 'control-response', to: peerId, accepted: false, reason: !bridge?.grantControl ? 'This device supports viewing only; native desktop control is unavailable.' : 'The screen owner is not currently sharing an available full desktop.' }); return;
+    send({ type: 'control-response', to: peerId, accepted: false, requestId: message.requestId, reason: !bridge?.grantControl ? 'This device supports viewing only; native desktop control is unavailable.' : 'The screen owner is not currently sharing an available full desktop.' }); return;
   }
   state.controlRequest = { peerId, name: peer.name, requestId: message.requestId };
   $('control-request-text').textContent = `${peer.name} wants to control your shared ${state.phoneScreen ? 'phone' : 'desktop'}. Approve only someone you trust. A system confirmation follows.${state.phoneScreen ? ' Android Accessibility must be enabled by you. Use the sharing notification to stop at any time.' : ''}`;
   openDialog('control-dialog');
 }
 $('deny-control').addEventListener('click', () => {
-  if (state.controlRequest) send({ type: 'control-response', to: state.controlRequest.peerId, accepted: false });
+  if (state.controlRequest) send({ type: 'control-response', to: state.controlRequest.peerId, accepted: false, requestId: state.controlRequest.requestId });
   state.controlRequest = null; $('control-dialog').close();
 });
 $('control-dialog').addEventListener('cancel', () => {
-  if (state.controlRequest) send({ type: 'control-response', to: state.controlRequest.peerId, accepted: false }); state.controlRequest = null;
+  if (state.controlRequest) send({ type: 'control-response', to: state.controlRequest.peerId, accepted: false, requestId: state.controlRequest.requestId }); state.controlRequest = null;
 });
 $('allow-control').addEventListener('click', async () => {
   const request = state.controlRequest; if (!request) return;
+  const epoch = state.epoch; const rtc = state.rtc; const screen = state.local.get('screen');
   $('allow-control').disabled = true;
   try {
     const sessionId = crypto.randomUUID();
     const result = await bridge.grantControl({ peerId: request.peerId, screenId: state.sourceId, sessionId, name: request.name });
-    if (!result?.ok || !state.joined || !state.local.has('screen') || !state.peers.has(request.peerId)) {
-      send({ type: 'control-response', to: request.peerId, accepted: false, reason: result?.reason || 'The screen owner did not approve desktop control.' });
+    if (!result?.ok || !roomCurrent(epoch, rtc) || state.controlRequest !== request || state.local.get('screen') !== screen || !state.peers.has(request.peerId)) {
+      send({ type: 'control-response', to: request.peerId, accepted: false, requestId: request.requestId, reason: result?.reason || 'The screen owner did not approve desktop control.' });
       await bridge.revokeControl(); return;
     }
     state.grant = { peerId: request.peerId, sessionId, lastSeq: 0, confirmed: false };
     send({ type: 'control-response', to: request.peerId, accepted: true, sessionId, requestId: request.requestId });
     state.grantTimer = setTimeout(() => { if (state.grant?.sessionId === sessionId && !state.grant.confirmed) revokeControl('Desktop control was not confirmed by the room.'); }, 5000);
     renderControl(); toast(`${request.name} can now control your shared display. Stop at any time.`);
-  } catch (error) { send({ type: 'control-response', to: request.peerId, accepted: false, reason: 'Desktop control could not start.' }); toast(cleanError(error), true); }
-  finally { state.controlRequest = null; $('control-dialog').close(); $('allow-control').disabled = false; }
+  } catch (error) { send({ type: 'control-response', to: request.peerId, accepted: false, requestId: request.requestId, reason: 'Desktop control could not start.' }); toast(cleanError(error), true); }
+  finally { if (state.controlRequest === request) { state.controlRequest = null; $('control-dialog').close(); } $('allow-control').disabled = false; }
 });
 async function revokeControl(reason) {
   const grant = state.grant; state.grant = null;
@@ -1045,12 +1216,31 @@ function updateDuration() {
 }
 $('end-button').addEventListener('click', () => leaveRoom());
 async function leaveRoom(stopHost = true) {
+  if (state.leaving) return;
+  const globalRoom = state.room?.internet === true || state.preparingInternet;
+  const stopNearbyHost = stopHost && !globalRoom && (state.isHost || state.preparingHost);
+  let stoppingHost;
+  // Invalidate native host preparation before any cleanup awaits. Otherwise
+  // a cancelled certificate/broker task can overwrite a replacement room.
+  if (stopNearbyHost) { try { stoppingHost = bridge?.stopRoom?.(); } catch {} }
+  state.leaving = true; state.epoch++; state.preparing = null; state.mediaPending.clear(); state.sharingPending = false;
+  state.preparingHost = false; state.preparingInternet = false;
+  const leavingInternetRoom = globalRoom && (state.joined || state.joining);
+  state.joined = false; state.joining = false;
+  updateButtons(); setStatus('Closing room…', 'waiting');
+  // Stop outgoing media immediately, before native cleanup awaits. A lost
+  // directory socket must never leave capture running during reconnect.
+  state.rtc?.close(); state.rtc = null;
+  for (const item of state.local.values()) item.stream.getTracks().forEach(track => track.stop());
+  for (const audio of state.audioElements.values()) { audio.pause(); audio.srcObject = null; }
+  const captureId = state.phoneScreen?.captureId;
   stopMicrophoneTest(); stopMicrophoneMonitor(); clearPhoneCapture();
   await revokeControl();
-  try { await bridge?.stopScreenShare?.(); } catch { /* Projection may already have ended. */ }
+  try { await bridge?.stopScreenShare?.(captureId ? { captureId } : undefined); } catch { /* Projection may already have ended. */ }
   try { await bridge?.stopSharing?.(); } catch { /* Native capture source may already be cleared. */ }
   releaseKeys(); state.controlling = null; state.pendingControl = null;
-  const socket = state.socket; state.socket = null; socket?.close();
+  const socket = state.socket; state.socket = null;
+  if (globalRoom) { if (leavingInternetRoom) { try { await internet.leaveRoom(); } catch {} } } else socket?.close();
   clearInterval(state.statsTimer); clearInterval(state.durationTimer); state.statsTimer = null; state.durationTimer = null;
   clearTimeout(state.controlTimer); clearTimeout(state.grantTimer);
   state.rtc?.close(); state.rtc = null;
@@ -1058,14 +1248,16 @@ async function leaveRoom(stopHost = true) {
   for (const audio of state.audioElements.values()) { audio.srcObject = null; audio.remove(); state.speakerPool.push(audio); }
   state.audioElements.clear(); state.local.clear(); state.peers.clear(); state.tracks.clear(); state.requests.clear();
   if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch {} }
-  if (stopHost && state.isHost) { try { await bridge?.stopRoom(); } catch { /* Broker may already be stopped. */ } }
+  try { await stoppingHost; } catch { /* Broker may already be stopped. */ }
   state.isHost = false; state.joined = false; state.joining = false; state.selfId = null; state.hostId = null; state.selected = null; state.sourceId = null; state.controlRequest = null; state.room = null;
   $('audio-banner').hidden = true; await updatePhoneAudioRoute().catch(() => {});
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
   $('session').hidden = true; $('lobby').hidden = false; $('room-duration').textContent = '00:00';
-  setStatus('Ready on this device'); renderRequests(); renderParticipants(); renderStage(); renderDevices(); renderControl(); updateButtons();
+  $('internet-relay-note').hidden = true;
+  setStatus(internet.status === 'online' ? 'Internet ready' : 'Ready on this device'); renderRequests(); renderParticipants(); renderStage(); renderDevices(); renderControl(); updateButtons();
+  state.leaving = false;
 }
-window.addEventListener('beforeunload', () => { state.rtc?.close(); bridge?.revokeControl(); state.socket?.close(); });
+window.addEventListener('beforeunload', () => { state.rtc?.close(); bridge?.revokeControl(); state.socket?.close(); internet.close(); });
 
 async function initialize() {
   savePreferences();
@@ -1080,21 +1272,20 @@ async function initialize() {
       const phoneMaximum = select.querySelector('option[value="1080"]'); if (phoneMaximum) phoneMaximum.textContent = '1080p · phone maximum';
     }
     $('profile-platform').textContent = 'Android companion';
-    $('host-button').disabled = true; $('host-button').title = 'Create rooms in Auralink for Windows or Mac';
-    $('host-button').closest('.action-card').hidden = true;
-    const caption = $('host-button').parentElement.querySelector('.card-caption');
-    if (caption) { caption.replaceChildren(document.createTextNode('Room hosting is available in the desktop app')); }
-    document.querySelector('.primary-card p').textContent = 'Create a room on Windows or Mac, then join it here for calls, viewing and approved desktop control.';
-    document.querySelector('.primary-card h2').textContent = 'A desktop hosts the room';
+    $('host-mode').value = 'internet'; $('host-button').title = 'Create an Internet room after pairing this phone';
     const connectionText = $('lobby').querySelector('.connection-note p');
-    if (connectionText) connectionText.textContent = 'Join a desktop invitation, turn on sound, then share your phone through Android’s screen permission. To let someone help, enable Auralink Accessibility and approve their separate control request. Allow notifications to keep the Stop sharing action available outside the app.';
+    if (connectionText) connectionText.textContent = 'Use a nearby desktop invitation or pair this phone with your private Internet service. Phone sharing needs Android’s capture permission; phone control needs Auralink Accessibility and your separate approval. You can stop sharing outside the app.';
     $('share-button').title = 'Share your phone using Android screen-capture permission';
     $('phone-speaker-toggle').hidden = !bridge?.setAudioRoute;
   }
   renderDevices();
   await refreshDevices();
   if (!$('stage').requestFullscreen) { $('fullscreen-button').disabled = true; $('fullscreen-button').title = 'Fullscreen is unavailable in this browser'; }
-  if (!bridge?.hostRoom) { $('host-button').querySelector('.button-label')?.remove(); $('host-button').title = 'Hosting requires the desktop app'; }
+  if (!bridge?.hostRoom) { $('host-mode').value = 'internet'; $('host-button').title = 'Create an Internet room after pairing this device'; }
+  updateHostMode(); renderInternet();
+  if (preferences.internetOnline && preferences.internetOrigin && internet.identity(preferences.internetOrigin)) {
+    void ensureInternetOnline(preferences.internetOrigin).catch(error => toast(cleanError(error), true));
+  }
   consumeInvitation();
   updateButtons();
 }

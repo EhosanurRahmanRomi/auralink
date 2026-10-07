@@ -26,6 +26,12 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci
+      - name: Install locked internet coordinator tools
+        run: npm ci --prefix internet-service
+      - name: Actual workerd and SQLite coordinator
+        run: npm run test:runtime --prefix internet-service
+      - name: Free Worker deployment bundle
+        run: npm run check --prefix internet-service
       - name: JavaScript syntax
         run: npm run check
       - name: Protocol, permission and Android bridge unit tests
@@ -40,6 +46,8 @@ jobs:
         run: node tests/mobile-control.cjs
       - name: Android capture bridge, decoded portrait video and consent
         run: node tests/phone-share-browser.cjs
+      - name: Internet pairing, consent and real WebRTC through coordinator
+        run: node tests/internet-browser.cjs
       - name: Desktop app and room teardown
         run: npm run test:desktop
       - name: Keep test evidence

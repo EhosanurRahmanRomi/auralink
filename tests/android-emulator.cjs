@@ -22,7 +22,8 @@ const serial=process.env.AURALINK_EMULATOR_SERIAL || 'emulator-5556';
 const pkg=require('../package.json');
 const output=path.join(project,'test-results');
 const fixtureDir=path.join(project,'.tools','android-runtime-fixture');
-const apk=path.join(project,'release',`Auralink-${pkg.version}-Android.apk`);
+const apk=process.env.AURALINK_TEST_APK ? path.resolve(process.env.AURALINK_TEST_APK) : path.join(project,'release',`Auralink-${pkg.version}-Android.apk`);
+const receiverAssets=process.env.AURALINK_TEST_RENDERER_DIR ? path.resolve(process.env.AURALINK_TEST_RENDERER_DIR) : path.join(project,'src','renderer');
 const browserPath=[process.env.AURALINK_TEST_BROWSER,'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Google/Chrome/Application/chrome.exe','/usr/bin/chromium','/usr/bin/google-chrome'].filter(Boolean).find(file=>fs.existsSync(file));
 const delay=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 let phase='setup';
@@ -319,9 +320,9 @@ async function accessibilityBound(timeout=30000) {
 
 async function hostFixture() {
   const cert=await selfsigned.generate([{name:'commonName',value:'Auralink isolated Android runtime QA'}],{keyType:'ec',curve:'P-256',algorithm:'sha256'});
-  const broker=await createBroker({host:'0.0.0.0',name:'Android runtime verification',tls:{key:cert.private,cert:cert.cert},assetsDir:path.join(project,'src','renderer')});
+  const broker=await createBroker({host:'0.0.0.0',name:'Android runtime verification',tls:{key:cert.private,cert:cert.cert},assetsDir:receiverAssets});
   const ws=new WebSocket(`wss://127.0.0.1:${broker.port}/ws`,{rejectUnauthorized:false});
-  const fixture={broker,ws,inbox:[],waiters:[],peerId:null,page:null,chain:Promise.resolve(),errors:[],network:{healthRequests:0,socketUpgrades:0,tlsErrorCodes:[]}};
+  const fixture={broker,ws,inbox:[],waiters:[],peerId:null,page:null,chain:Promise.resolve(),errors:[],network:{healthRequests:0,socketUpgrades:0,tlsErrorCodes:[],incomingTypes:{},outgoingTypes:{},socketCloses:[]}};
   // Observe the unmodified broker's incoming frame only for a static native
   // rejection reason. The broker intentionally omits reasons on its response.
   // Never retain peer/session identifiers, room credentials or arbitrary text.
@@ -331,13 +332,24 @@ async function hostFixture() {
     if(this._isServer && event==='message') {
       try {
         const packet=JSON.parse(args[0].toString());
+        if(typeof packet.type==='string' && /^[a-z-]{1,32}$/.test(packet.type)) fixture.network.incomingTypes[packet.type]=(fixture.network.incomingTypes[packet.type] || 0)+1;
         if(packet.type==='control-response') runtimeDiagnostics.nativeControlResponse={accepted:packet.accepted===true,
           reason:packet.accepted===true?null:safeReasons.has(packet.reason)?packet.reason:'Rejection reason omitted'};
       }catch{}
     }
+    if(this._isServer && event==='close') fixture.network.socketCloses.push({code:args[0],reason:safeError(String(args[1] || '')).slice(0,160)});
     return Reflect.apply(originalEmit,this,[event,...args]);
   };
-  fixture.restoreObserver=()=>{WebSocket.prototype.emit=originalEmit;};
+  const originalSend=WebSocket.prototype.send;
+  WebSocket.prototype.send=function(data,...args) {
+    if(this._isServer) {
+      try { const packet=JSON.parse(String(data));
+        if(typeof packet.type==='string' && /^[a-z-]{1,32}$/.test(packet.type)) fixture.network.outgoingTypes[packet.type]=(fixture.network.outgoingTypes[packet.type] || 0)+1;
+      } catch {}
+    }
+    return Reflect.apply(originalSend,this,[data,...args]);
+  };
+  fixture.restoreObserver=()=>{WebSocket.prototype.emit=originalEmit;WebSocket.prototype.send=originalSend;};
   broker.server.on('request',request=>{if(request.url==='/health')fixture.network.healthRequests++;});
   broker.server.on('upgrade',request=>{if(request.url==='/ws')fixture.network.socketUpgrades++;});
   broker.server.on('tlsClientError',error=>fixture.network.tlsErrorCodes.push(error.code || 'TLS handshake rejected'));
@@ -431,7 +443,17 @@ async function runUI(fixture) {
   if(permission['resource-id']==='com.android.permissioncontroller:id/permission_allow_button') {
     await tap(permission);permission=await findNode(systemCaptureButton,30000);
   }
-  await screenshot('android-emulator-projection-permission.png');await tap(permission);
+  await screenshot('android-emulator-projection-permission.png');await tapStable(systemCaptureButton);
+  const sharingLabel=node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text);
+  try {
+    const started=await findNode(node=>sharingLabel(node) || /^(?:Screen capture could not start|Screen delivery stalled|Screen frame conversion failed|Screen sharing was canceled|Sharing failed:|Screen share failed:)/.test(node.text || ''),30000);
+    if(!sharingLabel(started)) throw new Error(safeError(started.text || started['content-desc'] || 'Phone capture did not start.'));
+    checkpoint('nativeCaptureStartedAfterOwnerConsent');
+  } catch(error) {
+    const state=await adb(['shell','dumpsys','activity','services','local.auralink.mobile']).catch(()=> 'Service state unavailable');
+    runtimeDiagnostics.screenStart={captureServicePresent:state.includes('ScreenShareService'),foreground:state.includes('isForeground=true')};
+    throw error;
+  }
   phase='actual Android screen frames over WebRTC';console.log(phase);
   await fixture.page.waitForFunction(()=>{const video=document.getElementById('received-screen');return video && video.videoWidth>0 && video.currentTime>0 && video.readyState>=2;},undefined,{timeout:60000});
   const screen=await fixture.page.locator('#received-screen').evaluate(video=>({width:video.videoWidth,height:video.videoHeight,currentTime:video.currentTime,readyState:video.readyState}));
@@ -522,7 +544,7 @@ async function runUI(fixture) {
   assert.deepEqual(fixture.errors,[]);
   assert.deepEqual(await fixture.page.evaluate(()=>runtimeErrors),[]);
   const sourceCheck=path.join(project,'.tools','runtime-source-check.json');
-  return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,source:fs.existsSync(sourceCheck)?JSON.parse(fs.readFileSync(sourceCheck,'utf8')):null,diagnostics:runtimeDiagnostics,verifiedStages,screen,control,audio,
+  return {passed:true,version:process.env.AURALINK_TEST_APK_VERSION || pkg.version,baselineOverride:Boolean(process.env.AURALINK_TEST_APK),receiverRendererOverride:Boolean(process.env.AURALINK_TEST_RENDERER_DIR),serial,api:36,apkSha256:installedApkHash,source:fs.existsSync(sourceCheck)?JSON.parse(fs.readFileSync(sourceCheck,'utf8')):null,diagnostics:runtimeDiagnostics,verifiedStages,screen,control,audio,
     verified:['Production non-debuggable APK installed and loaded','Native pinned TLS room admission','Owner Android system projection consent','Actual MediaProjection screen frames decoded over WebRTC','Foreground sharing service','Owner share stop releases projection','No fatal Android runtime exception'],
     limitations:['Emulator has no physical microphone or speaker; physical audio route needs real-device test.',...(control?[]:['Phone Accessibility input requires a separate attended test.'])],errors:fixture.errors};
 }
@@ -550,7 +572,7 @@ async function main() {
         runtimeDiagnostics.nativeErrors=safeError(log).slice(-6000);
       }
     }catch{}
-    fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:safeError(error),verifiedStages,diagnostics:runtimeDiagnostics,network:fixture?.network,ui:diagnostics},null,2));throw new Error(safeError(error));
+    fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,version:process.env.AURALINK_TEST_APK_VERSION || pkg.version,baselineOverride:Boolean(process.env.AURALINK_TEST_APK),receiverRendererOverride:Boolean(process.env.AURALINK_TEST_RENDERER_DIR),serial,api:36,apkSha256:installedApkHash,phase,error:safeError(error),verifiedStages,diagnostics:runtimeDiagnostics,network:fixture?.network,ui:diagnostics},null,2));throw new Error(safeError(error));
   }finally {
     if(fixture){
       // Stop accepting signaling before closing either endpoint, then finish

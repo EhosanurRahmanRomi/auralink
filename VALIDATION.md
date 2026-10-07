@@ -2,6 +2,26 @@
 
 Tests record specific behavior. They do not certify unrestricted device control, physical media quality, internet reachability or absolute security.
 
+## 0.3.0 Internet beta checks
+
+The current source adds a private Internet directory and coordinator alongside Nearby mode. The deployed service is reachable at `https://auralink-private-coordinator.auralink-internet-service.workers.dev` using normal certificate-chain and hostname verification. Pairing secrets and device tokens are not part of the public installers or source archive.
+
+| Check | What it establishes |
+|---|---|
+| Coordinator policy tests | Hashed credentials, bounded private directory, admission and separate control consent, fixed absolute leases, cancellation during hashing/ICE fetch, forgotten-device races, persisted request/relay state and tampered-cache rejection |
+| Actual workerd / SQLite tests | Production Workers WebSocket upgrades, real persistence/alarms, pending consent through idle time, and a mocked provider fetched through the Workers runtime with encrypted room-cache reuse |
+| Live public native clients | Normal TLS/WSS, authenticated private presence, owner admission, sender identity, consent through an idle period, production heartbeat, exact native membership/grant, replay rejection and device cleanup |
+| Local and public browser integration | Real WebRTC video/audio and encrypted input fixture between two contexts on this Windows PC; delayed capture, microphone permission and control approval cannot attach to a replacement room/share; rapid leave/rejoin is ordered by acknowledgment |
+| Actual Electron integration | Production renderer/preload/native WSS, an approved native guest and actual capture of the Auralink app window; stopping capture and leaving retain directory presence |
+| Native desktop lifecycle tests | Canceled asynchronous room preparation cannot replace a newer broker or leave a late listener running; stale screen enumeration cannot authorize a source |
+| Android policy and bridge tests | Normal Internet CA/hostname verification remains separate from LAN pinning; room/socket loss invalidates consent immediately; capture IDs keep late results, frames and stops scoped to the originating share |
+
+The deeper review fixed reproduced asynchronous room/capture/control races, stale callbacks, lost consent/relay state through hibernation and two fetch behaviors specific to Cloudflare. The live relay is still disabled. Its optional path is covered with a fake provider in the actual Workers runtime; that does not establish that Metered's free account supports provider-enforced credential expiry. The account's activated allowance was a 500 MB trial. No paid plan or overage option was enabled.
+
+Current evidence is saved locally as `test-results/internet-public-native.json`, `internet-public-browser.json`, `internet-desktop.json`, `internet-browser.json` and the standard platform evidence files. A successful same-PC WebRTC path through a public signaling service does not establish media connectivity between different countries, restrictive routers or mobile carriers.
+
+The earlier 0.2.0 native Android emulator result below remains historical evidence. During the 0.3.0 recheck, the local emulator produced graphics stalls and an unresolved capture-consent stage; bidirectional Opus transport passed in one run. Until a fresh complete 0.3.0 native runtime run succeeds, phone projection/control must be treated as awaiting that verification. The release report records the actual final package and runtime status; physical iQOO and MacBook tests remain necessary even after hosted checks pass.
+
 ## 0.2.0 software checks
 
 | Check | What it establishes |
@@ -30,7 +50,7 @@ Mac hosted build checks do not grant the user's TCC permissions or prove physica
 
 ## Remaining limits
 
-- Direct same-network operation is the first target. No TURN relay or global directory is included.
+- Nearby supports same-network operation. The private Internet directory is deployed; media currently attempts direct WebRTC with STUN. TURN is disabled, so some network pairs cannot connect.
 - Desktop presentation targets at most 1440p/30; Android initially caps the longest edge at 1280/1920 with at most about 12fps and JPEG/video-frame conversion. Selection is a ceiling, not a measured-quality promise.
 - Voice uses microphone audio. Desktop/phone system playback capture is absent.
 - Normal desktop input and Android supported gestures/text cannot override UAC, lock screens, password fields, protected content or OS permission surfaces.

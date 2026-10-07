@@ -1,6 +1,24 @@
 /* A small WebRTC mesh. No CDN dependencies and no media capture on construction. */
+export class RelayBudget {
+  constructor({ seconds = 0, bytes = 0 } = {}) {
+    this.secondsLimit = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 3600) : 0;
+    this.bytesLimit = Number.isFinite(bytes) && bytes > 0 ? Math.min(bytes, 1024 * 1024 * 1024) : 0;
+    this.peers = new Map(); this.bytes = 0; this.seconds = 0; this.exhausted = false;
+  }
+  observe(id, { relay, bytes, now }) {
+    if (this.exhausted || !Number.isFinite(bytes) || bytes < 0 || !Number.isFinite(now)) return this.exhausted;
+    const previous = this.peers.get(id);
+    if (relay) {
+      this.bytes += previous ? Math.max(0, bytes - previous.bytes) : bytes;
+      if (previous?.relay) this.seconds += Math.max(0, now - previous.now) / 1000;
+    }
+    this.peers.set(id, { relay, bytes, now });
+    this.exhausted = Boolean((this.secondsLimit && this.seconds >= this.secondsLimit) || (this.bytesLimit && this.bytes >= this.bytesLimit));
+    return this.exhausted;
+  }
+}
 export class RoomRTC extends EventTarget {
-  constructor({ selfId, signal, iceServers = [] }) {
+  constructor({ selfId, signal, iceServers = [], iceTransportPolicy = 'all', relaySecondsLimit = 0, relayBytesLimit = 0 }) {
     super();
     this.selfId = selfId;
     this.signal = signal;
@@ -9,13 +27,16 @@ export class RoomRTC extends EventTarget {
     this.localTracks = new Map();
     this.previousStats = new Map();
     this.closed = false;
+    this.iceTransportPolicy = iceTransportPolicy === 'relay' ? 'relay' : 'all';
+    this.relayBudget = new RelayBudget({ seconds: relaySecondsLimit, bytes: relayBytesLimit });
+    this.budgetTimer = (relaySecondsLimit > 0 || relayBytesLimit > 0) ? setInterval(() => { if (!this.closed) void this.stats(); }, 1000) : null;
   }
 
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
 
   addPeer(peer) {
     if (peer.id === this.selfId || this.peers.has(peer.id) || this.closed) return;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers, bundlePolicy: 'max-bundle' });
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers, iceTransportPolicy: this.iceTransportPolicy, bundlePolicy: 'max-bundle' });
     const entry = {
       info: peer, pc, senders: new Map(), remoteKinds: {}, remoteMids: {}, remoteState: {},
       remoteTracks: new Map(), inactiveRemoteTracks: new Map(), polite: this.selfId.localeCompare(peer.id) > 0,
@@ -85,6 +106,7 @@ export class RoomRTC extends EventTarget {
     const entry = this.peers.get(peerId);
     if (!entry || !data || this.closed) return;
     entry.queue = entry.queue.then(async () => {
+      if (this.closed || this.peers.get(peerId) !== entry) return;
       if (data.mediaState) this.applyMediaState(peerId, data.mediaState);
       if (data.description) {
         const { pc } = entry;
@@ -98,7 +120,11 @@ export class RoomRTC extends EventTarget {
         entry.settingAnswer = description.type === 'answer';
         try { await pc.setRemoteDescription(description); }
         finally { entry.settingAnswer = false; }
-        if (description.type === 'offer') { await pc.setLocalDescription(); this.sendDescription(entry); }
+        if (this.closed || this.peers.get(peerId) !== entry) return;
+        if (description.type === 'offer') {
+          await pc.setLocalDescription();
+          if (!this.closed && this.peers.get(peerId) === entry) this.sendDescription(entry);
+        }
         // Never block the signaling queue behind setParameters: the awaited
         // answer/candidate may be the next message in this same queue.
         void this.setVideoLimits();
@@ -143,6 +169,7 @@ export class RoomRTC extends EventTarget {
   }
 
   async setTrack(kind, track, stream) {
+    if (this.closed) { track?.stop(); return; }
     const old = this.localTracks.get(kind);
     if (old?.track === track) return;
     if (track) this.localTracks.set(kind, { track, stream }); else this.localTracks.delete(kind);
@@ -185,13 +212,24 @@ export class RoomRTC extends EventTarget {
     if (!entry) return;
     entry.channel?.close(); entry.pc.close(); this.peers.delete(peerId);
     this.previousStats.delete(peerId);
+    this.relayBudget.peers.delete(peerId);
   }
 
-  async stats() {
+  stats() {
+    if (this.closed) return Promise.resolve([]);
+    // Diagnostics and the relay guard share one snapshot. Overlapping reads
+    // must not apply cumulative counters twice or revive a removed peer.
+    if (this.statsPromise) return this.statsPromise;
+    this.statsPromise = this.collectStats().finally(() => { this.statsPromise = null; });
+    return this.statsPromise;
+  }
+
+  async collectStats() {
     const results = [];
     for (const [peerId, entry] of this.peers) {
       try {
         const report = await entry.pc.getStats();
+        if (this.closed || this.peers.get(peerId) !== entry) continue;
         let pair = null; let transport = null; let receivedVideo = null; let sentVideo = null; let receivedAudio = null; let sentAudio = null; let audioSource = null;
         let totalReceived = 0; let totalSent = 0; let lost = 0; let packets = 0;
         report.forEach((row) => {
@@ -211,10 +249,12 @@ export class RoomRTC extends EventTarget {
         });
         if (transport) pair = report.get(transport.selectedCandidatePairId) || pair;
         const candidate = pair && report.get(pair.localCandidateId);
+        const remoteCandidate = pair && report.get(pair.remoteCandidateId);
+        const relayed = candidate?.candidateType === 'relay' || remoteCandidate?.candidateType === 'relay';
         const now = performance.now(); const prev = this.previousStats.get(peerId); const seconds = prev ? (now - prev.now) / 1000 : 0;
         const measurement = {
           peerId, name: entry.info.name, state: entry.pc.connectionState,
-          route: candidate ? (candidate.candidateType === 'relay' ? 'Relay' : 'Direct') : null,
+          route: candidate ? (relayed ? 'Relay' : 'Direct') : null,
           protocol: candidate?.protocol || null,
           roundTripMs: pair?.currentRoundTripTime !== undefined ? Math.round(pair.currentRoundTripTime * 1000) : null,
           downloadMbps: seconds > 0 ? Math.max(0, (totalReceived - prev.received) * 8 / seconds / 1e6) : null,
@@ -233,6 +273,14 @@ export class RoomRTC extends EventTarget {
           audioCodec: receivedAudio?.codecId ? report.get(receivedAudio.codecId)?.mimeType || null : sentAudio?.codecId ? report.get(sentAudio.codecId)?.mimeType || null : null,
         };
         this.previousStats.set(peerId, { now, received: totalReceived, sent: totalSent }); results.push(measurement);
+        const bytes = (pair?.bytesReceived ?? totalReceived) + (pair?.bytesSent ?? totalSent);
+        if (this.relayBudget.observe(peerId, { relay: relayed, bytes, now })) {
+          // Closing transport and tracks happens before notifying the UI. This
+          // local guard limits a session; provider quotas remain authoritative.
+          this.close();
+          this.emit('relay-budget', { reason: 'This room reached its free relay session allowance. Start a direct connection or try again later.', usedBytes: this.relayBudget.bytes, limitBytes: this.relayBudget.bytesLimit });
+          break;
+        }
       } catch { /* Closed or not yet negotiated peer. */ }
     }
     return results;
@@ -240,6 +288,7 @@ export class RoomRTC extends EventTarget {
 
   close() {
     this.closed = true;
+    clearInterval(this.budgetTimer); this.budgetTimer = null;
     for (const peerId of [...this.peers.keys()]) this.removePeer(peerId);
     for (const { track } of this.localTracks.values()) track.stop();
     this.localTracks.clear();

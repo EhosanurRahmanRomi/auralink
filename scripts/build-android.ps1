@@ -25,7 +25,7 @@ $privatePath = Join-Path $projectPath '.private'
 $releasePath = Join-Path $projectPath 'release'
 foreach ($directory in @($assetsPath, $classesPath, $dexPath, $privatePath, $releasePath, (Join-Path $androidPath 'res/drawable'))) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
 # All source copies are explicit; toolchains, keys and arbitrary PC files are not packaged.
-foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js')) { Copy-Item -LiteralPath (Join-Path $projectPath "src/renderer/$file") -Destination (Join-Path $assetsPath $file) -Force }
+foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js')) { Copy-Item -LiteralPath (Join-Path $projectPath "src/renderer/$file") -Destination (Join-Path $assetsPath $file) -Force }
 $legalAssets = Join-Path $outPath 'assets/legal'
 New-Item -ItemType Directory -Path $legalAssets -Force | Out-Null
 foreach ($file in @('Java-WebSocket-LICENSE.txt','SLF4J-LICENSE.txt')) { Copy-Item -LiteralPath (Join-Path $androidPath "legal/$file") -Destination (Join-Path $legalAssets $file) -Force }
@@ -52,7 +52,7 @@ $archive = [System.IO.Compression.ZipFile]::Open($unsigned, [System.IO.Compressi
 try {
     # Windows aapt2 can emit backslashes for assets. Android AssetManager
     # requires slash names, so create these fixed entries explicitly.
-    foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js')) {
+    foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js')) {
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $assetsPath $file), "assets/renderer/$file", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
     }
     foreach ($file in @('Java-WebSocket-LICENSE.txt','SLF4J-LICENSE.txt','Auralink-LICENSE.txt')) {

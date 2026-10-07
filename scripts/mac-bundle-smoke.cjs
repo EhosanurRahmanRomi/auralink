@@ -64,7 +64,8 @@ async function main() {
     assert.equal(permissions.inputPosted,false);
     const archive=path.join(resources,'app.asar');
     const sourceFiles=['src/main.cjs','src/preload.cjs','src/core/broker.cjs','src/core/invite.cjs','src/native/control.cjs','src/native/macos-input.swift',
-      'src/renderer/index.html','src/renderer/styles.css','src/renderer/app.js','src/renderer/rtc.js','src/renderer/android-bridge.js'];
+      'src/renderer/index.html','src/renderer/styles.css','src/renderer/app.js','src/renderer/rtc.js','src/renderer/android-bridge.js',
+      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs'];
     for(const file of sourceFiles) assert.equal(hash(asar.extractFile(archive,file)),hash(fs.readFileSync(path.join(project,file))),`${file} must match the tested source`);
     const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
     application=await _electron.launch({executablePath:binary,args:['--smoke-test',`--user-data-dir=${profile}`],env,timeout:60000});

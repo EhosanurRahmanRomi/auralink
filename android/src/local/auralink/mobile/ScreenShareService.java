@@ -39,8 +39,9 @@ public final class ScreenShareService extends Service {
     static final String STOP = "local.auralink.mobile.STOP_SCREEN";
     private static final int NOTIFICATION = 1041;
     private static ScreenShareService instance;
+    private static final ProjectionOwnership ownership = new ProjectionOwnership();
     private static Listener pendingListener;
-    private static String pendingTicket;
+    private String activeTicket;
     private final Handler main = new Handler(Looper.getMainLooper());
     private HandlerThread captureThread;
     private Handler capture;
@@ -63,12 +64,18 @@ public final class ScreenShareService extends Service {
             }
         }
     };
-    static synchronized void prepare(String ticket, Listener next) { pendingTicket = ticket; pendingListener = next; }
-    static synchronized void cancelPreparation() { pendingTicket = null; pendingListener = null; }
+    static synchronized void prepare(String ticket, Listener next) { ownership.prepare(ticket); pendingListener = next; }
+    static synchronized void cancelPreparation() { ownership.clearPending(); pendingListener = null; }
+    static synchronized void cancelPreparation(String ticket) { if (ownership.cancelPending(ticket)) pendingListener = null; }
     static boolean active() { return instance != null && instance.running && !instance.stopping; }
     static boolean activeFullDisplay() { return active() && instance.fullDisplay; }
     static void acknowledge(long seq) { ScreenShareService current = instance; if (current != null && current.inFlight == seq) current.inFlight = 0; }
     static void stopCurrent(String reason) { ScreenShareService current = instance; if (current != null) current.main.post(() -> current.stopSharing(reason)); else cancelPreparation(); }
+    static void stopCurrent(String ticket, String reason) {
+        ScreenShareService current = instance;
+        if (current != null) current.main.post(() -> { if (ticket != null && ticket.equals(current.activeTicket)) current.stopSharing(reason); });
+        cancelPreparation(ticket);
+    }
     static void addMediaTypes(int types) { ScreenShareService current = instance; if (current != null && current.running) { current.foregroundTypes |= types; current.startForeground(NOTIFICATION, current.notification(), current.foregroundTypes); } }
 
     @Override public void onCreate() {
@@ -78,15 +85,25 @@ public final class ScreenShareService extends Service {
     }
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent == null || STOP.equals(intent.getAction())) { stopSharing("Stopped from the Android notification."); return START_NOT_STICKY; }
+        final String ticket = intent.getStringExtra("ticket");
+        // A duplicate or delayed old service intent must not stop an active
+        // projection or consume another owner consent waiting to start.
+        if (running) return START_NOT_STICKY;
         if (stopping) {
             Listener waiting;
-            synchronized (ScreenShareService.class) { waiting = pendingListener; cancelPreparation(); }
+            synchronized (ScreenShareService.class) {
+                waiting = ownership.pendingMatches(ticket) ? pendingListener : null;
+                cancelPreparation(ticket);
+            }
             if (waiting != null) waiting.stopped("Previous screen sharing is stopping. Try sharing again in a moment.");
             stopSelf(); return START_NOT_STICKY;
         }
         synchronized (ScreenShareService.class) {
-            if (running || pendingListener == null || !java.util.Objects.equals(pendingTicket, intent.getStringExtra("ticket"))) { stopSelf(); return START_NOT_STICKY; }
-            listener = pendingListener; pendingListener = null; pendingTicket = null;
+            if (pendingListener == null || !ownership.claim(ticket)) {
+                if (pendingListener == null) stopSelf();
+                return START_NOT_STICKY;
+            }
+            activeTicket = ticket; listener = pendingListener; pendingListener = null;
         }
         maxEdge = intent.getIntExtra("maxEdge", 1280) == 1920 ? 1920 : 1280;
         foregroundTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
@@ -173,7 +190,8 @@ public final class ScreenShareService extends Service {
             .setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).setContentIntent(open).addAction(new Notification.Action.Builder(null, "Stop sharing", stop).build()).build();
     }
     private void stopSharing(String reason) {
-        if (stopping) return; stopping = true; running = false; fullDisplay = false; inFlight = 0; cancelPreparation();
+        if (stopping) return; stopping = true; running = false; fullDisplay = false; inFlight = 0;
+        cancelPreparation(activeTicket); ownership.release(activeTicket);
         AttendedAccessibilityService control = AttendedAccessibilityService.current(); if (control != null) control.revoke(reason);
         try { ((DisplayManager)getSystemService(DISPLAY_SERVICE)).unregisterDisplayListener(rotationListener); } catch (Exception ignored) { }
         MediaProjection previousProjection = projection; projection = null;

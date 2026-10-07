@@ -12,6 +12,8 @@
   const emergencyListeners = new Set();
   const mediaErrorListeners = new Set();
   let screenSequence = -1;
+  let screenCaptureId = null;
+  let captureRequestNumber = 0;
   let requestNumber = 0;
   let socketNumber = 0;
   let stopped = false;
@@ -19,7 +21,7 @@
   function invoke(method, args = null) {
     return new Promise((resolve, reject) => {
       const requestId = `r${++requestNumber}`;
-      const timeout = ['startScreenShare', 'grantControl'].includes(method) ? 120000 : method === 'trustInvite' ? 60000 : 15000;
+      const timeout = ['startScreenShare', 'grantControl'].includes(method) ? 120000 : ['trustInvite', 'trustInternetService'].includes(method) ? 60000 : 15000;
       const timer = setTimeout(() => { requests.delete(requestId); reject(new Error('The Android service did not respond.')); }, timeout);
       requests.set(requestId, { resolve, reject, timer });
       try { native.postMessage(JSON.stringify({ requestId, method, args })); }
@@ -39,7 +41,7 @@
     constructor(url) {
       super();
       const parsed = new URL(url);
-      if (parsed.protocol !== 'wss:' || parsed.pathname !== '/ws' || parsed.search || parsed.hash || parsed.username || parsed.password) throw new Error('Use a pinned HTTPS room invitation.');
+      if (parsed.protocol !== 'wss:' || !['/ws', '/internet/ws'].includes(parsed.pathname) || parsed.search || parsed.hash || parsed.username || parsed.password) throw new Error('Use a pinned HTTPS room invitation or a verified Internet service.');
       this.url = parsed.href;
       this.id = `socket-${++socketNumber}`;
       this._state = 0;
@@ -110,6 +112,9 @@
       return;
     }
     if (message.event === 'screen') {
+      // Events already queued for an old projection cannot reset the replay
+      // counter or end a later owner-approved projection.
+      if (screenCaptureId !== null && message.captureId !== screenCaptureId) return;
       if (message.type === 'frame') {
         if (stopped || !Number.isSafeInteger(message.seq) || message.seq <= screenSequence ||
             !Number.isInteger(message.width) || !Number.isInteger(message.height) ||
@@ -120,13 +125,17 @@
         for (const listener of frameListeners) { try { listener(message); } catch { /* Frame consumers have separate lifetimes. */ } }
       } else if (message.type === 'stopped') {
         screenSequence = -1;
-        for (const listener of screenStopListeners) { try { listener(String(message.reason || 'Phone screen sharing stopped.')); } catch { /* Native consent stays authoritative. */ } }
+        screenCaptureId = null;
+        const capture = { captureId: typeof message.captureId === 'string' ? message.captureId : null };
+        for (const listener of screenStopListeners) { try { listener(String(message.reason || 'Phone screen sharing stopped.'), capture); } catch { /* Native consent stays authoritative. */ } }
       }
       return;
     }
     if (message.event === 'session-stop') {
       stopped = true;
       screenSequence = -1;
+      screenCaptureId = null;
+      captureRequestNumber++;
       for (const socket of [...sockets.values()]) { socket.close(); socket.finish(1000, String(message.reason || 'App moved to the background.')); }
       for (const request of requests.values()) { clearTimeout(request.timer); request.reject(new Error('Android session stopped.')); }
       requests.clear();
@@ -151,11 +160,36 @@
         stopped = false;
         return invoke('trustInvite', invite);
       },
+      trustInternetService: (serviceURL) => {
+        try {
+          if (typeof serviceURL !== 'string' || serviceURL.length > 2048 || /[^\x20-\x7e]/.test(serviceURL)) throw new TypeError('Invalid Internet service address.');
+          if (!/^https:\/\/(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::[0-9]+)?\/?$/i.test(serviceURL.trim()))
+            throw new TypeError('Use the Internet service HTTPS root address without credentials, query or fragment.');
+          const service = new URL(serviceURL.trim());
+          if (service.protocol !== 'https:' || !['', '/'].includes(service.pathname) || service.username || service.password || service.search || service.hash || /[?#]/.test(serviceURL))
+            throw new TypeError('Use the Internet service HTTPS root address without credentials, query or fragment.');
+          stopped = false;
+          return invoke('trustInternetService', service.origin);
+        } catch (error) { return Promise.reject(error); }
+      },
       copyText: (text) => typeof text === 'string' && text.length <= 4096 ? invoke('copyText', text) : Promise.reject(new TypeError('Invalid clipboard text.')),
       createSocket: (url) => new NativeSocket(url),
-      startScreenShare: (args) => { screenSequence = -1; return invoke('startScreenShare', args); },
-      stopScreenShare: () => invoke('stopScreenShare'),
-      stopSharing: () => invoke('stopScreenShare'),
+      createInternetSocket: (url) => {
+        if (new URL(url).pathname !== '/internet/ws') throw new TypeError('Use the verified Internet service socket.');
+        return new NativeSocket(url);
+      },
+      startScreenShare: (args) => {
+        const captureRequest = ++captureRequestNumber;
+        return invoke('startScreenShare', args).then((screen) => {
+          if (captureRequest === captureRequestNumber && !stopped) {
+            screenSequence = -1;
+            screenCaptureId = typeof screen?.captureId === 'string' ? screen.captureId : null;
+          }
+          return screen;
+        });
+      },
+      stopScreenShare: (args) => invoke('stopScreenShare', args),
+      stopSharing: (args) => invoke('stopScreenShare', args),
       ackScreenFrame: (args) => invoke('ackScreenFrame', args),
       grantControl: (args) => invoke('grantControl', args),
       revokeControl: () => invoke('revokeControl'),

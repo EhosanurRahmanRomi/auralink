@@ -7,10 +7,13 @@ const selfsigned = require('selfsigned');
 const {parseInvite, fingerprint, certificateDecisionForPin} = require('./core/invite.cjs');
 const {createBroker} = require('./core/broker.cjs');
 const {ControlGate, createAdapter} = require('./native/control.cjs');
+const {probeInternetService, NativeInternetClient} = require('./core/internet-client.cjs');
 
 app.setName('Auralink');
 let win, broker, adapter, gate, selectedSource, currentSource;
 let grantGeneration=0;
+let roomOperation=0, sourceOperation=0;
+let internetService = null, internetClient = null, roomContext = 'nearby';
 const pins = new Map();
 const sources = new Map();
 const localPage = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
@@ -60,6 +63,8 @@ function localAddresses() {
   return Object.entries(os.networkInterfaces()).flatMap(([name, list]) => list.filter(x => x.family === 'IPv4' && !x.internal && !x.address.startsWith('169.254.')).map(x=>({name,address:x.address}))).sort((a,b)=>Number(/virtual|vmware|vbox/i.test(a.name))-Number(/virtual|vmware|vbox/i.test(b.name)));
 }
 async function revoke() { grantGeneration++; if (gate) await gate.revoke(); }
+function resetRoomSources() { roomOperation++; sourceOperation++; sources.clear(); selectedSource=null; currentSource=null; }
+function assertRoomOperation(operation) { if(operation !== roomOperation) throw new Error('Room preparation was canceled.'); }
 function pinOrigin(origin, fp) { pins.set(new URL(origin).hostname, fp); }
 function certificateDecision(request, callback) {
   callback(certificateDecisionForPin(pins.get(request.hostname),request.certificate.data,request.verificationResult));
@@ -80,6 +85,15 @@ function probeCertificate(origin, expected) {
     req.on('timeout',()=>req.destroy(new Error('Host is unreachable. Check that both apps are open and the network permits connections.')));
     req.on('error',reject);
   });
+}
+function internetAuthorizationLost(details) {
+  if (roomContext !== 'internet') return;
+  if (details.kind === 'room' && roomContext === 'internet') resetRoomSources();
+  void revoke();
+}
+function acceptedForControl(peerId) {
+  if (roomContext === 'internet') return Boolean(internetClient?.membership.isAcceptedPeer(peerId));
+  return !broker || broker.isAcceptedPeer(peerId);
 }
 
 app.whenReady().then(async () => {
@@ -105,43 +119,90 @@ app.whenReady().then(async () => {
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     if (!win || !request.frame || request.frame !== win.webContents.mainFrame || !selectedSource || Date.now()-selectedSource.at > 30000) return callback({});
     const chosen = selectedSource; selectedSource = null;
+    const captureGeneration = grantGeneration;
+    const captureRoom = roomOperation;
+    const captureContext = roomContext;
     try {
       const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:0,height:0}});
       const source = available.find(s=>s.id===chosen.id);
-      if (!source) return callback({});
+      if (!source || captureGeneration !== grantGeneration || captureRoom !== roomOperation || captureContext !== roomContext ||
+          (captureContext === 'internet' && !internetClient?.membership.roomId)) return callback({});
       currentSource = source;
       callback({video:source});
     } catch {callback({});}
   });
 
   handle('host', async args => {
+    resetRoomSources(); const operation=roomOperation;
+    const previous=broker; broker=null;
     await revoke();
-    if (broker) await broker.stop();
+    if (previous) await previous.stop();
+    assertRoomOperation(operation);
+    roomContext = 'nearby';
     const name = String(args?.name || 'My room').trim().slice(0,48) || 'My room';
     const pems = await selfsigned.generate([{name:'commonName',value:'Auralink private room'}], {keyType:'ec',curve:'P-256',notAfterDate:new Date(Date.now()+30*86400000),algorithm:'sha256'});
+    assertRoomOperation(operation);
     const certPin = fingerprint(pems.cert);
     const requestedPort=Number(args?.port || 0);
     if(!Number.isInteger(requestedPort)||requestedPort<0||requestedPort>65535||(requestedPort>0&&requestedPort<1024)) throw new Error('Choose a port between 1024 and 65535.');
-    broker = await createBroker({name, port:requestedPort, tls:{key:pems.private,cert:pems.cert}, assetsDir:path.join(__dirname,'renderer')});
-    const url = `https://127.0.0.1:${broker.port}`;
+    const created = await createBroker({name, port:requestedPort, tls:{key:pems.private,cert:pems.cert}, assetsDir:path.join(__dirname,'renderer')});
+    if(operation !== roomOperation) { await created.stop(); throw new Error('Room preparation was canceled.'); }
+    broker=created;
+    const url = `https://127.0.0.1:${created.port}`;
     pinOrigin(url, certPin);
     session.defaultSession.setCertificateVerifyProc(certificateDecision);
     const addresses = localAddresses();
-    const invites = addresses.map(a=>({name:a.name,address:a.address,invite:`https://${a.address}:${broker.port}/#key=${broker.roomKey}&fp=${certPin}`}));
-    const invite = invites[0]?.invite || `${url}/#key=${broker.roomKey}&fp=${certPin}`;
-    return {name,url,roomKey:broker.roomKey,hostToken:broker.hostToken,port:broker.port,fingerprint:certPin,invite,invites};
+    const invites = addresses.map(a=>({name:a.name,address:a.address,invite:`https://${a.address}:${created.port}/#key=${created.roomKey}&fp=${certPin}`}));
+    const invite = invites[0]?.invite || `${url}/#key=${created.roomKey}&fp=${certPin}`;
+    return {name,url,roomKey:created.roomKey,hostToken:created.hostToken,port:created.port,fingerprint:certPin,invite,invites};
   });
-  handle('stop', async () => {await revoke(); currentSource=null; if(broker) {await broker.stop(); broker=null;} return {ok:true};});
+  handle('stop', async () => {resetRoomSources(); const previous=broker; broker=null; await revoke(); if(previous) await previous.stop(); return {ok:true};});
   handle('trust-invite', async value => {
+    resetRoomSources(); const operation=roomOperation;
     const invite = parseInvite(value);
     await probeCertificate(invite.url, invite.fingerprint);
+    assertRoomOperation(operation);
+    await revoke();
+    assertRoomOperation(operation);
+    roomContext = 'nearby';
     pinOrigin(invite.url, invite.fingerprint);
     // Changing the verifier clears Chromium's certificate decision cache.
     session.defaultSession.setCertificateVerifyProc(certificateDecision);
     return invite;
   });
+  handle('trust-internet-service', async value => {
+    if (internetClient && !internetClient.closed) throw new Error('Disconnect Internet before changing its service address.');
+    internetService = await probeInternetService(value);
+    return internetService;
+  });
+  handle('internet-open', args => {
+    if (!internetService || typeof args?.socketId !== 'string' || !/^internet-[0-9]{1,16}$/.test(args.socketId) || args.url !== internetService.socketUrl) throw new Error('Verify the internet service before connecting.');
+    if (internetClient && !internetClient.closed) throw new Error('An internet connection is already open.');
+    internetClient = new NativeInternetClient(internetService.url, args.socketId, message => {
+      if (message.type === 'message') {
+        let payload;
+        try { payload = JSON.parse(message.data); } catch { return; }
+        if (payload.type === 'welcome') {
+          resetRoomSources(); void revoke();
+          roomContext = 'internet';
+        }
+      }
+      if (win && !win.isDestroyed()) win.webContents.send('auralink:internet-event', message);
+    }, internetAuthorizationLost);
+    return { ok: true };
+  });
+  handle('internet-send', args => {
+    if (!internetClient || args?.socketId !== internetClient.socketId) throw new Error('Unknown internet connection.');
+    internetClient.send(args.data); return { ok: true };
+  });
+  handle('internet-close', args => {
+    if (internetClient && args?.socketId === internetClient.socketId) internetClient.close();
+    return { ok: true };
+  });
   handle('sources', async () => {
+    const operation=roomOperation, request=++sourceOperation;
     const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:320,height:180},fetchWindowIcons:false});
+    if(operation !== roomOperation || request !== sourceOperation) throw new Error('Screen selection was canceled.');
     if (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') {
       throw new Error('Allow Auralink Screen & System Audio Recording in System Settings → Privacy & Security, then restart Auralink before sharing.');
     }
@@ -161,11 +222,11 @@ app.whenReady().then(async () => {
     const peerName=String(args.name || args.peerId).replace(/[\x00-\x1f]/g,'').slice(0,48);
     const approvedSource=currentSource;
     const approvalGeneration=grantGeneration;
-    if(broker && !broker.isAcceptedPeer(args.peerId)) return {ok:false,reason:'Participant is no longer in this room.'};
+    if(!acceptedForControl(args.peerId)) return {ok:false,reason:'Participant is no longer in this room.'};
     const result=await dialog.showMessageBox(win,{type:'warning',buttons:['Keep view only','Allow control'],defaultId:0,cancelId:0,title:'Approve remote control',message:`Allow ${peerName} to control the shared display?`,detail:'They can move your pointer and type into normal desktop apps. Only approve someone you trust. Stop instantly with Ctrl+Alt+Shift+Q (Command+Option+Shift+Q on Mac).'});
     if(result.response!==1) return {ok:false,reason:'Control was not approved.'};
     if(currentSource !== approvedSource || grantGeneration !== approvalGeneration) return {ok:false,reason:'Session changed while approval was open.'};
-    if(broker && !broker.isAcceptedPeer(args.peerId)) return {ok:false,reason:'Participant disconnected during approval.'};
+    if(!acceptedForControl(args.peerId)) return {ok:false,reason:'Participant disconnected during approval.'};
     if(process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
       return {ok:false,reason:'Enable Auralink in System Settings → Privacy & Security → Accessibility, then approve this request again. The Mac owner must grant this system permission.'};
     }
@@ -176,8 +237,11 @@ app.whenReady().then(async () => {
     return await gate.grant({peerId:args.peerId,sessionId:args.sessionId,display:bounds});
   });
   handle('revoke-control',async()=>{await revoke(); return {ok:true};});
-  handle('stop-sharing',async()=>{currentSource=null;selectedSource=null;await revoke();return {ok:true};});
-  handle('input',args=>gate.apply(args));
+  handle('stop-sharing',async()=>{sourceOperation++;sources.clear();currentSource=null;selectedSource=null;await revoke();return {ok:true};});
+  handle('input',args=>{
+    if(roomContext==='internet' && !internetClient?.membership.isGrantConfirmed(args?.peerId,args?.sessionId)) return {ok:false,reason:'The internet room has not confirmed this control grant.'};
+    return gate.apply(args);
+  });
   handle('copy',value=>{if(typeof value!=='string'||value.length>4096) throw new Error('Invalid clipboard value.');clipboard.writeText(value);return {ok:true};});
   handle('request-media',requestMedia);
   handle('permission-settings',async type=>{
@@ -190,11 +254,11 @@ app.whenReady().then(async () => {
   win=new BrowserWindow({width:1380,height:880,minWidth:900,minHeight:650,show:false,icon:path.join(__dirname,'..','build','icon.png'),backgroundColor:'#090e19',title:'Auralink',autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,spellcheck:false}});
   win.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   win.webContents.on('will-navigate',event=>event.preventDefault());
-  win.webContents.on('render-process-gone',emergencyStop);
-  win.on('closed',()=>{emergencyStop();win=null;});
+  win.webContents.on('render-process-gone',()=>{internetClient?.close();emergencyStop();});
+  win.on('closed',()=>{internetClient?.close();emergencyStop();win=null;});
   win.once('ready-to-show',()=>win.show());
   await win.loadFile(path.join(__dirname,'renderer','index.html'));
   globalShortcut.register(process.platform==='darwin'?'Command+Alt+Shift+Q':'Control+Alt+Shift+Q',emergencyStop);
 });
-app.on('before-quit',()=>{if(gate)gate.revoke();if(adapter)adapter.dispose();if(broker)broker.stop();globalShortcut.unregisterAll();});
+app.on('before-quit',()=>{internetClient?.close();if(gate)gate.revoke();if(adapter)adapter.dispose();if(broker)broker.stop();globalShortcut.unregisterAll();});
 app.on('window-all-closed',()=>app.quit());

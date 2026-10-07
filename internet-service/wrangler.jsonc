@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "auralink-private-coordinator",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-10-07",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": false },
+  "durable_objects": {
+    "bindings": [{ "name": "COORDINATOR", "class_name": "AuralinkCoordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AuralinkCoordinator"] }],
+  "vars": {
+    "RELAY_ENABLED": "false",
+    "RELAY_DAILY_ISSUANCE_LIMIT": "4",
+    "RELAY_MONTHLY_ISSUANCE_LIMIT": "60",
+    "RELAY_SESSION_SECONDS": "600"
+  }
+}

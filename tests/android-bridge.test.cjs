@@ -8,13 +8,13 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../src/renderer/android-bridge.js'), 'utf8');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-function setup({ android = true, existing, reject } = {}) {
+function setup({ android = true, existing, reject, response } = {}) {
   const messages = [];
   const window = existing ? { auralink: existing } : {};
   if (android) window.AuralinkNative = { postMessage(raw) {
     const message = JSON.parse(raw); messages.push(message);
     queueMicrotask(() => window.__auralinkNativeReceive?.(JSON.stringify({ requestId: message.requestId,
-      ok: !reject?.(message), result: message.method === 'getInfo' ? { platform: 'android', nativeControl: false } : { ok: true },
+      ok: !reject?.(message), result: response ? response(message) : message.method === 'getInfo' ? { platform: 'android', nativeControl: false } : { ok: true },
       error: 'Native permission declined.' })));
   } };
   vm.runInNewContext(source, { window, EventTarget, Event, MessageEvent, DOMException, TextEncoder, URL, setTimeout, clearTimeout, queueMicrotask });
@@ -59,6 +59,74 @@ test('Android capture events reject oversized, malformed and replayed frames and
   receive({event:'screen',type:'stopped'}); assert.deepEqual(frames,[1,0]); assert.equal(stops.length,1);
   await bridge.setAudioRoute({active:true,speaker:true});
   assert.deepEqual({...messages.at(-1).args},{active:true,speaker:true});
+});
+
+test('Android capture cleanup preserves the opaque native session identifier', async () => {
+  const { bridge, receive, messages } = setup();
+  const captureId = 'capture-session-owned-by-native';
+  await bridge.stopScreenShare({ captureId });
+  assert.deepEqual({ ...messages.at(-1).args }, { captureId });
+  await bridge.stopSharing({ captureId });
+  assert.deepEqual({ ...messages.at(-1).args }, { captureId });
+  await bridge.ackScreenFrame({ seq: 7, captureId });
+  assert.deepEqual({ ...messages.at(-1).args }, { seq: 7, captureId });
+  const stopped = [];
+  bridge.onScreenStopped((reason, capture) => stopped.push({ reason, captureId: capture.captureId }));
+  receive({ event: 'screen', type: 'stopped', reason: 'Owner stopped sharing.', captureId });
+  assert.deepEqual(stopped, [{ reason: 'Owner stopped sharing.', captureId }]);
+});
+
+test('old Android projection events cannot poison or stop a replacement capture', async () => {
+  let captureId = 'old-native-capture';
+  const { bridge, receive } = setup({ response: message => message.method === 'startScreenShare' ? { captureId } : { ok: true } });
+  const frames = [], stops = [];
+  bridge.onScreenFrame(frame => frames.push([frame.captureId, frame.seq]));
+  bridge.onScreenStopped(reason => stops.push(reason));
+  const frame = { event: 'screen', type: 'frame', width: 720, height: 1280, data: 'data:image/jpeg;base64,YQ==' };
+  await bridge.startScreenShare({});
+  receive({ ...frame, captureId, seq: 1 });
+  captureId = 'new-native-capture';
+  await bridge.startScreenShare({});
+  receive({ ...frame, captureId, seq: 1 });
+  receive({ ...frame, captureId: 'old-native-capture', seq: 500 });
+  receive({ event: 'screen', type: 'stopped', captureId: 'old-native-capture', reason: 'Old share stopped.' });
+  receive({ ...frame, captureId, seq: 1 });
+  receive({ ...frame, captureId, seq: 2 });
+  assert.deepEqual(frames, [['old-native-capture', 1], ['new-native-capture', 1], ['new-native-capture', 2]]);
+  assert.deepEqual(stops, []);
+});
+
+test('Internet service trust is explicit and accepts only a clean HTTPS origin', async () => {
+  const { bridge, messages } = setup();
+  for (const address of ['http://service.example', 'https://user:pass@service.example', 'https://service.example/internet/ws',
+    'https://service.example/?token=secret', 'https://service.example/#fp=anything', 'https://service.example/?',
+    'https://service.example/#', 'https://service.example/a/..', 'https://service.example\\other',
+    'https://service.example\n', 'https://service.example/' + 'x'.repeat(2048)]) {
+    await assert.rejects(bridge.trustInternetService(address), /Internet service|HTTPS root|Invalid URL/);
+  }
+  assert.equal(messages.length, 0, 'Invalid Internet addresses never reach the native bridge');
+  await bridge.trustInternetService('HTTPS://SERVICE.EXAMPLE:443/');
+  assert.equal(messages[0].method, 'trustInternetService');
+  assert.equal(messages[0].args, 'https://service.example');
+  assert.throws(() => bridge.createInternetSocket('wss://service.example/ws'), /Internet service socket/);
+  const socket = bridge.createInternetSocket('wss://service.example/internet/ws');
+  await flush();
+  assert.equal(messages.at(-1).method, 'openSocket');
+  assert.equal(messages.at(-1).args.url, 'wss://service.example/internet/ws');
+  socket.close(); await flush();
+});
+
+test('native refusal of an unverified Internet socket prevents registration credentials from being sent', async () => {
+  const { bridge, messages } = setup({ reject: message => message.method === 'openSocket' });
+  const socket = bridge.createInternetSocket('wss://unverified.example/internet/ws');
+  const events = [];
+  socket.addEventListener('error', () => events.push('error'));
+  socket.addEventListener('close', () => events.push('close'));
+  await flush();
+  assert.equal(socket.readyState, 3);
+  assert.deepEqual(events, ['error', 'close']);
+  assert.throws(() => socket.send('{"type":"register","deviceToken":"secret"}'), /not open/);
+  assert.ok(!messages.some(message => message.method === 'sendSocket'));
 });
 
 test('pinned native signaling preserves WebSocket event order and ignores stale traffic after close', async () => {

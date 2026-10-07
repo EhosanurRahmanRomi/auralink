@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — Private Internet beta (in development)
+
+- Added an optional **Internet** mode alongside existing **Nearby** rooms, with a Cloudflare Workers Free/SQLite Durable Object coordinator and a free public `workers.dev` address. A purchased domain is not required.
+- Added private device pairing, hashed device credentials, retained online/offline host status, device forget/revocation and a 32-device private-directory cap. Room admission still requires the owner, and rooms remain limited to four approved people.
+- Added normal CA-validated Internet transport, separate from Nearby invitation certificate pins. Signaling identities and roles come from authenticated membership; pending or unrelated devices cannot signal into a room.
+- Kept remote control independent from room admission and native owner consent. Internet grants use verified 15-minute leases bound to device, peer, socket and room identities; healthy hibernation preserves valid consent, while expired/replaced bindings and disconnects revoke it.
+- Added hibernatable heartbeats, bounded authentication/message handling, persisted room deadlines and policy/runtime tests for approval, spoofing, stale control, capacity, reconnection and lifecycle cleanup.
+- Fixed asynchronous admission/capture/control races, canceled native room preparation, late capture-session callbacks and stale diagnostics. Room leave waits for the coordinator acknowledgment before a new admission.
+- Preserved pending control requests and encrypted relay configuration through hibernation without extending their deadlines. Added actual Workers-runtime tests for platform-specific fetch behavior.
+- Added optional expiring Metered relay configuration, disabled by default, with persisted daily/monthly issuance limits and a whole-room session deadline. These application guards do not guarantee provider free billing or a byte quota; provider-enforced expiry, free allowance and overage behavior must be verified before enabling relay.
+- Added free deployment instructions and a physical different-network test guide. Coordinator policy tests, real local workerd/SQLite/WebSocket checks and deployment dry run pass; the public Cloudflare service passed normal-TLS native and browser pairing/admission/consent tests. Two browser contexts on one Windows PC exchanged synthetic video and audio; physical different-network and platform tests remain outstanding.
+
+The 0.2 hardware/input limits remain: a four-person mesh, Android 12fps capture with 1280/1920 maximum long-edge presets, microphone-only phone audio, ASCII-focused phone input and OS-protected surfaces. Installers remain test distribution without Windows signing or Apple notarization. Direct-only Internet connections do not cover every router/carrier pair, and unlimited free worldwide 2K streaming has not been established.
+
 ## 0.2.0 — Device assistance test release
 
 - Added Android screen sharing with native MediaProjection consent, visible foreground service, bounded frames and stop action.

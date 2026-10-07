@@ -74,8 +74,114 @@ public final class AndroidSecurityHarness {
     final X509Certificate future = certificate(values.getProperty("futureCertificate"));
     refuses(() -> PinnedTls.verifyCertificate(future, values.getProperty("futureFingerprint")), "Future leaf is refused even with correct pin");
     check(PinnedTls.context(invitation) != javax.net.ssl.SSLContext.getDefault(), "Pinned context is instance scoped");
+    internetPolicies(invitation);
+    membershipPolicies();
     controlPolicies();
     System.out.println("POLICIES_PASS checks=" + checks);
+  }
+  private static void internetPolicies(Invitation lan) throws Exception {
+    InternetServiceEndpoint endpoint = InternetServiceEndpoint.parse("HTTPS://SERVICE.EXAMPLE:443/");
+    check(endpoint.origin.equals("https://service.example"), "Internet origin canonicalizes independently of LAN invitation");
+    check(endpoint.matchesSocket("wss://service.example/internet/ws"), "Internet socket uses its separate exact endpoint");
+    check(!endpoint.matchesSocket("wss://service.example/ws"), "Internet service cannot become a LAN room socket");
+    check(!lan.matchesSocket(lan.origin.replace("https:", "wss:") + "/internet/ws"), "LAN pin cannot authorize Internet endpoint");
+    for (final String invalid : new String[]{"http://service.example", "file:///", "https://user:pass@service.example", "https://service.example/path",
+      "https://service.example/a/..", "https://service.example/?", "https://service.example/#", "https://service.example/?token=secret",
+      "https://service.example/#fp=anything", "https://service.example:0", "https://service.example:70000", "https://service.example\n"})
+      refuses(() -> InternetServiceEndpoint.parse(invalid), "Internet origin rejects non-root, unsafe or credential-bearing address");
+    for (String invalid : new String[]{"ws://service.example/internet/ws", "wss://other.example/internet/ws", "wss://service.example:1234/internet/ws",
+      "wss://service.example/internet/ws?", "wss://service.example/internet/ws#", "wss://user:pass@service.example/internet/ws", "wss://service.example/internet/other"})
+      check(!endpoint.matchesSocket(invalid), "Only the verified Internet origin and exact socket path are authorized");
+    PinnedRoomClient.Listener noop = new PinnedRoomClient.Listener() {
+      public void opened() {} public void message(String value) {} public void closed(int code, String reason) {} public void failed(Exception error) {}
+    };
+    javax.net.ssl.SSLParameters internet = new javax.net.ssl.SSLParameters();
+    new PinnedRoomClient(endpoint, noop).onSetSSLParameters(internet);
+    check("HTTPS".equals(internet.getEndpointIdentificationAlgorithm()), "Internet WSS requires HTTPS hostname validation");
+    javax.net.ssl.SSLParameters pinned = new javax.net.ssl.SSLParameters();
+    new PinnedRoomClient(lan, noop).onSetSSLParameters(pinned);
+    check(pinned.getEndpointIdentificationAlgorithm() == null, "LAN pin verification remains separately scoped");
+  }
+  private static void membershipPolicies() {
+    RoomMembership membership = new RoomMembership();
+    String owner = "owner-123", controller = "controller-456";
+    check(!membership.hasRoom() && !membership.allows(controller), "Directory connection alone authorizes no native room access");
+    check(!membership.add(controller), "Peer traffic before authenticated room welcome cannot admit a controller");
+    check(membership.begin(owner, java.util.Arrays.asList(controller)), "Authenticated room welcome admits the listed controller");
+    check(membership.hasRoom() && membership.allows(controller), "Welcome grants room membership only");
+    long firstRoom = membership.epoch();
+    check(!membership.endForEvent("registered") && membership.allows(controller), "Directory events do not grant or remove room privileges");
+    check(membership.endForEvent("room-left"), "Internet room-left is an authoritative exit event");
+    check(!membership.hasRoom() && membership.selfId() == null && !membership.allows(controller), "Room-left clears native membership even while directory socket remains connected");
+    check(membership.epoch() != firstRoom, "Room-left invalidates pending media and capture callback epochs without replacing the directory socket");
+    check(!membership.add(controller), "Stale peer-joined after leaving cannot restore room membership");
+    check(membership.begin(owner, java.util.Arrays.asList(controller)) && membership.endForEvent("room-ended") && !membership.allows(controller), "Room-ended removes native authorization");
+    check(membership.begin(owner, java.util.Arrays.asList(controller)) && membership.endForEvent("rejected") && !membership.allows(controller), "Rejected admission removes native authorization");
+    check(!membership.begin("invalid\nowner", java.util.Arrays.asList(controller)) && !membership.hasRoom(), "Malformed room identity fails closed");
+    check(!membership.begin(owner, java.util.Arrays.asList(controller, controller)) && !membership.hasRoom(), "Duplicate admitted identities fail closed");
+    check(membership.begin(owner, java.util.Arrays.asList(controller)), "A fresh authenticated welcome may admit a new room");
+    membership.remove(controller); check(!membership.allows(controller), "Peer departure immediately removes admission");
+    membership.clear(); check(!membership.hasRoom(), "Transport closure clears native room membership");
+    for (String operation : java.util.Arrays.asList("leave", "join", "join-device", "create-room", "forget")) {
+      check(membership.begin(owner, java.util.Arrays.asList(controller)), "Fresh welcome restores owner-approved room admission");
+      long oldRoom = membership.epoch();
+      check(membership.endForOutbound(operation) && !membership.hasRoom() && !membership.allows(controller) && membership.epoch() != oldRoom,
+        "Outgoing room transition invalidates native admission and old media epoch before a network response");
+    }
+    check(!membership.endForOutbound("register") && !membership.hasRoom(), "Directory registration cannot grant native room authorization");
+    check(!membership.acceptsWelcome(owner, "room-123"), "Unrequested Internet welcome cannot authorize room membership");
+    check(membership.expectAdmission("room-123", false), "An explicit Internet room join awaits only that room");
+    check(!membership.acceptsWelcome(owner, "other-room"), "Internet welcome cannot substitute an unrelated room");
+    check(membership.observePending(owner, "room-123"), "Authenticated pending event binds this join to the assigned identity");
+    check(!membership.acceptsWelcome(controller, "room-123"), "Internet welcome cannot substitute a different pending identity");
+    check(membership.acceptsWelcome(owner, "room-123") && membership.begin(owner, java.util.Arrays.asList(controller)), "The expected authenticated welcome grants membership once");
+    check(!membership.acceptsWelcome(owner, "room-123"), "A duplicate Internet welcome cannot recreate native room state");
+    check(membership.expectAdmission(null, true) && membership.observePending(owner, "device-room"), "Device joins learn the exact room from authenticated pending admission");
+    check(!membership.observePending(controller, "device-room") && !membership.acceptsWelcome(owner, "other-room"), "A pending device join cannot replace its assigned identity or room");
+    check(membership.endForOutbound("leave") && !membership.acceptsWelcome(owner, "device-room"), "Leave before admission prevents a late welcome from resurrecting membership");
+    check(!membership.expectAdmission("invalid\nroom", false) && !membership.acceptsWelcome(owner, "room-123"), "Malformed explicit room join fails closed");
+    projectionOwnershipPolicies();
+  }
+  private static void projectionOwnershipPolicies() {
+    ProjectionOwnership ownership = new ProjectionOwnership();
+    String oldTicket = "old-owner-consent", replacement = "new-owner-consent";
+    ownership.prepare(oldTicket);
+    ownership.prepare(replacement);
+    check(!ownership.claim(oldTicket) && ownership.pendingMatches(replacement), "Delayed old service intent cannot claim a replacement owner consent");
+    check(!ownership.cancelPending(oldTicket) && ownership.pendingMatches(replacement), "Old permission cleanup cannot cancel a replacement pending ticket");
+    check(ownership.claim(replacement) && ownership.activeMatches(replacement), "Exact pending owner ticket can start its projection");
+    check(!ownership.claim(oldTicket) && !ownership.release(oldTicket) && ownership.activeMatches(replacement), "Old intent and teardown cannot stop an active replacement projection");
+    check(!ownership.claim(replacement), "Duplicate start intent cannot restart an active projection");
+    ownership.prepare(oldTicket);
+    check(!ownership.claim(oldTicket) && ownership.pendingMatches(oldTicket), "A live projection cannot consume a second owner consent");
+    check(ownership.release(replacement) && ownership.pendingMatches(oldTicket), "Stopping the active projection preserves a different pending consent");
+    check(ownership.claim(oldTicket) && ownership.activeMatches(oldTicket), "Replacement consent can claim only after the old projection releases ownership");
+    check(!ownership.release(replacement) && ownership.activeMatches(oldTicket), "Delayed prior teardown cannot release the newly started projection");
+    check(ownership.release(oldTicket) && !ownership.activeMatches(oldTicket), "Owner stop releases exact active capture ownership");
+  }
+  private static void internetSocket(Properties values, boolean shouldOpen) throws Exception {
+    InternetServiceEndpoint endpoint = InternetServiceEndpoint.parse(values.getProperty("service"));
+    CountDownLatch finished = new CountDownLatch(1);
+    AtomicBoolean opened = new AtomicBoolean(false), registered = new AtomicBoolean(false);
+    AtomicReference<Exception> failure = new AtomicReference<>();
+    AtomicReference<PinnedRoomClient> current = new AtomicReference<>();
+    PinnedRoomClient client = new PinnedRoomClient(endpoint, new PinnedRoomClient.Listener() {
+      public void opened() { opened.set(true); current.get().send("{\"type\":\"register\",\"deviceToken\":\"test-only-credential\"}"); }
+      public void message(String message) { if (message.contains("\"type\":\"registered\"")) { registered.set(true); finished.countDown(); } }
+      public void closed(int code, String reason) { finished.countDown(); }
+      public void failed(Exception error) { failure.set(error); finished.countDown(); }
+    });
+    current.set(client); client.connect();
+    try {
+      check(finished.await(15, TimeUnit.SECONDS), "Internet socket completed within deadline");
+      if (shouldOpen) {
+        check(opened.get() && registered.get() && failure.get() == null, "System CA plus matching hostname permits Internet registration");
+        System.out.println("INTERNET_SOCKET_PASS systemPKI=true registered=true");
+      } else {
+        check(!opened.get() && !registered.get() && failure.get() != null, "Untrusted chain or mismatched hostname cannot send registration credentials");
+        System.out.println("INTERNET_REFUSAL_PASS opened=false registration=false");
+      }
+    } finally { client.cancel(); }
   }
   private static void controlPolicies() {
     String peer = "room-peer-1234", session = "session-approved-1234";
@@ -161,6 +267,8 @@ public final class AndroidSecurityHarness {
       case "policies": policies(values); break;
       case "join": socket(values, true); break;
       case "refuse": socket(values, false); break;
+      case "internet-join": internetSocket(values, true); break;
+      case "internet-refuse": internetSocket(values, false); break;
       default: throw new IllegalArgumentException("Unknown test mode");
     }
   }

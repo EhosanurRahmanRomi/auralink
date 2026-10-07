@@ -13,7 +13,8 @@ const pe = require('pe-library');
 
 const critical = ['src/main.cjs', 'src/preload.cjs', 'src/core/broker.cjs', 'src/core/invite.cjs',
   'src/native/control.cjs', 'src/native/windows-input.ps1', 'src/renderer/index.html',
-  'src/renderer/styles.css', 'src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/android-bridge.js'];
+  'src/renderer/styles.css', 'src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/android-bridge.js',
+  'src/renderer/internet.js', 'src/renderer/desktop-internet.js', 'src/core/internet-client.cjs'];
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
 function execute(command, args, options = {}) {

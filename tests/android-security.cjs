@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { X509Certificate } = require('node:crypto');
+const https = require('node:https');
 const WebSocket = require('ws');
 const selfsigned = require('selfsigned');
 const { createBroker } = require('../src/core/broker.cjs');
@@ -17,6 +18,7 @@ const packageDir = path.join(root, 'android', 'src', 'local', 'auralink', 'mobil
 const evidence = { kind: 'JVM production-code and source-policy checks', physicalAndroid: false, emulator: false, nativeInputInjection: false, checks: {} };
 const credentialFiles = [];
 let broker; let host;
+let internetServer; let internetWss;
 
 async function executable(name) {
   const executableName = name + (process.platform === 'win32' ? '.exe' : '');
@@ -77,6 +79,7 @@ async function sourcePolicies() {
   const activity = await fs.readFile(path.join(packageDir, 'MainActivity.java'), 'utf8');
   const projection = await fs.readFile(path.join(packageDir, 'ScreenShareService.java'), 'utf8');
   const control = await fs.readFile(path.join(packageDir, 'AttendedAccessibilityService.java'), 'utf8');
+  const client = await fs.readFile(path.join(packageDir, 'PinnedRoomClient.java'), 'utf8');
   const manifest = await fs.readFile(path.join(root, 'android', 'AndroidManifest.xml'), 'utf8');
   assert.doesNotMatch(activity, /\.proceed\s*\(/, 'WebView never bypasses TLS errors');
   assert.doesNotMatch(activity, /setDefault(?:SSLSocketFactory|HostnameVerifier)\s*\(/, 'No global TLS trust override');
@@ -105,11 +108,15 @@ async function sourcePolicies() {
   assert.match(transport, /localDocument\(\)\s*&&\s*\(ScreenShareService\.active\(\)\s*\|\|\s*projectionStarting\)/, 'Projection exception requires the exact bundled document and active or starting service');
   assert.match(activity, /main\.postDelayed\(projectionDeadline,\s*120000\)/, 'Owned projection prompt has a bounded deadline');
   assert.match(activity, /Manifest\.permission\.POST_NOTIFICATIONS/, 'Screen sharing requests an optional visible stop notification');
-  assert.match(activity, /code\s*==\s*43\s*&&\s*projectionRequest\s*!=\s*null/, 'Notification result is bound to a still-pending owner screen request');
+  assert.match(activity, /code\s*==\s*notificationPermissionCode\s*&&\s*projectionRequest\s*!=\s*null/, 'Notification result is bound to a still-pending owner screen request');
+  assert.match(activity, /requestCode\s*!=\s*projectionPermissionCode\s*\|\|\s*projectionRequest\s*==\s*null/, 'An old Android screen consent result cannot complete a replacement request');
+  assert.match(activity, /code\s*==\s*mediaPermissionCode\s*&&\s*mediaRequest\s*!=\s*null/, 'Android microphone and camera results match only their current owned permission request');
+  assert.match(activity, /projectionPermissionCode\s*=\s*newPermissionCode\(\)/, 'Each Android screen prompt receives a new native result code');
+  assert.match(activity, /nextPermissionCode\s*>\s*65535\)\s*throw/, 'Native permission result identifiers fail closed rather than reuse an old request code');
   assert.match(activity, /notificationAvailable/, 'Native screen descriptor tells the renderer when the stop notification is unavailable');
   const approval = activity.slice(activity.indexOf('private void grantControl'), activity.indexOf('private void requestMedia'));
   assert.match(approval, /!trustedPage\(\)/, 'Native owner approval is unavailable in the background');
-  assert.match(approval, /!approvedPeers\.contains\(peerId\)/, 'Native owner approval requires a broker-admitted peer');
+  assert.match(approval, /!roomMembership\.allows\(peerId\)/, 'Native owner approval requires a broker-admitted peer');
   assert.match(approval, /ScreenShareService\.activeFullDisplay\(\)/, 'Native owner approval requires a live full-display projection');
   assert.match(approval, /Allow control/, 'Native owner must explicitly approve input');
   assert.match(control, /isDeviceLocked\(\)/, 'Phone input is stopped at the lock screen');
@@ -122,9 +129,43 @@ async function sourcePolicies() {
   assert.match(projection, /inFlight\s*!=\s*0/, 'Native screen frames are bounded to one pending delivery');
   assert.match(projection, /bytes\.size\(\)\s*>\s*524288/, 'Native JPEG size is bounded');
   assert.match(projection, /Stop sharing/, 'Screen service provides a stop notification action');
+  assert.match(projection, /if\s*\(running\)\s*return\s*START_NOT_STICKY/, 'Delayed service intents do not stop a live projection');
+  assert.match(projection, /ownership\.claim\(ticket\)/, 'Projection service starts only the current pending owner ticket');
+  assert.match(projection, /cancelPreparation\(activeTicket\);\s*ownership\.release\(activeTicket\)/, 'Service teardown cancels and releases only its own capture ticket');
+  assert.match(activity, /ScreenShareService\.stopCurrent\(ticket,\s*"Screen start was superseded\."\)/, 'Obsolete Activity start callback stops only its own projection');
   const events = activity.slice(activity.indexOf('private void event(long serial'), activity.indexOf('private void closeSocket()'));
   assert.match(events, /pausedEvents\.size\(\)\s*>=\s*64/, 'Incoming native events have a bounded pause queue');
   assert.match(events, /generation\s*!=\s*serial/, 'Native event delivery rejects stale session generations');
+  assert.match(events, /"message"\.equals\(type\)\s*&&\s*!observeBroker\(data\)\)\s*return/, 'Admission observer receives authenticated native socket traffic and can reject canceled welcomes before renderer delivery');
+  const clearRoom = activity.slice(activity.indexOf('private void clearRoomState('), activity.indexOf('private boolean observeBroker('));
+  assert.match(clearRoom, /roomMembership\.clear\(\)/, 'Room exit clears native admitted identity and peers');
+  assert.match(clearRoom, /clearProjectionRequest\(\)/, 'Room exit cancels pending phone capture consent');
+  assert.match(clearRoom, /revokeControl\(reason\)/, 'Room exit revokes accessibility input authorization');
+  assert.match(clearRoom, /ScreenShareService\.stopCurrent\(reason\)/, 'Room exit ends live phone capture');
+  assert.doesNotMatch(clearRoom, /socket\s*=|closeSocket\(/, 'Leaving an Internet room retains its directory socket');
+  assert.match(activity, /roomMembership\.endForEvent\(type\)/, 'Native observer handles authoritative Internet room exit events');
+  assert.match(activity, /if\s*\(internetService\s*!=\s*null\)[\s\S]*roomMembership\.endForOutbound\(operation\)/, 'Internet room transitions clear native admission before awaiting a server response');
+  assert.match(activity, /roomMembership\.expectAdmission\(outgoing\.optString\("roomId"\),\s*"join-device"\.equals\(operation\)\)/, 'Internet admission is expected only after an explicit native join request');
+  assert.match(activity, /internetService\s*!=\s*null\s*&&\s*!roomMembership\.acceptsWelcome/, 'Internet native membership rejects unsolicited or canceled welcome traffic');
+  assert.match(activity, /roomMembership\.observePending/, 'Internet native pending admission binds the assigned identity and room');
+  // Inspect the real dispatch block, not its earlier background-method allowlist.
+  const realSend = activity.slice(activity.indexOf('} else if ("sendSocket".equals(method))'), activity.indexOf('} else if ("closeSocket".equals(method))'));
+  assert.ok(realSend.indexOf('clearRoomState(') < realSend.indexOf('socket.send(data)'), 'Room authorization is cleared synchronously before transition data leaves the native socket');
+  assert.match(events, /!foreground\s*&&\s*\("close"\.equals\(type\)\s*\|\|\s*"error"\.equals\(type\)\)\)\s*\{\s*stopSession\(\);/, 'Background socket loss invalidates pending consent and destroys active media immediately');
+  assert.match(activity, /"version",\s*installedVersion\(\)/, 'Android bridge reports the actual installed package version');
+  assert.match(activity, /projectionGeneration\s*=\s*roomMembership\.epoch\(\)/, 'Phone capture consent is scoped to the admitted room, not the longer-lived directory socket');
+  assert.match(activity, /mediaGeneration\s*!=\s*roomMembership\.epoch\(\)/, 'Old camera and microphone permission completion cannot authorize a later Internet room');
+  assert.match(activity, /roomMembership\.epoch\(\)\s*==\s*serial\s*&&\s*roomMembership\.hasRoom\(\)/, 'Screen frame delivery rejects callbacks from rooms already left');
+  assert.match(activity, /"captureId",\s*ticket/, 'Native capture callbacks carry the opaque projection identity');
+  assert.match(activity, /!ticket\.equals\(projectionId\)/, 'A stopped or started old projection cannot mutate a newer pending projection');
+  const realStop = activity.slice(activity.indexOf('} else if ("stopScreenShare".equals(method))'), activity.indexOf('} else if ("ackScreenFrame".equals(method))'));
+  assert.ok(realStop.indexOf('Objects.equals(projectionId') < realStop.indexOf('ScreenShareService.stopCurrent('), 'Scoped stale renderer cleanup is rejected before stopping the native service');
+  assert.match(client, /setSocketFactory\(SSLContext\.getDefault\(\)\.getSocketFactory\(\)\)/, 'Internet sockets use the normal system CA trust store');
+  assert.match(client, /setEndpointIdentificationAlgorithm\(internet\s*\?\s*"HTTPS"\s*:\s*null\)/, 'Internet hostname validation is distinct from LAN pin validation');
+  const internetTrust = activity.slice(activity.indexOf('"trustInternetService".equals(method)'), activity.indexOf('"openSocket".equals(method)'));
+  assert.doesNotMatch(internetTrust, /setHostnameVerifier|setSSLSocketFactory|PinnedTls/, 'Internet HTTPS health verification retains default certificate and hostname checks');
+  assert.match(internetTrust, /setInstanceFollowRedirects\(false\)/, 'Internet health cannot silently switch to another authority');
+  assert.match(activity, /internetService\s*!=\s*null\s*&&\s*invitation\s*==\s*null\s*&&\s*internetService\.matchesSocket\(address\)/, 'Internet sockets cannot reuse a LAN invitation trust namespace');
   const stopSession = activity.slice(activity.indexOf('private void stopSession()'), activity.indexOf('@Override protected void onPause()'));
   assert.match(stopSession, /generation\+\+/, 'Real background invalidates the current session generation');
   assert.match(stopSession, /pausedEvents\.clear\(\)/, 'Real background discards queued native events');
@@ -141,7 +182,7 @@ async function main() {
   const java = await executable('java'); const javac = await executable('javac');
   const libs = ['Java-WebSocket-1.6.0.jar', 'slf4j-api-2.0.13.jar'].map(name => path.join(root, 'android', 'libs', name));
   const classpath = libs.join(path.delimiter);
-  const sources = ['Invitation.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
+  const sources = ['Invitation.java', 'InternetServiceEndpoint.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'RoomMembership.java', 'ProjectionOwnership.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
   await run(javac, ['--release', '8', '-cp', classpath, '-d', classesDir, ...sources, path.join(__dirname, 'android', 'AndroidSecurityHarness.java')]);
   evidence.checks.compile = { passed: true, javaTarget: 8, productionClasses: sources.map(filename => path.basename(filename)) };
   const now = Date.now();
@@ -168,11 +209,62 @@ async function main() {
   const refused = await run(java, [...javaArgs, 'refuse', wrongProps]);
   assert.equal(requestCount(), 1, 'Wrong-pin client never sent its invitation key or admission request');
   evidence.checks.realWssPinMismatch = { passed: true, result: refused.stdout, additionalAdmissionRequests: 0 };
+  await internetTransport(java, javaArgs);
   await sourcePolicies();
   evidence.passed = true;
 }
+async function internetTransport(java, javaArgs) {
+  const now = Date.now();
+  const ca = await selfsigned.generate([{ name: 'commonName', value: 'Test-only Internet fixture CA' }], {
+    keyType: 'ec', curve: 'P-256', algorithm: 'sha256', notBeforeDate: new Date(now - 3600000), notAfterDate: new Date(now + 86400000),
+    extensions: [{ name: 'basicConstraints', cA: true }, { name: 'keyUsage', keyCertSign: true, cRLSign: true }],
+  });
+  async function leaf() {
+    return selfsigned.generate([{ name: 'commonName', value: 'localhost' }], {
+      keyType: 'ec', curve: 'P-256', algorithm: 'sha256', notBeforeDate: new Date(now - 3600000), notAfterDate: new Date(now + 86400000),
+      ca: { cert: ca.cert, key: ca.private },
+      extensions: [{ name: 'basicConstraints', cA: false }, { name: 'keyUsage', digitalSignature: true },
+        { name: 'extKeyUsage', serverAuth: true }, { name: 'subjectAltName', altNames: [{ type: 2, value: 'localhost' }] }],
+    });
+  }
+  const first = await leaf();
+  internetServer = https.createServer({ key: first.private, cert: first.cert }, (_request, response) => { response.writeHead(200); response.end('healthy fixture'); });
+  internetWss = new WebSocket.WebSocketServer({ server: internetServer, path: '/internet/ws', maxPayload: 65536 });
+  let registrations = 0;
+  internetWss.on('connection', socket => socket.on('message', raw => {
+    const message = JSON.parse(raw.toString());
+    assert.equal(message.type, 'register'); registrations++;
+    socket.send(JSON.stringify({ type: 'registered', deviceId: 'jvm-fixture' }));
+  }));
+  await new Promise((resolve, reject) => { internetServer.once('error', reject); internetServer.listen(0, '127.0.0.1', resolve); });
+  const port = internetServer.address().port;
+  const serviceProps = await properties('internet-valid', { service: `https://localhost:${port}` });
+  const untrusted = await run(java, [...javaArgs, 'internet-refuse', serviceProps]);
+  assert.equal(registrations, 0, 'Internet credentials never cross a self-signed or untrusted service chain');
+  const caFile = path.join(fixtureDir, 'internet-test-ca.pem');
+  const trustStore = path.join(fixtureDir, 'internet-test-trust.p12');
+  await fs.writeFile(caFile, ca.cert); credentialFiles.push(caFile, trustStore);
+  await fs.unlink(trustStore).catch(() => {});
+  const keytool = await executable('keytool');
+  await run(keytool, ['-importcert', '-noprompt', '-alias', 'test-only-ca', '-file', caFile, '-keystore', trustStore, '-storetype', 'PKCS12', '-storepass', 'test-only-password']);
+  const trustedArgs = [`-Djavax.net.ssl.trustStore=${trustStore}`, '-Djavax.net.ssl.trustStoreType=PKCS12', '-Djavax.net.ssl.trustStorePassword=test-only-password', ...javaArgs];
+  const accepted = await run(java, [...trustedArgs, 'internet-join', serviceProps]);
+  assert.equal(registrations, 1, 'Normal CA plus DNS validation allows exactly one registration');
+  const wrongHostProps = await properties('internet-hostname-mismatch', { service: `https://127.0.0.1:${port}` });
+  const wrongHost = await run(java, [...trustedArgs, 'internet-refuse', wrongHostProps]);
+  assert.equal(registrations, 1, 'Trusted certificate for another hostname cannot receive registration credentials');
+  const rotated = await leaf();
+  assert.notEqual(fingerprint(rotated.cert), fingerprint(first.cert), 'Certificate rotation uses a genuinely different leaf');
+  internetServer.setSecureContext({ key: rotated.private, cert: rotated.cert });
+  const rotation = await run(java, [...trustedArgs, 'internet-join', serviceProps]);
+  assert.equal(registrations, 2, 'A newly CA-signed certificate for the same DNS identity remains accepted without stale pinning');
+  evidence.checks.internetSystemPki = { passed: true, trust: 'Isolated test-only JVM CA store; production uses the device system CA store', untrusted: untrusted.stdout,
+    accepted: accepted.stdout, wrongHostname: wrongHost.stdout, certificateRotation: rotation.stdout, registrations };
+}
 main().catch(error => { evidence.passed = false; evidence.error = error.message; process.exitCode = 1; }).finally(async () => {
   if (host) host.terminate(); if (broker) await broker.stop();
+  if (internetWss) { for (const socket of internetWss.clients) socket.terminate(); await new Promise(resolve => internetWss.close(resolve)); }
+  if (internetServer) await new Promise(resolve => internetServer.close(resolve));
   for (const filename of credentialFiles) await fs.unlink(filename).catch(() => {});
   await fs.mkdir(resultsDir, { recursive: true });
   await fs.writeFile(path.join(resultsDir, 'android-security.json'), JSON.stringify(evidence, null, 2));
