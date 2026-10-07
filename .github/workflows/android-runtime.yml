@@ -81,13 +81,13 @@ jobs:
           hw.lcd.width=720
           hw.lcd.height=1280
           hw.lcd.density=240
-          hw.ramSize=3072M
+          hw.ramSize=4096M
           hw.cpu.ncore=4
           hw.gpu.enabled=yes
           hw.gpu.mode=swiftshader_indirect
           disk.dataPartition.size=2048M
           CONFIG
-          "$task_sdk/emulator/emulator" -avd AuralinkAPI36 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -memory 3072 -cores 4 -port 5556 -accel on > .tools/emulator-runtime.log 2>&1 &
+          "$task_sdk/emulator/emulator" -avd AuralinkAPI36 -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect -memory 4096 -cores 4 -port 5556 -accel on > .tools/emulator-runtime.log 2>&1 &
       - name: Actual production WebView, native projection and Accessibility input
         run: node tests/android-emulator.cjs --control
       - name: Preserve runtime evidence

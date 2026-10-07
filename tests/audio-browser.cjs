@@ -103,8 +103,16 @@ async function main() {
     phase = 'input level';
     for (const page of [a, b]) await page.waitForFunction(() => document.getElementById('mic-level').value > .001, undefined, { timeout: 12000 });
     phase = 'persistent autoplay recovery'; await b.waitForFunction(() => !document.getElementById('audio-banner').hidden);
-    await b.locator('#hear-room').click(); assert.equal(await b.locator('#audio-banner').isVisible(), true, 'Failed replay must keep the Enable sound action visible');
-    await b.evaluate(() => { qaAllowRemotePlayback = true; }); await b.locator('#hear-room').click(); await b.waitForFunction(() => document.getElementById('audio-banner').hidden);
+    await b.locator('#hear-room').click();
+    await b.waitForFunction(() => !document.getElementById('audio-banner').hidden && document.getElementById('audio-banner-text').textContent.includes('Playback is still blocked'));
+    assert.equal(await b.locator('#audio-banner').isVisible(), true, 'Failed replay must keep the Enable sound action visible');
+    // Keep every late track/unmute retry blocked until the actual recovery
+    // gesture. Lifting the fixture gate before click lets a retry hide the
+    // action while Playwright is waiting for its layout to become stable.
+    await b.evaluate(() => {
+      document.getElementById('hear-room').addEventListener('click', () => { qaAllowRemotePlayback = true; }, { once: true, capture: true });
+    });
+    await b.locator('#hear-room').click(); await b.waitForFunction(() => document.getElementById('audio-banner').hidden);
     phase = 'decoded bidirectional audio'; const audio = [await proof(a), await proof(b)];
     assert.ok(audio.every(item => item.decodedMeanSquareEnergy > .000001), 'Both peers must decode real non-silent synthetic audio');
     for (const page of [a, b]) {

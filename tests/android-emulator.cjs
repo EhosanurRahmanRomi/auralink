@@ -48,9 +48,31 @@ function coordinates(node) {
 }
 async function tap(node) {const [x,y]=coordinates(node);await adb(['shell','input','tap',String(x),String(y)]);}
 async function findNode(predicate,timeout=30000) {
-  const deadline=Date.now()+timeout;
-  do {let nodes=[];try{nodes=await hierarchy();}catch{}const found=nodes.find(predicate);if(found)return found;await delay(800);}while(Date.now()<deadline);
+  let deadline=Date.now()+timeout;
+  do {
+    let nodes=[];try{nodes=await hierarchy();}catch{}
+    const wait=nodes.find(node=>node['resource-id']==='android:id/aerr_wait');
+    if(wait) {
+      const recovered=Boolean(runtimeDiagnostics.anrs?.length);
+      await recordANR(nodes);
+      if(phase!=='production APK lobby' || recovered)throw new Error('Android reported an application ANR after the permitted cold-start recovery');
+      await tap(wait);await delay(2000);deadline=Math.max(deadline,Date.now()+30000);continue;
+    }
+    const found=nodes.find(predicate);if(found)return found;await delay(800);
+  }while(Date.now()<deadline);
   throw new Error(`Android UI element absent during ${phase}`);
+}
+async function recordANR(nodes) {
+  const title=nodes.find(node=>node['resource-id']==='android:id/alertTitle')?.text || 'Android application not responding';
+  const state=await adb(['shell','dumpsys','activity','lastanr']).catch(()=> 'Last ANR state unavailable');
+  const traces=await adb(['shell','dumpsys','activity','lastanr-traces'],{timeout:60000}).catch(()=> 'Last ANR traces unavailable');
+  fs.writeFileSync(path.join(output,'android-emulator-anr-raw.txt'),state+'\n'+traces);
+  const appSection=traces.match(/Cmd line: local\.auralink\.mobile[\s\S]*?(?=\n----- end|\n----- pid|$)/)?.[0] || '';
+  const mainThread=appSection.match(/"main"[\s\S]*?(?=\n"|$)/)?.[0]?.slice(0,6000) || 'Main thread trace unavailable';
+  const reason=state.split('\n').filter(line=>/ANR in |Reason:|Subject:|PID:|Process:/.test(line) && !/Intent|Bundle|extras/i.test(line)).slice(0,12).join('\n');
+  const entry={phase,title:safeError(title),reason:safeError(reason),mainThread:safeError(mainThread)};
+  runtimeDiagnostics.anrs=(runtimeDiagnostics.anrs || []).concat(entry);
+  console.log(JSON.stringify({androidStartupANR:entry,recovery:'One owner Wait action; repeated ANRs fail the test'}));
 }
 async function invitationFields(timeout=30000) {
   const deadline=Date.now()+timeout;
@@ -115,7 +137,7 @@ async function startPhoneAudio(fixture) {
     const rows=[...(await rtc.peers.get(id).pc.getStats()).values()];
     const sent=rows.find(row=>row.type==='outbound-rtp' && row.kind==='audio');
     const acknowledged=rows.find(row=>row.type==='remote-inbound-rtp' && row.kind==='audio');
-    return {packetsSent:sent.packetsSent,receiverReports:acknowledged.roundTripTimeMeasurements,roundTripTime:acknowledged.roundTripTime};
+    return {packetsSent:sent.packetsSent,roundTripTimeMeasurements:acknowledged.roundTripTimeMeasurements,roundTripTime:acknowledged.roundTripTime};
   },fixture.peerId);
   await screenshot('android-emulator-audio-active.png');
   return {passed:true,phoneToHost:incoming,syntheticHostToPhone:outgoing,mode:'MODE_IN_COMMUNICATION',checks:['Native Android microphone permission approved by the test owner','Live WebView microphone track sends increasing encrypted RTP packets','Synthetic host tone RTP acknowledged by actual Android receiver','Actual Android communication audio mode'],physicalMicrophoneAndSpeakerVerified:false};
@@ -131,6 +153,9 @@ async function nativeDevice() {
   assert.equal((await adb(['shell','getprop','sys.boot_completed'])).trim(),'1','Isolated emulator must finish booting');
   assert.equal((await adb(['shell','getprop','ro.boot.qemu.avd_name'])).trim(),'AuralinkAPI36','Refusing a different AVD');
   assert.equal((await adb(['shell','getprop','ro.build.version.sdk'])).trim(),'36');
+  // sys.boot_completed precedes first-boot package optimization and WebView
+  // provider startup on this cold CI image. Let Android finish that work.
+  await delay(30000);
   await adb(['shell','input','keyevent','82']);
   installedApkHash=crypto.createHash('sha256').update(fs.readFileSync(apk)).digest('hex');
   await adb(['install','--no-incremental','-r',apk],{timeout:120000});
@@ -212,7 +237,9 @@ async function runUI(fixture) {
   await screenshot('android-emulator-invitation-dialog.png');
   console.log('Production invitation dialog exposes both Android text inputs');
   const invitation=fields.find(node=>node['resource-id']==='join-invite') || fields[1];
-  await tap(invitation);await type(fixture.invite);
+  await tap(invitation);
+  await findNode(node=>node['resource-id']==='join-invite' && node.focused==='true');
+  await type(fixture.invite);
   const typed=await hierarchy();const entered=typed.find(node=>node['resource-id']==='join-invite');
   runtimeDiagnostics.invitation={expectedLength:fixture.invite.length,enteredLength:entered?.text?.length || 0,exactTextMatches:entered?.text===fixture.invite};
   assert.ok(entered?.text===fixture.invite,'Android text input must preserve the complete invitation exactly');
@@ -229,9 +256,10 @@ async function runUI(fixture) {
   const audio=await startPhoneAudio(fixture);
   phase='Android owner screen permission';console.log(phase);
   await tap(await findNode(label('Share screen')));
-  let permission=await findNode(node=>/Start now|Start recording|Start sharing/i.test(node.text) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button',30000);
+  const systemCaptureButton=node=>node.package==='com.android.systemui' && node.class==='android.widget.Button' && /^(Start now|Start recording|Start sharing|Share screen)$/i.test(node.text);
+  let permission=await findNode(node=>systemCaptureButton(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button',30000);
   if(permission['resource-id']==='com.android.permissioncontroller:id/permission_allow_button') {
-    await tap(permission);permission=await findNode(node=>/Start now|Start recording|Start sharing/i.test(node.text),30000);
+    await tap(permission);permission=await findNode(systemCaptureButton,30000);
   }
   await screenshot('android-emulator-projection-permission.png');await tap(permission);
   phase='actual Android screen frames over WebRTC';console.log(phase);
@@ -292,7 +320,7 @@ async function runUI(fixture) {
   assert.ok(!fatal.includes('FATAL EXCEPTION'),fatal);
   assert.deepEqual(fixture.errors,[]);
   const sourceCheck=path.join(project,'.tools','runtime-source-check.json');
-  return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,source:fs.existsSync(sourceCheck)?JSON.parse(fs.readFileSync(sourceCheck,'utf8')):null,screen,control,audio,
+  return {passed:true,version:pkg.version,serial,api:36,apkSha256:installedApkHash,source:fs.existsSync(sourceCheck)?JSON.parse(fs.readFileSync(sourceCheck,'utf8')):null,diagnostics:runtimeDiagnostics,screen,control,audio,
     verified:['Production non-debuggable APK installed and loaded','Native pinned TLS room admission','Owner Android system projection consent','Actual MediaProjection screen frames decoded over WebRTC','Foreground sharing service','Owner share stop releases projection','No fatal Android runtime exception'],
     limitations:['Emulator has no physical microphone or speaker; physical audio route needs real-device test.',...(control?[]:['Phone Accessibility input requires a separate attended test.'])],errors:fixture.errors};
 }
@@ -312,6 +340,14 @@ async function main() {
     // Keep those local/ignored; the workflow publishes only the safe summary.
     let diagnostics;
     try{await screenshot('android-emulator-failure.png');const nodes=await hierarchy();fs.writeFileSync(path.join(output,'android-emulator-failure-ui.json'),JSON.stringify(nodes,null,2));diagnostics=safeHierarchy(nodes);}catch{}
+    try {
+      const appPid=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
+      if(/^\d+$/.test(appPid)) {
+        const log=await adb(['shell','logcat','-d',`--pid=${appPid}`,'-s','AndroidRuntime:E','chromium:E','WebViewFactory:E']);
+        fs.writeFileSync(path.join(output,'android-emulator-native-errors-raw.txt'),log);
+        runtimeDiagnostics.nativeErrors=safeError(log).slice(-6000);
+      }
+    }catch{}
     fs.writeFileSync(path.join(output,'android-emulator.json'),JSON.stringify({passed:false,phase,error:safeError(error),diagnostics:runtimeDiagnostics,network:fixture?.network,ui:diagnostics},null,2));throw new Error(safeError(error));
   }finally {
     if(!process.argv.includes('--fixture-only')) await adb(['shell','am','force-stop','local.auralink.mobile']).catch(()=>{});
