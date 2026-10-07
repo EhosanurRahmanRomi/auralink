@@ -1,0 +1,96 @@
+{
+  "name": "auralink",
+  "version": "0.2.0",
+  "description": "Peer-hosted calls, presentations and attended remote assistance",
+  "private": true,
+  "main": "src/main.cjs",
+  "author": "Ehosanur Rahman Romi",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "check": "node scripts/check.cjs",
+    "dist:win": "electron-builder --win portable nsis --x64",
+    "dist:win:portable": "electron-builder --win portable --x64",
+    "dist:win:setup": "electron-builder --win nsis --x64",
+    "test:win:setup": "node scripts/windows-installer-smoke.cjs",
+    "dist:mac": "npm run build:mac-helper && electron-builder --mac dmg --arm64",
+    "build:mac-helper": "node scripts/build-mac-helper.cjs",
+    "test:desktop": "node scripts/desktop-smoke.cjs"
+  },
+  "dependencies": {
+    "selfsigned": "5.5.0",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "electron": "44.6.0",
+    "electron-builder": "26.15.3",
+    "playwright": "1.58.2"
+  },
+  "build": {
+    "appId": "local.auralink.desktop",
+    "productName": "Auralink",
+    "compression": "store",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**/*",
+      "build/icon.png",
+      "package.json",
+      "README.md",
+      "LICENSE"
+    ],
+    "asarUnpack": [
+      "src/native/**/*"
+    ],
+    "win": {
+      "target": [
+        "portable",
+        "nsis"
+      ],
+      "artifactName": "Auralink-${version}-Windows-x64.exe",
+      "signExecutable": false,
+      "icon": "build/icon.ico"
+    },
+    "portable": {
+      "artifactName": "Auralink-${version}-Windows-x64.exe",
+      "requestExecutionLevel": "user"
+    },
+    "nsis": {
+      "artifactName": "Auralink-Setup-${version}-Windows-x64.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "packElevateHelper": false,
+      "runAfterFinish": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": false,
+      "uninstallDisplayName": "Auralink ${version}",
+      "include": "build/installer.nsh",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "artifactName": "Auralink-${version}-Mac-arm64.dmg",
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.png",
+      "extendInfo": {
+        "NSCameraUsageDescription": "Use your camera only when you enable video in a room.",
+        "NSMicrophoneUsageDescription": "Use your microphone only when you enable audio in a room.",
+        "NSScreenCaptureUsageDescription": "Share a screen you select with approved room participants.",
+        "NSLocalNetworkUsageDescription": "Connect directly to devices you invite for private calls, screen sharing and attended remote assistance."
+      },
+      "identity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false,
+      "minimumSystemVersion": "13.0"
+    }
+  }
+}

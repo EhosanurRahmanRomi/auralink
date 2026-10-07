@@ -1,0 +1,179 @@
+name: Auralink checks and installers
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auralink-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Unit, browser and desktop checks
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: JavaScript syntax
+        run: npm run check
+      - name: Protocol, permission and Android bridge unit tests
+        run: npm test
+      - name: Browser room interface and media
+        run: node tests/ui-browser.cjs
+      - name: Real WebRTC mesh and media transitions
+        run: node tests/rtc-browser.cjs
+      - name: Bidirectional decoded audio, autoplay recovery and microphone preflight
+        run: node tests/audio-browser.cjs
+      - name: Approved phone-style desktop controls
+        run: node tests/mobile-control.cjs
+      - name: Android capture bridge, decoded portrait video and consent
+        run: node tests/phone-share-browser.cjs
+      - name: Desktop app and room teardown
+        run: npm run test:desktop
+      - name: Keep test evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-evidence
+          path: |
+            test-results/*.json
+            test-results/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-installer:
+    name: Windows per-user installer
+    needs: checks
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build per-user NSIS setup
+        run: npm run dist:win:setup -- --publish never
+      - name: Verify setup manifest, embedded source and application launch
+        run: npm run test:win:setup
+      - name: Keep installer and verification
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Auralink-Windows-setup
+          path: |
+            release/Auralink-Setup-*-Windows-x64.exe
+            test-results/windows-installer-smoke.json
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-installer:
+    name: macOS Apple Silicon DMG
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Confirm Apple Silicon runner
+        run: node -e "if(process.platform !== 'darwin' || process.arch !== 'arm64') process.exit(1)"
+      - name: Install locked dependencies
+        run: npm ci
+      - name: JavaScript syntax and protocol permissions
+        run: |
+          npm run check
+          npm test
+      - name: Compile and safely verify native arm64 input helper
+        run: npm run build:mac-helper
+      - name: Build ad-hoc signed Apple Silicon test DMG
+        run: npm run dist:mac -- --publish never
+      - name: Verify actual mounted DMG, signed bundle and application launch
+        run: node scripts/mac-bundle-smoke.cjs
+      - name: Keep Mac test installer and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Auralink-Mac-arm64
+          path: |
+            release/Auralink-*-Mac-arm64.dmg
+            test-results/mac-helper-build.json
+            test-results/mac-bundle-smoke.json
+            test-results/mac-lobby.png
+          if-no-files-found: error
+          retention-days: 7
+
+  android-apk:
+    name: Android companion APK
+    needs: checks
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install locked JavaScript dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: npm ci
+      - name: Install Android platform and build tools
+        shell: pwsh
+        run: |
+          $taskAndroidSdk = if ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { $env:ANDROID_HOME }
+          if (-not $taskAndroidSdk) { throw 'The runner Android SDK is unavailable.' }
+          $taskSdkManager = Join-Path $taskAndroidSdk 'cmdline-tools/latest/bin/sdkmanager.bat'
+          if (-not (Test-Path -LiteralPath $taskSdkManager)) { throw 'Android sdkmanager is unavailable.' }
+          1..100 | ForEach-Object { 'y' } | & $taskSdkManager --licenses
+          if ($LASTEXITCODE -ne 0) { throw 'Android SDK license acceptance failed.' }
+          & $taskSdkManager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+          if ($LASTEXITCODE -ne 0) { throw 'Android SDK installation failed.' }
+          "ANDROID_SDK_ROOT=$taskAndroidSdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and verify locally signed companion APK
+        shell: pwsh
+        run: ./scripts/build-android.ps1 -AndroidSdkRoot $env:ANDROID_SDK_ROOT -JdkDirectory $env:JAVA_HOME
+      - name: Check pinned Java transport and Android permission policies
+        run: node tests/android-security.cjs
+      - name: Verify APK manifest, signature and bundled source
+        shell: pwsh
+        run: ./scripts/verify-android.ps1 -AndroidSdkRoot $env:ANDROID_SDK_ROOT -JdkDirectory $env:JAVA_HOME
+      - name: Keep APK and public verification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Auralink-Android-companion
+          path: |
+            release/Auralink-*-Android.apk
+            release/Android-build.json
+            test-results/android-security.json
+            test-results/android-apk-validation.json
+          if-no-files-found: error
+          retention-days: 7

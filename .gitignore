@@ -1,0 +1,13 @@
+node_modules/
+release/
+test-results/
+qa/
+.tools/
+.private/
+android/out/
+*.keystore
+*.jks
+*.key
+*.p12
+*.log
+src/native/macos-input

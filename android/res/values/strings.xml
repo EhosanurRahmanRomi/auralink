@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="attended_control_description">Allows a room member you approve to tap, swipe, scroll and enter ordinary text while you share your phone screen. You approve every session in Auralink. A floating Stop control button ends access immediately. No unattended access, event history or text logging. Password fields and the lock screen are blocked.</string>
+</resources>
