@@ -618,9 +618,17 @@ export class RelayMedia {
     } else source.encoderBlockedSince = null;
     const congested = [...this.peers.values()].some(peer => peer.active && peer.pendingVideo >= 2) || source.encoder?.state === 'configured' && source.encoder.encodeQueueSize >= 2;
     if (congested) {
-      if (now - source.lastAdapt > 1000) { source.bitrate = Math.max(700000, Math.round((source.bitrate || cap) * .8)); source.targetFPS = Math.max(12, source.targetFPS - 3); source.lastAdapt = now; }
+      // Drop this frame immediately to keep the native/encrypted queues at
+      // two. A single keyframe or compositor pause is not evidence that the
+      // connection needs a lower permanent rate: reconfiguration itself asks
+      // for another expensive keyframe. Adapt only after sustained pressure.
+      if (!Number.isFinite(source.congestedSince) || !Number.isFinite(lastCheck) || now - lastCheck > 500) source.congestedSince = now;
+      if (now - source.congestedSince >= 300 && now - source.lastAdapt > 1000) {
+        source.bitrate = Math.max(700000, Math.round((source.bitrate || cap) * .8)); source.targetFPS = Math.max(12, source.targetFPS - 3); source.lastAdapt = now;
+      }
       return;
     }
+    source.congestedSince = null;
     if (now - source.lastAdapt > 3000) { source.bitrate = Math.min(cap, Math.round((source.bitrate || cap) * 1.1)); source.targetFPS = Math.min(30, source.targetFPS + 3); source.lastAdapt = now; }
     if (source.quality !== quality) { source.bitrate = cap; source.quality = quality; source.forceKey = true; }
     const changed = !source.encoder || source.encoder.state === 'closed' || source.codec !== codec || source.width !== targetWidth || source.height !== targetHeight;

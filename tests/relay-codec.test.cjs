@@ -283,6 +283,57 @@ test('a dynamic FPS reduction after long uptime resumes capture within the new f
     assert.equal(encodedAt.length - beforeQuiet, 1, 'A source returning late cannot catch up with a burst');
   } finally { media.close(); await settle(); assert.equal(canceled, true); global.MediaStreamTrackProcessor = oldProcessor; Object.defineProperty(global, 'performance', oldPerformance); }
 });
+test('isolated encoder or relay queue pressure drops frames without ratcheting quality, while sustained pressure adapts and resets', async () => {
+  const { RelayMedia } = await ready;
+  const oldPerformance = Object.getOwnPropertyDescriptor(global, 'performance'), oldEncoder = global.VideoEncoder, oldDecoder = global.VideoDecoder, oldFrame = global.VideoFrame;
+  let now = 10000; const encoders = [], clones = [];
+  Object.defineProperty(global, 'performance', { configurable: true, value: { now: () => now } });
+  global.VideoDecoder = class { static async isConfigSupported(config) { return { supported: true, config }; } };
+  global.VideoFrame = class { constructor(frame) { this.displayWidth = frame.displayWidth; this.displayHeight = frame.displayHeight; clones.push(this); } close() { this.closed = true; } };
+  global.VideoEncoder = class {
+    static async isConfigSupported(config) { return { supported: true, config }; }
+    constructor() { this.state = 'unconfigured'; this.encodeQueueSize = 0; this.encoded = 0; this.configurations = []; encoders.push(this); }
+    configure(config) { this.configurations.push(config); this.state = 'configured'; }
+    encode() { assert.ok(this.encodeQueueSize < 2, 'Never submit another native frame when the two-slot queue is full'); this.encoded++; this.encodeQueueSize++; }
+    close() { this.state = 'closed'; }
+  };
+  let media;
+  try {
+    const transport = rtc(); transport.quality = '1440'; media = new RelayMedia(transport, randomBytes(32).toString('base64url'));
+    await media.capabilities; const peer = media.addPeer('guest'); peer.active = true;
+    const track = { enabled: true }, source = { track, active: true, targetFPS: 30, forceKey: true, sequence: 0, lastKey: 0, lastAdapt: now };
+    const frame = new global.VideoFrame({ displayWidth: 2560, displayHeight: 1440 });
+    const encode = async time => { now = time; await media.encodeCompressed(source, frame, 2560, 1440, 'avc1.420033', () => true); };
+    await encode(10000); const encoder = encoders[0]; assert.equal(encoder.encoded, 1); assert.equal(source.bitrate, 4500000);
+    for (const start of [11100, 12200, 13300]) {
+      encoder.encodeQueueSize = 2; const count = encoder.encoded; await encode(start);
+      assert.equal(encoder.encoded, count, 'A busy native queue drops the candidate frame immediately');
+      encoder.encodeQueueSize = 0; await encode(start + 40);
+      peer.pendingVideo = 2; const pendingCount = encoder.encoded; await encode(start + 80);
+      assert.equal(encoder.encoded, pendingCount, 'A full encrypted relay queue also prevents additional encode work');
+      peer.pendingVideo = 0; encoder.encodeQueueSize = 0; await encode(start + 120);
+      assert.equal(source.targetFPS, 30); assert.equal(source.bitrate, 4500000);
+      assert.equal(encoder.configurations.length, 1, 'Isolated pressure must not force repeated keyframes by reconfiguring');
+    }
+    encoder.encodeQueueSize = 2; const before = encoder.encoded;
+    await encode(14500); await encode(14600); await encode(14700);
+    assert.equal(source.targetFPS, 30, 'Pressure shorter than300ms does not lower the sustained ceiling');
+    await encode(14800); assert.equal(source.targetFPS, 27); assert.equal(source.bitrate, 3600000); assert.equal(encoder.encoded, before);
+    encoder.encodeQueueSize = 0; await encode(14840);
+    assert.equal(source.congestedSince, null, 'A healthy queue resets the pressure duration');
+    assert.equal(encoder.configurations.at(-1).framerate, 27);
+    peer.pendingVideo = 2; await encode(16000); await encode(16200);
+    assert.equal(source.targetFPS, 27, 'An old pressure interval cannot immediately lower a replacement healthy interval');
+    // A source returning after a quiet gap is not continuously congested.
+    await encode(18000); assert.equal(source.targetFPS, 27); await encode(18300);
+    assert.equal(source.targetFPS, 24); assert.equal(encoder.encoded, before + 1);
+    peer.pendingVideo = 0; encoder.encodeQueueSize = 0; await encode(18340);
+    encoder.encodeQueueSize = 0; await encode(21400); assert.equal(source.targetFPS, 27, 'Healthy transmission still recovers toward the original30fps ceiling');
+    assert.equal(source.congestedSince, null); assert.equal(frame.closed, undefined); assert.ok(clones.slice(1).every(clone => clone.closed));
+    encoder.encodeQueueSize = 0; frame.close(); media.close(); media = null;
+  } finally { media?.close(); global.VideoEncoder = oldEncoder; global.VideoDecoder = oldDecoder; global.VideoFrame = oldFrame; Object.defineProperty(global, 'performance', oldPerformance); }
+});
+
 test('a stalled encoder downgrades hardware then retires the stalled default codec without misclassifying quiet or congested sources', async () => {
   const { RelayMedia } = await ready;
   const oldPerformance = Object.getOwnPropertyDescriptor(global, 'performance'), oldEncoder = global.VideoEncoder, oldDecoder = global.VideoDecoder, oldFrame = global.VideoFrame;

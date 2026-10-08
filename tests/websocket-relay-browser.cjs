@@ -183,7 +183,7 @@ async function mediaProof(page, otherName, sender) {
   });
   assert.ok(audio.decodedMeanSquareEnergy > .000001, 'Relayed PCM must decode non-silent audio at the actual receiver output: ' + JSON.stringify(audio));
   assert.ok(await page.evaluate(() => qaPCs.every(pc => pc.connectionState === 'closed')), 'Direct RTC must be closed before media proof');
-  const sourceBefore = sender ? await sender.evaluate(() => ({ time: performance.now(), paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames })) : null;
+  const sourceBefore = sender ? await sender.evaluate(() => ({ time: performance.now(), paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames, queue: { ...qaEncoderQueue } })) : null;
   const motion = await page.locator('#stage-video').evaluate(async video => {
     const before = video.getVideoPlaybackQuality().totalVideoFrames; const initialStream = video.srcObject; const initialTrack = initialStream.getVideoTracks()[0]; const initialTime = video.currentTime; const sourcePaintsBefore = qaSourcePaints; const encodesBefore = qaEncodeRequests; const encodedBefore = qaEncodedFrames; const decodedBefore = qaDecodedFrames; const start = performance.now();
     await new Promise(resolve => setTimeout(resolve, 3000));
@@ -191,7 +191,7 @@ async function mediaProof(page, otherName, sender) {
     return { width: video.videoWidth, height: video.videoHeight, time: video.currentTime, initialTime, sourcePaints: qaSourcePaints - sourcePaintsBefore, encodeRequests: qaEncodeRequests - encodesBefore, encodedOutputs: qaEncodedFrames - encodedBefore, decodedOutputs: qaDecodedFrames - decodedBefore, initialFrames: before, finalFrames: video.getVideoPlaybackQuality().totalVideoFrames, sameStream: video.srcObject === initialStream, sameTrack: video.srcObject?.getVideoTracks()[0] === initialTrack, decodedFrames: frames, measuredFps: frames / seconds };
   });
   motion.startup = startup;
-  if (sender) { const sourceAfter = await sender.evaluate(() => ({ time: performance.now(), paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames, encoderConfigurations: qaEncoderConfigurations.slice(), encoderErrors: qaEncoderErrors })); motion.source = { seconds: (sourceAfter.time - sourceBefore.time) / 1000, paints: sourceAfter.paints - sourceBefore.paints, encodes: sourceAfter.encodes - sourceBefore.encodes, encoded: sourceAfter.encoded - sourceBefore.encoded, encoderConfigurations: sourceAfter.encoderConfigurations, encoderErrors: sourceAfter.encoderErrors }; }
+  if (sender) { const sourceAfter = await sender.evaluate(() => ({ time: performance.now(), paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames, encoderConfigurations: qaEncoderConfigurations.slice(), encoderErrors: qaEncoderErrors, queue: { ...qaEncoderQueue } })); motion.source = { seconds: (sourceAfter.time - sourceBefore.time) / 1000, paints: sourceAfter.paints - sourceBefore.paints, encodes: sourceAfter.encodes - sourceBefore.encodes, encoded: sourceAfter.encoded - sourceBefore.encoded, encoderConfigurations: sourceAfter.encoderConfigurations, configurationsDuringMeasurement: sourceAfter.encoderConfigurations.filter(item => item.atMs >= sourceBefore.time), encoderErrors: sourceAfter.encoderErrors, nativeQueueReads: sourceAfter.queue.reads - sourceBefore.queue.reads, nativeFullQueueReads: sourceAfter.queue.fullReads - sourceBefore.queue.fullReads, peakNativeQueueSinceStart: sourceAfter.queue.peak }; }
   assert.equal(motion.sameStream, true, 'Presentation stream must remain stable throughout quality proof: ' + JSON.stringify(motion));
   assert.equal(motion.sameTrack, true, 'Presentation track must remain stable throughout quality proof: ' + JSON.stringify(motion));
   assert.equal(motion.width, 2560, 'High-quality fallback must preserve the selected 1440p screen width');
@@ -248,6 +248,7 @@ async function main() {
           }; return socket;
         } });
         window.qaSourcePaints = 0; window.qaEncodeRequests = 0; window.qaEncodedFrames = 0; window.qaDecodedFrames = 0; window.qaEncoderConfigurations = []; window.qaEncoderErrors = 0; window.qaStartupSettle = null;
+        window.qaEncoderQueue = { reads: 0, fullReads: 0, peak: 0 };
         window.qaAudioContexts = []; window.qaAudioProof = null; window.qaAudioWorklets = []; window.qaMicrophoneRequests = [];
         const NativeAudioContext = window.AudioContext;
         window.AudioContext = new Proxy(NativeAudioContext, { construct(target, args) {
@@ -281,8 +282,13 @@ async function main() {
           window.VideoEncoder = new Proxy(NativeEncoder, { construct(target, args) {
             const options = args[0];
             const encoder = Reflect.construct(target, [{ ...options, output: (...values) => { qaEncodedFrames++; return options.output(...values); }, error: (...values) => { qaEncoderErrors++; return options.error?.(...values); } }]);
+            const queueSize = Object.getOwnPropertyDescriptor(NativeEncoder.prototype, 'encodeQueueSize')?.get;
+            if (queueSize) Object.defineProperty(encoder, 'encodeQueueSize', { get() {
+              const size = queueSize.call(this); qaEncoderQueue.reads++; if (size >= 2) qaEncoderQueue.fullReads++;
+              qaEncoderQueue.peak = Math.max(qaEncoderQueue.peak, size); return size;
+            } });
             const configure = encoder.configure.bind(encoder);
-            encoder.configure = config => { qaEncoderConfigurations.push({ codec: config.codec, hardwareAcceleration: config.hardwareAcceleration || 'unspecified', width: config.width, height: config.height }); if (qaEncoderConfigurations.length > 10) qaEncoderConfigurations.shift(); return configure(config); };
+            encoder.configure = config => { qaEncoderConfigurations.push({ atMs: performance.now(), codec: config.codec, hardwareAcceleration: config.hardwareAcceleration || 'unspecified', width: config.width, height: config.height, framerate: config.framerate, bitrate: config.bitrate, encodeQueueSize: encoder.encodeQueueSize }); if (qaEncoderConfigurations.length > 20) qaEncoderConfigurations.shift(); return configure(config); };
             const encode = encoder.encode.bind(encoder); encoder.encode = (...values) => { qaEncodeRequests++; return encode(...values); };
             return encoder;
           } });

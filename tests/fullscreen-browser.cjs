@@ -21,7 +21,7 @@ if (!executablePath) throw new Error('Install Edge/Chrome or set AURALINK_TEST_B
 async function fixture(broker, context) {
   const page = await context.newPage();
   const ws = new WebSocket(broker.url.replace(/^http/, 'ws') + '/ws', { rejectUnauthorized: false });
-  const owner = { ws, page, ready: false, signals: [], inbox: [], waiters: [], chain: Promise.resolve() };
+  const owner = { ws, page, ready: false, signals: [], inbox: [], waiters: [], chain: Promise.resolve(), observedTypes: [] };
   owner.send = packet => ws.send(JSON.stringify(packet));
   owner.take = type => {
     const index = owner.inbox.findIndex(packet => packet.type === type);
@@ -35,6 +35,7 @@ async function fixture(broker, context) {
   owner.deliver = packet => { owner.chain = owner.chain.then(() => owner.page.evaluate(packet => rtc.receive(packet.from, packet.data), packet)); };
   ws.on('message', raw => {
     const packet = JSON.parse(raw.toString());
+    if (packet.type !== 'signal') owner.observedTypes.push(packet.type);
     if (packet.type === 'signal') { if (owner.ready) owner.deliver(packet); else owner.signals.push(packet); return; }
     const index = owner.waiters.findIndex(waiter => waiter.type === packet.type);
     if (index >= 0) { const [waiter] = owner.waiters.splice(index, 1); clearTimeout(waiter.timer); waiter.resolve(packet); }
@@ -267,7 +268,25 @@ async function run(browser, mode) {
       'visible exit and leave actions restore the normal room', 'no local screen or microphone capture'];
     if (mode === 'electron') proof.verified.push('production native main/preload fullscreen entry and exit', 'native minimized window retains room and video track while actual remote packets and frames advance', 'admitted room owns prevent-app-suspension and leave releases it');
     return proof;
-  } catch (error) { throw new Error(`${mode}: ${phase}: ${error.message}`); }
+  } catch (error) {
+    const diagnosis = { phase, pageErrorTypes: errors.map(message => String(message).replace(/(?:https?:|auralink:|glance-port:)\/\/\S+/g, '[private invitation removed]').slice(0, 160)) };
+    if (guest && !guest.isClosed()) diagnosis.renderer = await guest.evaluate(() => ({
+      presentation: document.body.classList.contains('presentation-mode'), presentationMode: document.getElementById('stage').dataset.presentation,
+      domFullscreen: document.fullscreenElement?.id || null, visible: !document.hidden, sessionHidden: document.getElementById('session').hidden,
+      requestDisabled: document.getElementById('request-control').disabled, requestLabel: document.getElementById('request-control').querySelector('small').textContent,
+      presentationControlLabel: document.getElementById('presentation-control-button').getAttribute('aria-label'),
+      toolsHidden: document.getElementById('remote-tools').hidden, toolToggleExpanded: document.getElementById('presentation-tools-toggle').getAttribute('aria-expanded'),
+      controlBannerHidden: document.getElementById('control-banner').hidden,
+      video: { hidden: document.getElementById('stage-video').hidden, width: document.getElementById('stage-video').videoWidth, height: document.getElementById('stage-video').videoHeight, time: document.getElementById('stage-video').currentTime },
+      rtc: qaViewRTCs.map(connection => ({ connection: connection.connectionState, ice: connection.iceConnectionState, signaling: connection.signalingState })),
+      captureCalls: qaCaptureCalls.slice(), noticeCount: document.getElementById('toast-region').childElementCount,
+    })).catch(() => null);
+    if (owner?.page && !owner.page.isClosed()) diagnosis.owner = { observedTypes: owner.observedTypes.slice(-20),
+      rtc: await owner.page.evaluate(() => ({ inputs: fixtureInputs.length, errors: fixtureErrors.map(value => typeof value),
+        peers: [...rtc.peers.values()].map(entry => ({ connection: entry.pc.connectionState, channel: entry.channel?.readyState })) })).catch(() => null) };
+    if (app) diagnosis.native = await app.evaluate(({ BrowserWindow }) => { const win = BrowserWindow.getAllWindows()[0]; return { fullscreen: win?.isFullScreen(), minimized: win?.isMinimized(), transitions: qaFullscreenEvents.slice() }; }).catch(() => null);
+    const failure = new Error(`${mode}: ${phase}: ${error.message}`); failure.diagnosis = diagnosis; throw failure;
+  }
   finally {
     if (owner?.page && !owner.page.isClosed()) await owner.page.evaluate(() => { clearInterval(fixtureTimer); rtc.close(); }).catch(() => {});
     owner?.ws.terminate(); await app?.close().catch(() => {}); await guestContext?.close(); await ownerContext?.close(); await broker?.stop();
@@ -289,7 +308,7 @@ async function main() {
   try {
     for (const mode of electronMode ? ['electron'] : ['browser', 'denied', 'mobile-unavailable']) proof.scenarios.push(await run(browser, mode));
     proof.passed = true;
-  } catch (error) { proof.error = String(error.message).replace(/(?:https?:|auralink:|glance-port:)\/\/\S+/g, '[private invitation removed]'); process.exitCode = 1; }
+  } catch (error) { proof.error = String(error.message).replace(/(?:https?:|auralink:|glance-port:)\/\/\S+/g, '[private invitation removed]'); if (error.diagnosis) proof.diagnosis = error.diagnosis; process.exitCode = 1; }
   finally {
     await browser.close(); fs.writeFileSync(path.join(output, `fullscreen-${electronMode ? 'electron' : 'browser'}.json`), JSON.stringify(proof, null, 2));
     console.log(JSON.stringify({ passed: proof.passed, platform: proof.platform, scenarios: proof.scenarios.map(({ mode, passed, pointerCentre, backgroundRecovery }) => ({ mode, passed, pointerCentre, backgroundRecovery })), ...(proof.error ? { error: proof.error } : {}) }, null, 2));
