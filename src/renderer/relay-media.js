@@ -153,7 +153,7 @@ function validJPEGDimensions(bytes, width, height) {
 export class RelayMedia {
   constructor(rtc, key) {
     this.rtc = rtc; this.key = key; this.peers = new Map(); this.sources = new Map(); this.closed = false;
-    this.audioContexts = new Set(); this.audioModules = new WeakMap();
+    this.audioContexts = new Set(); this.audioModules = new WeakMap(); this.audioContextRoles = new WeakMap();
     this.hardwarePreferences = new Map();
     this.capabilities = this.codecCapabilities();
   }
@@ -176,7 +176,7 @@ export class RelayMedia {
   }
   addPeer(id) {
     if (!this.peers.has(id)) this.peers.set(id, { cipher: new RelayCipher(this.key, this.rtc.selfId, id), active: false,
-      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingData: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, needsKey: true, videoCodecs: null });
+      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingMetadata: 0, pendingData: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, sentAudioPackets: 0, needsKey: true, videoCodecs: null });
     return this.peers.get(id);
   }
   activate(id) {
@@ -194,8 +194,17 @@ export class RelayMedia {
   }
   send(id, header, bytes) {
     const peer = this.peers.get(id);
-    const data = header?.type === 'data', queue = data ? 'pendingData' : 'pending';
-    if (this.closed || !peer?.active || (data && peer.dataFailed) || peer[queue] >= (data ? 16 : 3) || this.rtc.closed || !this.rtc.peers.has(id)) return false;
+    const data = header?.type === 'data', metadata = ['hello', 'state', 'keyframe', 'codec-reject'].includes(header?.type);
+    const queue = data ? 'pendingData' : metadata ? 'pendingMetadata' : 'pending';
+    if (this.closed || !peer?.active || (data && peer.dataFailed) || this.rtc.closed || !this.rtc.peers.has(id)) return false;
+    if (header?.type === 'state') peer.deferredState = null;
+    if (peer[queue] >= (data ? 16 : metadata ? 8 : 3)) {
+      // A mute/start snapshot must survive a full media queue: losing it can
+      // leave the receiver rejecting every subsequent screen/audio packet.
+      // Keep only the newest snapshot if even the metadata queue is full.
+      if (header?.type === 'state') { peer.deferredState = { ...header, mediaState: { ...header.mediaState } }; return true; }
+      return false;
+    }
     if (data) {
       try { const serialized = JSON.stringify(header.data); if (typeof serialized !== 'string' || serialized.length > 4096 || bytes?.length) return false; }
       catch { return false; }
@@ -208,13 +217,19 @@ export class RelayMedia {
       const envelope = await peer.cipher.seal(packet);
       if (envelope && !this.closed && peer.active && this.peers.get(id) === peer && this.rtc.peers.has(id)) {
         const result = this.rtc.signal(id, { relay: envelope });
-        if (result !== false) peer.sent += packet.length; else if (data) this.failData(id, peer);
+        if (result !== false) { peer.sent += packet.length; if (header?.type === 'audio') peer.sentAudioPackets++; }
+        else if (data) this.failData(id, peer);
       } else if (data) this.failData(id, peer);
     }).catch(() => {
       if (data) this.failData(id, peer);
       else if (!this.closed && this.peers.get(id) === peer && this.rtc.peers.has(id)) this.rtc.emit('error', { peerId: id, error: new Error('The secure relay could not send media. Rejoin the room to retry.') });
     })
-      .finally(() => { peer[queue]--; });
+      .finally(() => {
+        peer[queue]--;
+        if (peer.deferredState && peer.pendingMetadata < 8 && !this.closed && peer.active && this.peers.get(id) === peer) {
+          const state = peer.deferredState; peer.deferredState = null; this.send(id, state);
+        }
+      });
     return true;
   }
   failData(id, peer) {
@@ -278,12 +293,22 @@ export class RelayMedia {
       else if (header.type === 'data' && !peer.dataFailed && payload.length === 0 && JSON.stringify(header.data).length <= 4096) this.rtc.emit('data', { peerId: id, data: header.data });
     }).catch(() => { /* A malformed or interrupted media frame is discarded. */ }).finally(() => { peer.receiving--; });
   }
-  async resumePlayback() { await Promise.all([...this.audioContexts].map(context => context.resume().catch(() => {}))); }
+  async resumePlayback() { await Promise.all([...this.audioContexts].map(context => context.resume().catch(() => {}))); this.playbackState(); }
   playbackState() {
-    if (!this.closed) this.rtc.emit('playback-blocked', { blocked: [...this.audioContexts].some(context => context.state === 'suspended' || context.state === 'interrupted') });
+    if (this.closed) return;
+    const blocked = [...this.audioContexts].some(context => this.audioContextRoles.get(context) !== 'capture' && ['suspended', 'interrupted'].includes(context.state));
+    this.rtc.emit('playback-blocked', { blocked });
+    this.rtc.emit('relay-audio-state', { captureContextState: this.sources.get('audio')?.context?.state || 'off', playbackBlocked: blocked });
   }
-  watchAudioContext(context) {
+  watchAudioContext(context, role = 'playback') {
+    this.audioContextRoles.set(context, role);
     this.audioContexts.add(context); context.onstatechange = () => this.playbackState(); this.playbackState();
+  }
+  audioDiagnostics(id) {
+    const source = this.sources.get('audio'), peer = this.peers.get(id);
+    return { captureContextState: source?.context?.state || 'off', playbackContextState: peer?.outputs.get('audio')?.context?.state || 'off',
+      sentAudioPackets: peer?.sentAudioPackets || 0, capturedAudioPackets: source?.audioPackets || 0, capturedAudioSamples: source?.audioSamples || 0,
+      capturedAudioEnergy: source?.audioMeanSquareEnergy ?? null, microphoneLevel: Number.isFinite(source?.audioMeanSquareEnergy) ? Math.sqrt(source.audioMeanSquareEnergy) : null };
   }
   async audioModule(context) {
     if (!this.audioModules.has(context)) this.audioModules.set(context, context.audioWorklet.addModule(new URL('./audio-worklet.js', import.meta.url)));
@@ -407,8 +432,9 @@ export class RelayMedia {
     if (this.rtc.peers.get(id)?.remoteState.audio === false) return;
     let output = peer.outputs.get('audio');
     if (!output) {
-      const context = new AudioContext({ sampleRate: header.sampleRate, latencyHint: 'interactive' }); this.watchAudioContext(context);
+      let context;
       try {
+        context = new AudioContext({ sampleRate: header.sampleRate, latencyHint: 'interactive' }); this.watchAudioContext(context, 'playback');
         await this.audioModule(context);
         if (this.closed || this.peers.get(id) !== peer || !peer.active || !this.rtc.peers.has(id) || this.rtc.peers.get(id)?.remoteState.audio === false) { this.audioContexts.delete(context); await context.close(); return; }
         const node = new AudioWorkletNode(context, 'auralink-relay-playback', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
@@ -416,7 +442,13 @@ export class RelayMedia {
         const track = destination.stream.getAudioTracks()[0];
         this.output(id, 'audio', track, destination.stream, { context, node, sampleRate: header.sampleRate }); output = peer.outputs.get('audio');
         void context.resume().catch(() => {}); this.playbackState();
-      } catch (error) { this.audioContexts.delete(context); await context.close(); throw error; }
+      } catch (error) {
+        this.audioContexts.delete(context); await context?.close().catch(() => {});
+        if (!peer.audioErrorNotified && !this.closed && this.peers.get(id) === peer) {
+          peer.audioErrorNotified = true; this.rtc.emit('error', { peerId: id, error: new Error('Incoming relay audio could not start. Open Check sound and enable sound, or rejoin the room.') });
+        }
+        throw error;
+      }
     }
     if (!output || output.sampleRate !== header.sampleRate) return;
     const buffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
@@ -430,58 +462,114 @@ export class RelayMedia {
     const source = { track: current.track, active: true, pending: false, instance: base64(crypto.getRandomValues(new Uint8Array(12))) }; this.sources.set(kind, source);
     const valid = () => !this.closed && source.active && this.sources.get(kind) === source && this.rtc.localTracks.get(kind)?.track === source.track;
     if (kind === 'audio') {
-      const context = new AudioContext({ sampleRate: 24000, latencyHint: 'interactive' }); source.context = context; this.watchAudioContext(context);
+      let context;
       try {
+        context = new AudioContext({ sampleRate: 24000, latencyHint: 'interactive' }); source.context = context; this.watchAudioContext(context, 'capture');
         await this.audioModule(context); if (!valid()) { await context.close(); return; }
         source.input = context.createMediaStreamSource(new MediaStream([current.track]));
         source.node = new AudioWorkletNode(context, 'auralink-relay-capture'); source.input.connect(source.node); source.node.connect(context.destination);
         source.node.port.onmessage = event => {
           if (!valid() || !current.track.enabled || !(event.data?.buffer instanceof ArrayBuffer)) return;
           const bytes = new Uint8Array(event.data.buffer);
+          if (!bytes.length || bytes.length > 24000 || bytes.length % 2 || ![24000, 44100, 48000].includes(event.data.sampleRate)) return;
+          source.audioPackets = (source.audioPackets || 0) + 1; source.audioSamples = (source.audioSamples || 0) + bytes.length / 2;
+          if (Number.isFinite(event.data.meanSquareEnergy) && event.data.meanSquareEnergy >= 0 && event.data.meanSquareEnergy <= 1) source.audioMeanSquareEnergy = event.data.meanSquareEnergy;
           for (const [id, peer] of this.peers) if (peer.active) this.send(id, { type: 'audio', sampleRate: event.data.sampleRate }, bytes);
         };
         void context.resume().catch(() => {}); this.playbackState();
       } catch (error) {
-        const wasActive = valid(); this.audioContexts.delete(context); void context.close().catch(() => {});
+        const wasActive = valid(); this.audioContexts.delete(context); void context?.close().catch(() => {});
         if (this.sources.get(kind) === source) this.stopSource(kind);
-        if (wasActive) this.rtc.emit('error', { error: new Error('Secure relay microphone processing is unavailable. Update Android WebView or your app.') });
+        if (wasActive) this.rtc.emit('error', { error: new Error('Relay microphone processing could not start. Check microphone permission, then turn the microphone off and on again.') });
       }
       return;
     }
     if (kind !== 'screen') return;
     source.startedAt = performance.now(); source.forceKey = true; source.sequence = 0; source.targetFPS = 30; source.lastKey = 0; source.lastAdapt = 0;
-    // TrackProcessor consumes generated Android frames even when its Activity
-    // has no compositor paints. Cloning avoids taking ownership of RTC capture.
-    source.clone = current.track.clone();
-    if (typeof MediaStreamTrackProcessor === 'function') {
-      source.reader = new MediaStreamTrackProcessor({ track: source.clone }).readable.getReader();
-      void (async () => {
-        let last = -Infinity, deadline = -Infinity, previousInterval = null;
-        try { while (valid()) { const { done, value } = await source.reader.read(); if (done) break;
-          try { const now = performance.now(), interval = source.jpeg ? 250 : 1000 / source.targetFPS;
-            if (interval !== previousInterval) { deadline = last + interval; previousInterval = interval; }
-            // Source clocks have small scheduling jitter. The allowance avoids
-            // halving a 30 fps source. Fractional deadlines preserve adapted
-            // rates; a source returning late never emits a catch-up burst.
-            if (now + (source.jpeg ? 0 : 2) < deadline || source.pending || !source.track.enabled) continue;
-            deadline = !Number.isFinite(deadline) || now - deadline > interval ? now + interval : deadline + interval;
-            last = now; await this.encodeVideo(kind, source, value, valid); }
-          finally { value.close(); }
-        } } catch { /* Source stop releases the reader. */ }
-      })();
-    } else if (typeof ImageCapture === 'function') {
-      source.capture = new ImageCapture(source.clone);
-      source.timer = setInterval(async () => { if (!valid() || source.pending || !source.track.enabled) return;
-        source.pending = true; let bitmap;
-        try { bitmap = await source.capture.grabFrame(); await this.encodeVideo(kind, source, bitmap, valid); } catch {} finally { bitmap?.close(); source.pending = false; }
-      }, 33);
-    } else { this.stopSource(kind); this.rtc.emit('error', { error: new Error('Secure relay video is unavailable in this media engine.') }); }
+    this.startScreenCapture(source, valid);
+  }
+  stopScreenCapture(source) {
+    source.captureVersion = (source.captureVersion || 0) + 1;
+    // Encoder callbacks belong to the reader generation that created them.
+    // A recovered reader at the same resolution must get a fresh encoder;
+    // otherwise its output would retain the retired generation's validity gate.
+    try { source.encoder?.close(); } catch {}
+    source.encoder = null; source.codec = null; source.forceKey = true;
+    clearInterval(source.timer); clearInterval(source.captureWatchdog); source.timer = null; source.captureWatchdog = null;
+    source.clone?.stop(); source.clone = null; void source.reader?.cancel().catch(() => {}); source.reader = null; source.capture = null;
+    if (source.video) { source.video.pause(); source.video.srcObject = null; source.video.remove(); source.video = null; }
+  }
+  startScreenCapture(source, valid, first = 0, reason) {
+    if (!valid()) return;
+    this.stopScreenCapture(source);
+    const methods = ['Track processor', 'Image capture', 'Video element'];
+    for (let index = first; index < methods.length; index++) {
+      if (index === 0 && typeof MediaStreamTrackProcessor !== 'function' || index === 1 && typeof ImageCapture !== 'function' || index === 2 && typeof globalThis.document?.createElement !== 'function') continue;
+      try {
+        // Some native capture backends fail after accepting a cloned track.
+        // Each retry gets a fresh clone and never stops the original RTC source.
+        source.clone = source.track.clone(); source.captureBackend = methods[index]; source.captureFailures = 0; source.captureError = null;
+        source.captureStartedAt = performance.now(); source.lastCaptureAt = null; source.capturePending = false;
+        source.captureLast = -Infinity; source.captureDeadline = -Infinity; source.captureInterval = null;
+        const version = source.captureVersion, current = () => valid() && source.captureVersion === version;
+        const retry = failure => { if (current()) this.startScreenCapture(source, valid, index + 1, failure); };
+        const accept = async frame => {
+          if (!current()) return;
+          const now = performance.now(), interval = source.jpeg ? 250 : 1000 / source.targetFPS;
+          source.lastCaptureAt = now; source.capturedFrames = (source.capturedFrames || 0) + 1; source.captureError = null;
+          if (interval !== source.captureInterval) { source.captureDeadline = source.captureLast + interval; source.captureInterval = interval; }
+          if (now + (source.jpeg ? 0 : 2) < source.captureDeadline || source.pending || !source.track.enabled) return;
+          source.captureDeadline = !Number.isFinite(source.captureDeadline) || now - source.captureDeadline > interval ? now + interval : source.captureDeadline + interval;
+          source.captureLast = now; await this.encodeVideo('screen', source, frame, current);
+        };
+        if (index === 0) {
+          source.reader = new MediaStreamTrackProcessor({ track: source.clone }).readable.getReader(); const reader = source.reader;
+          void (async () => {
+            try {
+              while (current()) {
+                const { done, value } = await reader.read();
+                if (done) { retry('The native screen frame reader ended.'); break; }
+                try { await accept(value); } finally { value?.close(); }
+              }
+            } catch { retry('The native screen frame reader failed.'); }
+          })();
+        } else if (index === 1) {
+          source.capture = new ImageCapture(source.clone); const capture = source.capture;
+          source.timer = setInterval(async () => {
+            if (!current() || source.capturePending || !source.track.enabled) return;
+            source.capturePending = true; let bitmap;
+            try { bitmap = await capture.grabFrame(); source.captureFailures = 0; await accept(bitmap); }
+            catch { if (current() && ++source.captureFailures >= 3) retry('The native image capture backend failed.'); }
+            finally { bitmap?.close(); if (current()) source.capturePending = false; }
+          }, 33);
+        } else {
+          const video = document.createElement('video'); source.video = video;
+          video.muted = true; video.autoplay = true; video.playsInline = true; video.srcObject = new MediaStream([source.clone]);
+          Object.assign(video.style, { position: 'fixed', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none' }); document.body.append(video);
+          void video.play().catch(() => retry('The screen capture preview could not start.'));
+          source.timer = setInterval(async () => {
+            if (!current() || source.capturePending || !source.track.enabled || video.readyState < 2) return;
+            source.capturePending = true;
+            try { await accept(video); } catch { if (current() && ++source.captureFailures >= 3) retry('The screen capture preview failed.'); }
+            finally { if (current()) source.capturePending = false; }
+          }, 33);
+        }
+        source.captureWatchdog = setInterval(() => {
+          if (current() && source.track.enabled && performance.now() - (source.lastCaptureAt ?? source.captureStartedAt) > 6000) retry('No native screen frames arrived.');
+        }, 1000);
+        this.rtc.emit('relay-capture', { kind: 'screen', backend: source.captureBackend, recovered: Boolean(reason), reason });
+        return;
+      } catch { this.stopScreenCapture(source); reason = 'The native screen capture backend could not start.'; }
+    }
+    this.stopScreenCapture(source); source.captureBackend = 'Unavailable';
+    source.captureError = 'Screen capture stopped producing frames. Check Screen Recording permission, then stop sharing and choose your display again.';
+    this.rtc.emit('error', { error: new Error(source.captureError) });
   }
   async encodeVideo(kind, source, frame, valid) {
     if (source.jpeg && performance.now() - (source.lastJPEG || 0) < 250) return;
     source.pending = true;
     try {
-      const width = frame.displayWidth || frame.width, height = frame.displayHeight || frame.height;
+      const width = frame.displayWidth || frame.videoWidth || frame.width, height = frame.displayHeight || frame.videoHeight || frame.height;
       if (!width || !height) return;
       const codecs = await this.capabilities; if (!valid()) return;
       const peers = [...this.peers.values()].filter(peer => peer.active);
@@ -607,7 +695,7 @@ export class RelayMedia {
   }
   stopSource(kind) {
     const source = this.sources.get(kind); if (!source) return;
-    this.sources.delete(kind); source.active = false; clearInterval(source.timer); source.clone?.stop(); void source.reader?.cancel().catch(() => {});
+    this.sources.delete(kind); source.active = false; this.stopScreenCapture(source);
     try { source.encoder?.close(); } catch {}
     if (source.node) { source.node.port.postMessage('stop'); source.node.disconnect(); source.node.port.onmessage = null; }
     source.input?.disconnect(); if (source.context) { this.audioContexts.delete(source.context); void source.context.close().catch(() => {}); this.playbackState(); }

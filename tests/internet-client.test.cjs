@@ -150,10 +150,18 @@ test('healthy pongs clear their deadline and closing clears both heartbeat timer
   const { InternetDirectory } = await moduleReady; const sockets = []; let disconnects = 0;
   const directory = new InternetDirectory({ storage: storage(), heartbeatInterval: 5, pongTimeout: 15, socketFactory: url => { const socket = new Socket(url, pairedServer); sockets.push(socket); return socket; } });
   directory.addEventListener('disconnected', () => disconnects++);
-  await directory.open(origin, { pairingKey: 'private-qa-code' });
-  await new Promise(resolve => setTimeout(resolve, 35));
-  assert.equal(directory.status, 'online'); assert.equal(disconnects, 0); assert.ok(sockets[0].sent.filter(packet => packet.type === 'ping').length >= 2); assert.equal(directory.pongTimer, null);
-  directory.close(); const sentBefore = sockets[0].sent.length;
+  try {
+    await directory.open(origin, { pairingKey: 'private-qa-code' });
+    const deadline = performance.now() + 1000;
+    const pings = () => sockets[0].sent.filter(packet => packet.type === 'ping').length;
+    // Parallel media fixtures can delay timer dispatch. Wait for the behavior
+    // being checked instead of requiring two intervals within a fixed sleep.
+    while (pings() < 2 && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(pings() >= 2, 'The healthy connection must send at least two heartbeats within the bounded wait');
+    assert.equal(directory.status, 'online'); assert.equal(disconnects, 0);
+    assert.notEqual(directory.heartbeatTimer, null); assert.equal(directory.pongTimer, null);
+  } finally { directory.close(); }
+  const sentBefore = sockets[0].sent.length;
   await new Promise(resolve => setTimeout(resolve, 25));
   assert.equal(directory.heartbeatTimer, null); assert.equal(directory.pongTimer, null); assert.equal(sockets[0].sent.length, sentBefore); assert.equal(sockets.length, 1);
 });

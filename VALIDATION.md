@@ -2,6 +2,16 @@
 
 Tests record specific behavior. They do not certify unrestricted device control, physical media quality, internet reachability or absolute security.
 
+## 0.4.1 recovery revision
+
+The repaired source passes 185 unit tests, including a stopped microphone during sender attachment, full media queues losing enable/mute state, failed or stalled native screen readers, and failed direct sender replacement. Screen recovery also covers a reader failing after compressed streaming has started: a fresh encoder resumes encrypted frames at the same resolution. Local browser tests decode non-silent microphone audio in both directions and recover after interruption. Actual Windows app-window capture passes the shipped encrypted screen encoder/decoder using both the normal track processor and a deliberately forced ImageCapture fallback; original capture ownership is preserved until Stop sharing. These checks do not establish the user's physical Mac microphone or capture permissions.
+
+The current production Electron live test uses two isolated Windows apps, the actual main/preload and native public WSS, blocked direct RTC, decoded synthetic microphone tones in both directions, microphone restart and synthetic 1440p H.264 screen playback above 15 measured frames per second in each direction. It waits for the relay route before measuring media; temporary direct-track metadata during fallback is not treated as delivered audio. Source hashes and measurements are recorded separately from hardware or different-network acceptance.
+
+The Mac package check now reads the actual signed app and audio helper entitlements. Each release report records the CI result and frozen source. Physical Windows↔Mac on different networks remains the final user-device acceptance test, and must not be inferred from generated-media CI or same-PC production tests.
+
+Cloudflare Realtime TURN remains disabled because the inspected activation form requires a payment method and billable overages. Its backend adapter has mocked-provider tests only. No paid subscription, card or overage option was enabled. The default retains finite Workers Free media allowances.
+
 ## 0.4.0 desktop screen-sharing revision
 
 The current milestone is Windows and Apple Silicon macOS: open an invitation room with one click, share its link, and let the invited device join without an admission prompt. Each screen owner deliberately starts capture and separately approves remote control. Camera calls are removed; microphone audio remains optional. Android work is retained in source and deferred from this release milestone.

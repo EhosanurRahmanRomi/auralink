@@ -121,15 +121,31 @@ export class RoomRTC extends EventTarget {
   }
 
   async activateRelay(entry) {
-    if (!entry || this.closed || !this.websocketRelayEnabled || entry.relayActive || this.peers.get(entry.info.id) !== entry) return;
+    if (!entry || this.closed || !this.websocketRelayEnabled || entry.relayActive || this.peers.get(entry.info.id) !== entry) return false;
     const media = await this.relayReady;
-    if (!media || this.closed || !this.websocketRelayEnabled || this.peers.get(entry.info.id) !== entry) return;
+    if (!media || this.closed || !this.websocketRelayEnabled || entry.relayActive || this.peers.get(entry.info.id) !== entry) return false;
     entry.relayActive = true; clearTimeout(entry.recoveryTimer); entry.recoveryTimer = null;
     // A fallback has one route. Closing the failed RTC path prevents duplicate
     // audio or later transport callbacks from replacing the relayed tracks.
     entry.channel?.close(); entry.channel = null;
     for (const kind of [...entry.remoteTracks.keys()]) this.removeRemoteTrack(entry.info.id, kind);
     entry.inactiveRemoteTracks.clear(); entry.pc.close(); media.activate(entry.info.id);
+    return true;
+  }
+
+  async useSecureRelay(peerId) {
+    if (this.closed) throw new Error('This room has closed. Open or join a room again.');
+    if (!this.websocketRelayEnabled) throw new Error('Secure relay is unavailable in this room. Use an internet invitation room to retry.');
+    const media = await this.relayReady;
+    if (!media || this.closed || !this.websocketRelayEnabled) throw new Error('Secure relay is unavailable. Rejoin the room to retry.');
+    const entries = peerId === undefined ? [...this.peers.values()] : [this.peers.get(peerId)].filter(Boolean);
+    let activated = 0;
+    for (const entry of entries) {
+      if (entry.relayActive || this.peers.get(entry.info.id) !== entry) continue;
+      const changed = await this.activateRelay(entry);
+      if (changed && entry.relayActive && this.peers.get(entry.info.id) === entry) activated++;
+    }
+    return activated;
   }
 
   resumePlayback() { return this.relayMedia ? this.relayMedia.resumePlayback() : this.relayReady.then(media => media?.resumePlayback()); }
@@ -256,22 +272,61 @@ export class RoomRTC extends EventTarget {
   }
 
   mediaState() {
-    return Object.fromEntries(['audio', 'screen'].map((kind) => [kind, Boolean(this.localTracks.get(kind)?.track.enabled)]));
+    return Object.fromEntries(['audio', 'screen'].map((kind) => {
+      const track = this.localTracks.get(kind)?.track;
+      return [kind, Boolean(track?.enabled && track.readyState !== 'ended')];
+    }));
+  }
+
+  captureState(kind) {
+    const track = this.localTracks.get(kind)?.track;
+    if (!track) return 'off';
+    if (track.readyState === 'ended') return 'ended';
+    if (!track.enabled) return 'off';
+    return track.muted ? 'paused' : 'live';
+  }
+
+  watchLocalTrack(kind, item) {
+    const { track } = item;
+    if (!track.addEventListener) return;
+    const changed = () => {
+      if (this.closed || this.localTracks.get(kind) !== item) return;
+      this.emit('capture-state', { kind, track, state: this.captureState(kind) });
+    };
+    const ended = () => {
+      if (this.closed || this.localTracks.get(kind) !== item) return;
+      // Device removal/privacy revocation can end a source while the renderer
+      // is awaiting another operation. Stop transport without that UI wait.
+      void this.setTrack(kind, null).catch(error => { if (!this.closed) this.emit('error', { error }); });
+      this.emit('capture-state', { kind, track, state: 'ended' });
+    };
+    track.addEventListener('mute', changed); track.addEventListener('unmute', changed); track.addEventListener('ended', ended);
+    item.unwatch = () => { track.removeEventListener('mute', changed); track.removeEventListener('unmute', changed); track.removeEventListener('ended', ended); };
   }
 
   async setTrack(kind, track, stream) {
     if (this.closed) { track?.stop(); return; }
     if (!['audio', 'screen'].includes(kind)) { track?.stop(); throw new Error('Choose microphone audio or screen sharing.'); }
+    if (track && (track.kind !== (kind === 'audio' ? 'audio' : 'video') || track.readyState === 'ended')) throw new Error('The selected capture has ended or is unavailable. Start it again.');
     const old = this.localTracks.get(kind);
     if (old?.track === track) return;
-    if (track) this.localTracks.set(kind, { track, stream }); else this.localTracks.delete(kind);
+    old?.unwatch?.();
+    if (track) { const item = { track, stream }; this.localTracks.set(kind, item); this.watchLocalTrack(kind, item); }
+    else this.localTracks.delete(kind);
+    // The relay source must not wait on another peer's browser sender or
+    // negotiation. Otherwise one stalled/rejected replaceTrack mutes everyone
+    // already using the relay, even though capture itself remains live.
+    this.relayMedia?.state();
     const replacements = [];
     for (const entry of this.peers.values()) {
-      replacements.push(this.syncSenders(entry));
+      replacements.push(this.syncSenders(entry).catch(async error => {
+        if (this.closed || entry.relayActive || this.peers.get(entry.info.id) !== entry) return;
+        this.emit('error', { peerId: entry.info.id, error });
+        if (this.websocketRelayEnabled) await this.activateRelay(entry);
+      }));
       this.send(entry.info.id, { mediaState: this.mediaState() });
     }
     await Promise.all(replacements);
-    this.relayMedia?.state();
     if (track?.kind === 'video') await this.setVideoLimits();
   }
 
@@ -338,6 +393,7 @@ export class RoomRTC extends EventTarget {
       try {
         if (entry.relayActive) {
           const peer = this.relayMedia?.peers.get(peerId); if (!peer) continue;
+          const screen = this.relayMedia.sources.get('screen');
           const now = performance.now(); const prev = this.previousStats.get(peerId); const seconds = prev ? (now - prev.now) / 1000 : 0;
           results.push({ peerId, name: entry.info.name, state: 'connected', route: 'Secure relay', protocol: 'TLS / WebSocket',
             incoming: peer.width ? `${peer.width} × ${peer.height}` : null, incomingCodec: peer.width ? peer.codec || 'JPEG · compatibility' : null,
@@ -346,17 +402,20 @@ export class RoomRTC extends EventTarget {
             fps: seconds > 0 ? Math.round((peer.frames - (prev.frames || 0)) / seconds) : null,
             downloadMbps: seconds > 0 ? Math.max(0, (peer.received - prev.received) * 8 / seconds / 1e6) : null,
             uploadMbps: seconds > 0 ? Math.max(0, (peer.sent - prev.sent) * 8 / seconds / 1e6) : null,
-            receivedAudioPackets: peer.audioPackets, audioCodec: 'PCM mono', roundTripMs: null, packetLoss: null });
+            receivedAudioPackets: peer.audioPackets, audioCodec: 'PCM mono', roundTripMs: null, packetLoss: null,
+            captureBackend: screen?.captureBackend || null, capturedFrames: screen?.capturedFrames ?? null, captureError: screen?.captureError || null,
+            microphoneState: this.captureState('audio'), ...this.relayMedia.audioDiagnostics?.(peerId) });
           this.previousStats.set(peerId, { now, received: peer.received, sent: peer.sent, frames: peer.frames }); continue;
         }
         const report = await entry.pc.getStats();
         if (this.closed || this.peers.get(peerId) !== entry) continue;
-        let pair = null; let transport = null; let receivedVideo = null; let sentVideo = null; let receivedAudio = null; let sentAudio = null; let audioSource = null;
+        let pair = null; let transport = null; let receivedVideo = null; let sentVideo = null; let receivedAudio = null; let sentAudio = null;
+        const audioSources = [];
         let totalReceived = 0; let totalSent = 0; let lost = 0; let packets = 0;
         report.forEach((row) => {
           if (row.type === 'transport' && row.selectedCandidatePairId) transport = row;
           if (row.type === 'candidate-pair' && row.state === 'succeeded' && row.nominated) pair = row;
-          if (row.type === 'media-source' && row.kind === 'audio') audioSource = row;
+          if (row.type === 'media-source' && row.kind === 'audio') audioSources.push(row);
           if (row.type === 'inbound-rtp' && !row.isRemote) {
             totalReceived += row.bytesReceived || 0; lost += row.packetsLost || 0; packets += row.packetsReceived || 0;
             if (row.kind === 'video' && (!receivedVideo || (row.frameWidth || 0) > (receivedVideo.frameWidth || 0))) receivedVideo = row;
@@ -368,6 +427,14 @@ export class RoomRTC extends EventTarget {
             if (row.kind === 'audio' && (!sentAudio || (row.bytesSent || 0) > (sentAudio.bytesSent || 0))) sentAudio = row;
           }
         });
+        // Chromium can retain a retired source row after replaceTrack. A
+        // zero level from that row must not report a live new input as silent.
+        const microphone = this.localTracks.get('audio')?.track;
+        const linkedAudioSource = sentAudio?.mediaSourceId ? report.get(sentAudio.mediaSourceId) : null;
+        const audioSource = microphone && microphone.readyState !== 'ended' ?
+          audioSources.find(row => row.trackIdentifier === microphone.id) ||
+          (linkedAudioSource && (!linkedAudioSource.trackIdentifier || linkedAudioSource.trackIdentifier === microphone.id) ? linkedAudioSource : null) ||
+          audioSources.find(row => !row.trackIdentifier) || null : null;
         if (transport) pair = report.get(transport.selectedCandidatePairId) || pair;
         const candidate = pair && report.get(pair.localCandidateId);
         const remoteCandidate = pair && report.get(pair.remoteCandidateId);
@@ -391,6 +458,11 @@ export class RoomRTC extends EventTarget {
           sentAudioPackets: sentAudio?.packetsSent ?? null,
           receivedAudioEnergy: receivedAudio?.totalAudioEnergy ?? null,
           microphoneLevel: audioSource?.audioLevel ?? null,
+          microphoneState: this.captureState('audio'),
+          sentAudioBytes: sentAudio?.bytesSent ?? null,
+          receivedAudioBytes: receivedAudio?.bytesReceived ?? null,
+          capturedAudioDuration: audioSource?.totalSamplesDuration ?? null,
+          capturedAudioEnergy: audioSource?.totalAudioEnergy ?? null,
           audioCodec: receivedAudio?.codecId ? report.get(receivedAudio.codecId)?.mimeType || null : sentAudio?.codecId ? report.get(sentAudio.codecId)?.mimeType || null : null,
         };
         this.previousStats.set(peerId, { now, received: totalReceived, sent: totalSent }); results.push(measurement);
@@ -412,7 +484,7 @@ export class RoomRTC extends EventTarget {
     globalThis.removeEventListener?.('online', this.networkOnline); this.relayMedia?.close();
     clearInterval(this.budgetTimer); this.budgetTimer = null;
     for (const peerId of [...this.peers.keys()]) this.removePeer(peerId);
-    for (const { track } of this.localTracks.values()) track.stop();
+    for (const item of this.localTracks.values()) { item.unwatch?.(); item.track.stop(); }
     this.localTracks.clear();
   }
 }

@@ -40,7 +40,7 @@ const state = {
   pendingControl: null, controlTimer: null, grantTimer: null, audioElements: new Map(), speakerPool: [], nativeInfo: null,
   audioContext: null, silentOutput: null, microphoneMonitor: null, microphoneTest: null, speaker: true, phoneScreen: null,
   mediaPending: new Map(), sharingPending: false,
-  relayPlaybackBlocked: false, relayCompatibilityNotified: false,
+  relayPlaybackBlocked: false, relayCaptureSuspended: false, relayCompatibilityNotified: false,
   leaving: false, epoch: 0, preparing: null, preparingHost: false, preparingInternet: false,
   started: 0, lastMove: 0, seq: 0, pressed: new Set(), pressedButtons: new Set(), lastPoint: { x: .5, y: .5 }, statsTimer: null, durationTimer: null,
 };
@@ -353,8 +353,10 @@ async function updatePhoneAudioRoute() {
   if (bridge?.setAudioRoute) await bridge.setAudioRoute({ active: Boolean(state.joined || state.microphoneTest), ongoing, playback, speaker: state.speaker });
 }
 function updateAudioBanner() {
-  const blocked = state.relayPlaybackBlocked || [...state.audioElements.values()].some(audio => audio.dataset.blocked === 'true');
+  const blocked = state.relayCaptureSuspended || state.relayPlaybackBlocked || [...state.audioElements.values()].some(audio => audio.dataset.blocked === 'true');
   $('audio-banner').hidden = !blocked;
+  $('audio-banner-title').textContent = state.relayCaptureSuspended ? 'Microphone processing needs a tap' : 'Room audio needs a tap';
+  $('audio-banner-text').textContent = state.relayCaptureSuspended ? 'Resume audio processing so the other person can hear your microphone.' : 'Enable playback to hear the other participants.';
 }
 async function playRemoteAudio(audio) {
   try { await audio.play(); audio.dataset.blocked = 'false'; }
@@ -373,7 +375,7 @@ $('phone-speaker-toggle').addEventListener('click', async () => {
   try { await updatePhoneAudioRoute(); } catch (error) { toast(`Audio route: ${cleanError(error)}`, true); }
 });
 function microphoneError(error) {
-  if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) return 'Allow microphone access in your device privacy settings, then try again. Windows: Settings → Privacy & security → Microphone, including desktop apps.';
+  if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) return bridge?.platform === 'darwin' ? 'Allow Auralink in System Settings → Privacy & Security → Microphone, then quit and reopen the app if macOS requests it.' : 'Allow microphone access in your device privacy settings, then try again. Windows: Settings → Privacy & security → Microphone, including desktop apps.';
   if (['NotReadableError', 'TrackStartError'].includes(error?.name)) return 'Your microphone could not start. Close another app using it, check the device connection, or select System default in Preferences.';
   if (error?.name === 'NotFoundError') return 'No microphone was found. Connect one and check the selected device in Preferences.';
   return cleanError(error);
@@ -729,6 +731,15 @@ function bindRTC() {
   const rtc = state.rtc; const epoch = state.epoch;
   const on = (type, listener) => rtc.addEventListener(type, event => { if (state.rtc === rtc && state.epoch === epoch && !state.leaving) void listener(event); });
   on('playback-blocked', ({ detail }) => { state.relayPlaybackBlocked = Boolean(detail.blocked); updateAudioBanner(); });
+  on('relay-audio-state', ({ detail }) => {
+    state.relayCaptureSuspended = Boolean(state.local.has('audio') && ['suspended', 'interrupted'].includes(detail.captureContextState));
+    updateAudioBanner();
+  });
+  on('capture-state', ({ detail }) => {
+    if (state.local.get(detail.kind)?.track !== detail.track || detail.kind !== 'audio') return;
+    if (detail.state === 'paused') $('voice-status-text').textContent = 'Microphone paused by your device';
+    else if (detail.state === 'live') $('voice-status-text').textContent = `${detail.track.label || 'Microphone'} · listening`;
+  });
   on('relay-codec', ({ detail }) => {
     if (!state.room?.internet) return;
     $('internet-relay-note').hidden = false;
@@ -770,7 +781,7 @@ function bindRTC() {
       send({ type: 'signal', to: peerId, data: { controlStop: { sessionId } } }); clearControlling('The desktop control channel closed.');
     }
   });
-  on('error', ({ detail }) => { console.warn('WebRTC negotiation:', detail.peerId, cleanError(detail.error)); toast('A media connection could not negotiate. Check Connection details and the network.', true); });
+  on('error', ({ detail }) => { console.warn('Media connection:', detail.peerId, cleanError(detail.error)); toast(cleanError(detail.error) || 'A media connection could not start. Check Connection details.', true, 12000); });
   on('data', async ({ detail }) => {
     const { peerId, data } = detail;
     if (data?.type !== 'input' || !state.grant?.confirmed || state.grant.peerId !== peerId || state.grant.sessionId !== data.sessionId || !state.local.has('screen')) return;
@@ -916,6 +927,9 @@ function updateButtons() {
   $('request-control').querySelector('small').textContent = state.pendingControl ? 'Request pending' : state.controlling ? 'Controlling' : 'Request control';
   $('request-control').classList.toggle('enabled', Boolean(state.controlling));
   $('request-control').title = canRequest ? 'Ask the screen owner for desktop control' : 'Select another participant’s shared desktop to request control';
+  const relayAvailable = Boolean(ready && state.rtc?.websocketRelayEnabled && state.peers.size);
+  $('retry-relay').hidden = !relayAvailable; $('retry-relay-help').hidden = !relayAvailable;
+  $('retry-relay').disabled = !relayAvailable;
 }
 
 $('mic-button').addEventListener('click', () => toggleMicrophone());
@@ -926,22 +940,35 @@ async function toggleMicrophone() {
   state.mediaPending.set(kind, operation);
   prepareListening();
   $('mic-button').disabled = true;
+  let captured = null;
   try {
     if (state.local.has(kind)) {
       const item = state.local.get(kind); state.local.delete(kind); item.stream.getTracks().forEach((track) => track.stop()); await rtc.setTrack(kind, null);
-      stopMicrophoneMonitor();
+      stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner();
     } else {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture requires a trusted HTTPS connection and browser support.');
-      const stream = await captureMicrophone(() => roomCurrent(epoch, rtc));
-      const track = stream.getTracks()[0];
+      const stream = await captureMicrophone(() => roomCurrent(epoch, rtc)); captured = stream;
+      const track = stream.getAudioTracks()[0];
       if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach((item) => item.stop()); return; }
+      if (!track || track.readyState !== 'live') throw new DOMException('The microphone did not provide a live audio track.', 'NotReadableError');
+      track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); void rtc.setTrack(kind, null).catch(() => {}); stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); } });
+      // Native permission prompts can interrupt a previously unlocked audio
+      // context. Resume the existing outputs after capture, before publishing.
+      prepareListening(); await rtc.resumePlayback?.().catch(() => {});
       state.local.set(kind, { track, stream }); await rtc.setTrack(kind, track, stream);
       if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
+      if (track.readyState !== 'live' || state.local.get(kind)?.track !== track) throw new DOMException('The microphone stopped while connecting. Turn it on again.', 'NotReadableError');
       stopMicrophoneMonitor(); state.microphoneMonitor = startMicrophoneMonitor(stream); await updatePhoneAudioRoute();
       await refreshDevices();
-      track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); state.rtc?.setTrack(kind, null); stopMicrophoneMonitor(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); } });
     }
-  } catch (error) { if (roomCurrent(epoch, rtc)) { $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; toast(`Microphone: ${microphoneError(error)}`, true, 12000); } }
+  } catch (error) {
+    captured?.getTracks().forEach(track => track.stop());
+    if (roomCurrent(epoch, rtc)) {
+      if (captured && state.local.get(kind)?.stream === captured) { state.local.delete(kind); await rtc.setTrack(kind, null).catch(() => {}); }
+      stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner();
+      $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; toast(`Microphone: ${microphoneError(error)}`, true, 12000);
+    }
+  }
   finally { if (state.mediaPending.get(kind) === operation) state.mediaPending.delete(kind); if (roomCurrent(epoch, rtc)) void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); }
 }
 async function captureMicrophone(current = () => true) {
@@ -1009,14 +1036,24 @@ async function beginSharing(epoch = state.epoch, rtc = state.rtc) {
   if (!roomCurrent(epoch, rtc)) return;
   const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 } }, audio: false });
   if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach((track) => track.stop()); return; }
-  const track = stream.getVideoTracks()[0]; track.contentHint = 'detail';
+  const track = stream.getVideoTracks()[0];
+  if (!track || track.readyState !== 'live') { stream.getTracks().forEach(item => item.stop()); throw new Error('The display did not provide a live screen. Check Screen Recording permission, then select the display again.'); }
+  track.contentHint = 'detail';
   try { await track.applyConstraints(captureConstraints()); } catch { /* Use the source's actual capture mode; diagnostics reports it. */ }
   if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
+  track.addEventListener('ended', () => { if (state.local.get('screen')?.track === track) void stopSharing(); });
+  try {
+  prepareListening(); await rtc.resumePlayback?.().catch(() => {});
   state.local.set('screen', { track, stream }); await rtc.setTrack('screen', track, stream);
   if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
+  if (track.readyState !== 'live' || state.local.get('screen')?.track !== track) throw new Error('Screen capture stopped while connecting. Select the display again.');
   state.selected = { peerId: state.selfId, kind: 'screen' };
-  track.addEventListener('ended', () => { if (state.local.get('screen')?.track === track) void stopSharing(); });
   updateButtons(); renderParticipants(); renderStage();
+  } catch (error) {
+    if (roomCurrent(epoch, rtc) && state.local.get('screen')?.stream === stream) { state.local.delete('screen'); await rtc.setTrack('screen', null).catch(() => {}); }
+    stream.getTracks().forEach(item => item.stop());
+    throw error;
+  }
 }
 async function beginPhoneSharing() {
   if (typeof MediaStreamTrackGenerator !== 'function' || typeof VideoFrame !== 'function' || typeof createImageBitmap !== 'function') throw new Error('Update Android System WebView to enable phone screen streaming, including sharing while another app is open.');
@@ -1262,7 +1299,8 @@ function releaseKeys() {
 }
 stageVideo.addEventListener('blur', releaseKeys);
 window.addEventListener('blur', () => { releaseKeys(); clearRemoteText(); });
-document.addEventListener('visibilitychange', () => { if (document.hidden) { releaseKeys(); clearRemoteText(); } });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { releaseKeys(); clearRemoteText(); } else if (state.joined) prepareListening(); });
+window.addEventListener('focus', () => { if (state.joined) prepareListening(); });
 
 // Phone software keyboards do not consistently produce physical DOM codes.
 // Convert only supported ASCII into the same narrow, session-gated key path.
@@ -1374,6 +1412,10 @@ async function refreshStats() {
       ['Audio received', Number.isFinite(measurement.receivedAudioPackets) ? `${measurement.receivedAudioPackets} packets` : null],
       ['Audio sent', Number.isFinite(measurement.sentAudioPackets) ? `${measurement.sentAudioPackets} packets` : null], ['Audio codec', measurement.audioCodec],
       ['Microphone level', Number.isFinite(measurement.microphoneLevel) ? `${Math.round(measurement.microphoneLevel * 100)}%` : null],
+      ['Microphone source', measurement.microphoneState],
+      ['Microphone processing', measurement.captureContextState], ['Audio playback processing', measurement.playbackContextState],
+      ['Captured audio', Number.isFinite(measurement.capturedAudioPackets) ? `${measurement.capturedAudioPackets} blocks` : null],
+      ['Screen capture', measurement.captureBackend], ['Capture status', measurement.captureError],
       ['Playback', state.audioElements.get(measurement.peerId)?.dataset.blocked === 'true' ? 'Tap Enable sound' : state.audioElements.get(measurement.peerId)?.srcObject ? 'Enabled' : 'No remote microphone'],
     ]) {
       const row = document.createElement('div'); row.className = 'stat-row'; const key = document.createElement('span'); key.textContent = label; const val = document.createElement('strong'); val.textContent = value ?? '—'; row.append(key, val); panel.append(row);
@@ -1381,6 +1423,19 @@ async function refreshStats() {
     $('rtc-stats').append(panel);
   }
 }
+$('retry-relay').addEventListener('click', async () => {
+  const rtc = state.rtc; const epoch = state.epoch;
+  if (!roomCurrent(epoch, rtc) || !rtc.websocketRelayEnabled) return;
+  $('retry-relay').disabled = true;
+  try {
+    if (state.grant) await revokeControl('Changing the media route. Request control again after it connects.');
+    if (state.controlling) { const { peerId, sessionId } = state.controlling; releaseKeys(); send({ type: 'signal', to: peerId, data: { controlStop: { sessionId } } }); clearControlling('Changing the media route. Request control again after it connects.'); }
+    prepareListening();
+    const count = await rtc.useSecureRelay();
+    if (roomCurrent(epoch, rtc)) { toast(count ? 'Secure relay selected. Your existing screen and microphone will reconnect.' : 'No participant needs a relay retry.'); await refreshStats(); }
+  } catch (error) { if (roomCurrent(epoch, rtc)) toast(cleanError(error), true); }
+  finally { if (roomCurrent(epoch, rtc)) $('retry-relay').disabled = !rtc.websocketRelayEnabled; }
+});
 function updateDuration() {
   const seconds = Math.floor((Date.now() - state.started) / 1000); const min = Math.floor(seconds / 60);
   $('room-duration').textContent = `${String(min).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
@@ -1423,7 +1478,7 @@ async function leaveRoom(stopHost = true) {
   if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch {} }
   try { await stoppingHost; } catch { /* Broker may already be stopped. */ }
   state.isHost = false; state.joined = false; state.joining = false; state.selfId = null; state.hostId = null; state.selected = null; state.sourceId = null; state.controlRequest = null; state.room = null;
-  state.relayPlaybackBlocked = false; state.relayCompatibilityNotified = false; $('audio-banner').hidden = true; await updatePhoneAudioRoute().catch(() => {});
+  state.relayPlaybackBlocked = false; state.relayCaptureSuspended = false; state.relayCompatibilityNotified = false; $('audio-banner').hidden = true; await updatePhoneAudioRoute().catch(() => {});
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
   $('session').hidden = true; $('lobby').hidden = false; $('room-duration').textContent = '00:00';
   $('internet-relay-note').hidden = true;

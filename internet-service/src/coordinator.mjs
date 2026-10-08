@@ -94,6 +94,68 @@ function validatedIce(supplied) {
   return iceServers.some(entry => entry.urls.some(url => /^turns?:/i.test(url))) ? iceServers : null;
 }
 
+// These are the exact hosts/transports documented by Cloudflare's credential API.
+// Its alternate port 53 is browser-blocked; accept that documented variant only
+// to remove it, never to expose it to the client. No suffix or redirect trust.
+const CLOUDFLARE_ICE_URLS = new Set(['stun:stun.cloudflare.com:3478',
+  'turn:turn.cloudflare.com:3478?transport=udp', 'turn:turn.cloudflare.com:443?transport=udp',
+  'turn:turn.cloudflare.com:3478?transport=tcp', 'turn:turn.cloudflare.com:80?transport=tcp',
+  'turns:turn.cloudflare.com:5349?transport=tcp', 'turns:turn.cloudflare.com:443?transport=tcp',
+  'turn:turn.cloudflare.com:53?transport=udp', 'turn:turn.cloudflare.com:53?transport=tcp']);
+export function validatedCloudflareIce(supplied) {
+  if (!Array.isArray(supplied) || !supplied.length || supplied.length > 12) return null;
+  const iceServers = [];
+  for (const entry of supplied) {
+    const urls = Array.isArray(entry?.urls) ? entry.urls : [entry?.urls];
+    if (!urls.length || urls.length > 8 || !urls.every(url => CLOUDFLARE_ICE_URLS.has(url))) return null;
+    const relay = urls.some(url => /^turns?:/.test(url));
+    if (!keysAre(entry, relay ? ['urls', 'username', 'credential'] : ['urls']) ||
+        (relay && (!urls.every(url => /^turns?:/.test(url)) ||
+          ![entry.username, entry.credential].every(value => typeof value === 'string' && /^[\x21-\x7e]{1,256}$/.test(value))))) return null;
+    const usable = [...new Set(urls.filter(url => !/:53\?/.test(url)))];
+    if (usable.length) iceServers.push(relay ? { urls: usable, username: entry.username, credential: entry.credential } : { urls: usable });
+  }
+  return iceServers.some(entry => entry.urls.some(url => /^turns?:/.test(url))) ? iceServers : null;
+}
+
+// A single deadline bounds fetching AND streamed body reads. The long-lived
+// token is sent only to this fixed backend endpoint, never persisted or returned.
+export async function requestCloudflareIce(fetcher, keyId, token, ttl) {
+  const controller = new AbortController(); let reader, timer;
+  const operation = (async () => {
+    const response = await fetcher(`https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`, {
+      method: 'POST', redirect: 'manual', signal: controller.signal,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ ttl }) });
+    if (response.status !== 201 || response.redirected ||
+        !/^application\/json(?:\s*;|$)/i.test(response.headers?.get('content-type') || '')) return null;
+    const declared = response.headers.get('content-length');
+    if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > 16384)) return null;
+    reader = response.body?.getReader(); if (!reader) return null;
+    const chunks = []; let bytes = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      if (!(value instanceof Uint8Array) || (bytes += value.byteLength) > 16384) return null;
+      chunks.push(value);
+    }
+    const combined = new Uint8Array(bytes); let offset = 0;
+    for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+    const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(combined));
+    if (!keysAre(body, ['iceServers'])) return null;
+    const servers = validatedCloudflareIce(body.iceServers);
+    if (servers?.some(server => server.username === token || server.credential === token)) return null;
+    return servers;
+  })();
+  const deadline = new Promise((resolve, reject) => { timer = setTimeout(() => {
+    controller.abort(); reject(new Error('The relay provider request timed out.'));
+  }, 5000); });
+  try { return await Promise.race([operation, deadline]); }
+  finally {
+    clearTimeout(timer); controller.abort();
+    try { reader?.cancel().catch(() => {}); } catch {}
+  }
+}
+
 export class Coordinator {
   constructor({ store, env = {}, now = () => Date.now(), fetcher = (input, init) => fetch(input, init), restored = [] }) {
     this.store = store; this.env = env; this.now = now; this.fetcher = fetcher;
@@ -740,20 +802,38 @@ export class Coordinator {
     const direct = reason => ({ iceServers: DIRECT_ICE.map(server => ({ ...server })), relayEnabled: false, relaySecondsLimit: 0,
       ...(reason ? { relayReason: reason } : {}) });
     if (this.env.RELAY_ENABLED !== 'true') return direct('Relay is disabled. Direct connections only.');
-    const domain = this.env.METERED_APP_DOMAIN || '';
-    const expiry = Date.parse(this.env.METERED_CREDENTIAL_EXPIRES_AT || '');
-    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.metered\.live$/.test(domain) ||
-        typeof this.env.METERED_API_KEY !== 'string' || this.env.METERED_API_KEY.length < 16 ||
-        !Number.isFinite(expiry) || expiry <= this.now() + 30000 || expiry - this.now() > 86400000) {
-      return direct('Relay needs a configured, expiring provider credential.');
+    const name = this.env.TURN_PROVIDER || 'metered';
+    const sessionSeconds = positive(this.env.RELAY_SESSION_SECONDS, 600, 1800);
+    let domain, expiry, provider, validate = validatedIce;
+    if (name === 'cloudflare') {
+      // This is an operator assertion, not a spending cap. Credential issuance
+      // counters cannot bound external TURN traffic or account-wide billing.
+      if (this.env.CLOUDFLARE_TURN_FREE_ONLY_CONFIRMED !== 'true') return direct('Cloudflare TURN awaits verified free-only account controls.');
+      const keyId = this.env.CLOUDFLARE_TURN_KEY_ID, token = this.env.CLOUDFLARE_TURN_API_TOKEN;
+      if (typeof keyId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(keyId) ||
+          typeof token !== 'string' || !/^[\x21-\x7e]{16,2048}$/.test(token)) return direct('Cloudflare TURN needs backend credentials.');
+      expiry = this.now() + sessionSeconds * 1000;
+      provider = await digest(JSON.stringify(['cloudflare', keyId, token, sessionSeconds]));
+      validate = validatedCloudflareIce;
+    } else if (name === 'metered') {
+      domain = this.env.METERED_APP_DOMAIN || '';
+      expiry = Date.parse(this.env.METERED_CREDENTIAL_EXPIRES_AT || '');
+      if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.metered\.live$/.test(domain) ||
+          typeof this.env.METERED_API_KEY !== 'string' || this.env.METERED_API_KEY.length < 16 ||
+          !Number.isFinite(expiry) || expiry <= this.now() + 30000 || expiry - this.now() > 86400000) {
+        return direct('Relay needs a configured, expiring provider credential.');
+      }
+      provider = await digest(JSON.stringify([domain, this.env.METERED_API_KEY, expiry]));
+    } else {
+      return direct('The configured TURN provider is unsupported.');
     }
-    const provider = await digest(JSON.stringify([domain, this.env.METERED_API_KEY, expiry]));
     if (this.rooms.get(room.id) !== room) return direct('The room ended.');
+    if (room.relayDeadline && room.relayDeadline <= this.now()) return direct('The room relay deadline expired.');
     const cached = this.iceCache.get(room.id);
     if (cached && cached.provider === provider && cached.config.relayExpiresAt === room.relayDeadline && room.relayDeadline > this.now()) {
       return { ...cached.config, relaySecondsLimit: Math.max(0, Math.floor((room.relayDeadline - this.now()) / 1000)) };
     }
-    const restored = await this.readIceCache(room, provider, expiry);
+    const restored = await this.readIceCache(room, provider, expiry, validate);
     if (restored) {
       this.iceCache.set(room.id, { provider, config: restored });
       return { ...restored, relaySecondsLimit: Math.max(0, Math.floor((room.relayDeadline - this.now()) / 1000)) };
@@ -770,29 +850,35 @@ export class Coordinator {
     // Reserve before network I/O. Failed provider requests still count, preventing retry abuse.
     budget.daily++; budget.monthly++; this.store.saveBudget(budget);
     try {
-      const url = new URL(`https://${domain}/api/v1/turn/credentials`);
-      url.searchParams.set('apiKey', this.env.METERED_API_KEY);
-      const response = await this.fetcher(url.href, { signal: AbortSignal.timeout(5000), redirect: 'manual', headers: { Accept: 'application/json' } });
-      if (!response.ok) return direct('The relay provider is unavailable.');
-      const reader = response.body?.getReader(); if (!reader) return direct('The relay provider returned an invalid configuration.');
-      const chunks = []; let bytes = 0;
-      for (;;) {
-        const { done, value } = await reader.read(); if (done) break;
-        bytes += value.byteLength;
-        if (bytes > 16384) { await reader.cancel(); return direct('The relay provider returned an invalid configuration.'); }
-        chunks.push(value);
+      let iceServers;
+      if (name === 'cloudflare') {
+        iceServers = await requestCloudflareIce(this.fetcher, this.env.CLOUDFLARE_TURN_KEY_ID,
+          this.env.CLOUDFLARE_TURN_API_TOKEN, sessionSeconds);
+        if (this.env.RELAY_ENABLED !== 'true' || this.env.CLOUDFLARE_TURN_FREE_ONLY_CONFIRMED !== 'true' ||
+            this.env.TURN_PROVIDER !== 'cloudflare') return direct('Cloudflare TURN was disabled.');
+      } else {
+        const url = new URL(`https://${domain}/api/v1/turn/credentials`);
+        url.searchParams.set('apiKey', this.env.METERED_API_KEY);
+        const response = await this.fetcher(url.href, { signal: AbortSignal.timeout(5000), redirect: 'manual', headers: { Accept: 'application/json' } });
+        if (!response.ok) return direct('The relay provider is unavailable.');
+        const reader = response.body?.getReader(); if (!reader) return direct('The relay provider returned an invalid configuration.');
+        const chunks = []; let bytes = 0;
+        for (;;) {
+          const { done, value } = await reader.read(); if (done) break;
+          bytes += value.byteLength;
+          if (bytes > 16384) { await reader.cancel(); return direct('The relay provider returned an invalid configuration.'); }
+          chunks.push(value);
+        }
+        const combined = new Uint8Array(bytes); let offset = 0;
+        for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
+        iceServers = validatedIce(JSON.parse(new TextDecoder().decode(combined)));
       }
-      const combined = new Uint8Array(bytes); let offset = 0;
-      for (const chunk of chunks) { combined.set(chunk, offset); offset += chunk.byteLength; }
-      const body = new TextDecoder().decode(combined);
-      const supplied = JSON.parse(body);
-      const iceServers = validatedIce(supplied);
       if (!iceServers) return direct('The relay provider returned no usable relay.');
       if (this.rooms.get(room.id) !== room || expiry <= this.now() + 1000 || (room.relayDeadline && room.relayDeadline <= this.now())) {
         return direct('The room or relay credential expired.');
       }
-      const seconds = Math.min(positive(this.env.RELAY_SESSION_SECONDS, 600, 1800), Math.floor((expiry - this.now()) / 1000));
-      const deadline = this.now() + seconds * 1000;
+      const seconds = Math.min(sessionSeconds, Math.floor((expiry - this.now()) / 1000));
+      const deadline = Math.min(this.now() + seconds * 1000, Number.isFinite(room.expiresAt) ? room.expiresAt : Infinity);
       room.relayDeadline = Math.min(room.relayDeadline || deadline, deadline); this.store.saveRoom(room);
       const config = { iceServers, relayEnabled: true, relaySecondsLimit: Math.max(0, Math.floor((room.relayDeadline - this.now()) / 1000)),
         relayExpiresAt: room.relayDeadline };
@@ -814,7 +900,7 @@ export class Coordinator {
       additionalData: encoder.encode(`${room.id}:${provider}`) }, key, encoder.encode(JSON.stringify(config)));
     return { version: 1, provider, iv: encodeBytes(iv), cipher: encodeBytes(new Uint8Array(cipher)), expiresAt: config.relayExpiresAt };
   }
-  async readIceCache(room, provider, providerExpiry) {
+  async readIceCache(room, provider, providerExpiry, validate = validatedIce) {
     const cache = room.iceCache;
     if (!cache || cache.version !== 1 || cache.provider !== provider || cache.expiresAt !== room.relayDeadline ||
         !Number.isFinite(cache.expiresAt) || cache.expiresAt <= this.now() || cache.expiresAt > providerExpiry) return null;
@@ -824,7 +910,7 @@ export class Coordinator {
       const clear = await crypto.subtle.decrypt({ name: 'AES-GCM', iv,
         additionalData: encoder.encode(`${room.id}:${provider}`) }, await this.cacheKey(), cipher);
       const config = JSON.parse(new TextDecoder().decode(clear));
-      const iceServers = validatedIce(config.iceServers);
+      const iceServers = validate(config.iceServers);
       if (!iceServers || config.relayEnabled !== true || config.relayExpiresAt !== cache.expiresAt) return null;
       return { ...config, iceServers };
     } catch { return null; }

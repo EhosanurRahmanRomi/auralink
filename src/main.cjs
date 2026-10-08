@@ -15,6 +15,7 @@ let win, broker, adapter, gate, selectedSource, currentSource;
 let grantGeneration=0;
 let roomOperation=0, sourceOperation=0;
 let internetService = null, internetClient = null, roomContext = 'nearby';
+let microphonePermissionRequest = null;
 const pins = new Map();
 const sources = new Map();
 const localPage = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
@@ -63,10 +64,17 @@ async function requestMedia(type) {
   if (type !== 'microphone') throw new Error('Only microphone permission is supported.');
   let status=permissionStatus(type);
   if (process.platform === 'darwin' && status === 'not-determined') {
-    const granted=await systemPreferences.askForMediaAccess(type);
-    status=granted ? 'granted' : permissionStatus(type);
+    // Native IPC preflight and Chromium's media request can overlap. Share one
+    // TCC prompt, and never reinterpret an explicit refusal as permission when
+    // macOS has not yet updated its cached access status.
+    if (!microphonePermissionRequest) {
+      microphonePermissionRequest = Promise.resolve().then(() => systemPreferences.askForMediaAccess(type));
+      microphonePermissionRequest.finally(() => { microphonePermissionRequest = null; }).catch(() => {});
+    }
+    const granted=await microphonePermissionRequest;
+    status=granted ? 'granted' : 'denied';
   }
-  const ok=!['denied','restricted'].includes(status);
+  const ok=process.platform === 'darwin' ? status === 'granted' : !['denied','restricted'].includes(status);
   return {ok,status,reason:ok ? null : `Allow Auralink ${type} access in ${process.platform === 'darwin' ? 'System Settings → Privacy & Security' : 'Windows Settings → Privacy & security'}. Restart Auralink after changing access.`};
 }
 const settingsLinks = {
@@ -163,6 +171,7 @@ app.whenReady().then(async () => {
       const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:0,height:0}});
       const source = available.find(s=>s.id===chosen.id);
       if (!source || captureGeneration !== grantGeneration || captureRoom !== roomOperation || captureContext !== roomContext ||
+          (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') ||
           (captureContext === 'internet' && !internetClient?.membership.roomId)) return callback({});
       currentSource = source;
       callback({video:source});
@@ -239,6 +248,8 @@ app.whenReady().then(async () => {
   handle('pending-invitation', () => { const code = pendingInvitation; pendingInvitation = null; return code; });
   handle('sources', async () => {
     const operation=roomOperation, request=++sourceOperation;
+    // A failed refresh must not leave an older chooser authorization usable.
+    sources.clear(); selectedSource=null;
     const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:320,height:180},fetchWindowIcons:false});
     if(operation !== roomOperation || request !== sourceOperation) throw new Error('Screen selection was canceled.');
     if (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') {

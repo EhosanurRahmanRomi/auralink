@@ -16,7 +16,7 @@ Auralink is an open-source screen-sharing and attended remote-control app. The c
 
 The room flow is **Open a room → copy its invitation → join from the other device**. Invitation holders enter automatically while invitations are open. Screen capture and remote control remain separate, deliberate actions.
 
-**0.4.0 is a testing revision.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). Earlier 0.3 builds use private-group setup and lack the new one-click flow. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
+**0.4.1 repairs screen and microphone recovery.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). Both desktops must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
 
 ## Download and connect
 
@@ -34,6 +34,8 @@ Releases include checksums, source and a report describing the exact build and c
 3. Select **Share screen** and choose a display/window. Microphone audio is optional and starts off; use **Check sound** before enabling it.
 4. For remote help, view the other person's full-display share and **Request control**. The screen owner separately approves it. macOS also requires Accessibility permission.
 5. Stop with **Stop control**, **Stop sharing** or **Leave room**. Emergency stop: **Ctrl+Alt+Shift+Q** on Windows; **Command+Option+Shift+Q** on Mac.
+
+If a participant joins but screen or audio does not arrive, open **Connection → Retry through secure relay**. This reconnects the existing capture using the free fallback; control must be approved again. **Check sound** verifies your local microphone and speaker, while Connection details show actual packet counts and processing state. Use **Enable sound** when audio processing is paused after a native permission prompt.
 
 Hosts can remove participants, lock invitations and create new invitations. **Remove & close invite** removes that connection and invalidates the old code. A fresh anonymous app cannot be permanently identified as the same person; share new invitations only with people you trust.
 
@@ -55,9 +57,9 @@ These captures show the bundled interface. Validation identifies actual-app and 
 - Invitation rooms for up to four people, host removal, invitation closure/rotation and separate control consent.
 - Direct encrypted WebRTC plus bounded encrypted WebSocket fallback when enabled by the service.
 
-Two actual Electron apps on one Windows PC exchanged a **2560×1440 H.264 screen at 26–27 measured fps**, one presenter at a time in both directions, through the deployed relay with direct RTC deliberately blocked. This establishes that specific synthetic test, not physical Mac capture/control or a different-network result. **1440p/30 fps remains a ceiling, not a guarantee**; hardware, codecs, bandwidth and motion affect quality. Basic JPEG fallback is a limited compatibility mode. See [validation](VALIDATION.md).
+Two actual Electron apps on one Windows PC exchanged a **2560×1440 H.264 screen above 15 measured fps**, one presenter at a time in both directions, through the deployed relay with direct RTC deliberately blocked. The same test decoded microphone tones in both directions and after microphone restart. The release report records each measured result. These synthetic tests do not establish physical Mac capture/control or a different-network result. **1440p/30 fps remains a ceiling, not a guarantee**; hardware, codecs, bandwidth and motion affect quality. Basic JPEG fallback is a limited compatibility mode. See [validation](VALIDATION.md).
 
-Different networks can block direct media while both apps appear online. Coordination makes rooms reachable; relay supplies an alternate media path. Free infrastructure has finite room, byte and message budgets, rather than unlimited hosting or full decentralization. TURN is optional and disabled until provider-enforced free quota and credential expiry are verified. See [service setup](internet-service/README.md).
+Different networks can block direct media while both apps appear online. Coordination makes rooms reachable; relay supplies an alternate media path. The default service stays on Cloudflare Workers Free, with finite room, byte and message budgets and no active Metered integration. A separate Cloudflare Realtime TURN adapter remains disabled until actual account controls are verified: its advertised 1,000 GB allowance does not automatically prevent overage charges. See [service setup](internet-service/README.md).
 
 The coordinator distributes relay keys, so encrypted WebSocket transport assumes a trusted coordinator. Microphone audio does not include system playback. ASCII/host keyboard-layout limits apply. Arbitrary Unicode/IME, Windows UAC/secure desktops, locked screens and protected OS surfaces remain outside control support.
 

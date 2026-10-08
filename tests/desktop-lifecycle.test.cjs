@@ -18,7 +18,7 @@ async function fixture(options = {}) {
   const app = new EventEmitter(); app.setName = () => {}; app.whenReady = () => Promise.resolve(); app.getVersion = () => '0.3.0';
   const session = { defaultSession: { setCertificateVerifyProc() {}, setPermissionRequestHandler(handler) { permissionRequest = handler; }, setPermissionCheckHandler(handler) { permissionCheck = handler; }, setDisplayMediaRequestHandler(handler) { displayRequest = handler; } } };
   const electron = { app, BrowserWindow: Window, ipcMain: { handle(name, handler) { handlers.set(name, handler); } }, session,
-    desktopCapturer: { getSources: options.sources || (async () => []) }, screen: displayEvents, dialog: {}, globalShortcut: { register() {}, unregisterAll() {} }, clipboard: {}, systemPreferences: { getMediaAccessStatus: () => 'granted' }, shell: {} };
+    desktopCapturer: { getSources: options.sources || (async () => []) }, screen: displayEvents, dialog: {}, globalShortcut: { register() {}, unregisterAll() {} }, clipboard: {}, systemPreferences: { getMediaAccessStatus: () => 'granted', ...options.systemPreferences }, shell: {} };
   class Gate { async revoke() { revocations++; } }
   const mainFile = path.resolve(__dirname, '../src/main.cjs');
   const dependencies = {
@@ -29,7 +29,7 @@ async function fixture(options = {}) {
     './core/internet-client.cjs': {},
     './core/app-invitation.cjs': require('../src/core/app-invitation.cjs'),
   };
-  vm.runInNewContext(fs.readFileSync(mainFile, 'utf8'), { require: name => Object.hasOwn(dependencies, name) ? dependencies[name] : require(name), __dirname: path.dirname(mainFile), process, URL, Map, Set, Date, String, Number, Boolean }, { filename: mainFile });
+  vm.runInNewContext(fs.readFileSync(mainFile, 'utf8'), { require: name => Object.hasOwn(dependencies, name) ? dependencies[name] : require(name), __dirname: path.dirname(mainFile), process: { ...process, platform: options.platform || process.platform }, URL, Map, Set, Date, String, Number, Boolean }, { filename: mainFile });
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(window, 'Production native IPC registered');
   return {
@@ -114,4 +114,46 @@ test('legacy empty-device screen permission needs a selected source and cannot a
   await native.invoke('choose-screen',source.id);
   native.displayEvents.emit('display-removed',{},{});
   assert.equal(await native.permission([]),false,'Display changes invalidate that selection');
+});
+
+test('Mac microphone refusal remains denied even before TCC updates its cached status', async () => {
+  let prompts=0;
+  const native=await fixture({platform:'darwin',systemPreferences:{getMediaAccessStatus:()=> 'not-determined',askForMediaAccess:async type=>{assert.equal(type,'microphone');prompts++;return false;}}});
+  const result=await native.invoke('request-media','microphone');
+  assert.equal(result.ok,false);assert.equal(result.status,'denied');assert.match(result.reason,/System Settings/);
+  assert.equal(await native.permission(['audio']),false);
+  assert.equal(prompts,2);
+});
+
+test('Mac overlapping microphone requests share one prompt and preserve its native decision', async () => {
+  const pending=defer();let prompts=0;
+  const native=await fixture({platform:'darwin',systemPreferences:{getMediaAccessStatus:()=> 'not-determined',askForMediaAccess:()=>{prompts++;return pending.promise;}}});
+  const first=native.invoke('request-media','microphone');const browser=native.permission(['audio']);
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(prompts,1);
+  pending.resolve(true);assert.equal((await first).ok,true);assert.equal(await browser,true);
+});
+
+test('Mac denied, restricted and unknown microphone access cannot report ready to capture', async () => {
+  for(const status of ['denied','restricted','unknown']) {
+    const native=await fixture({platform:'darwin',systemPreferences:{getMediaAccessStatus:()=>status,askForMediaAccess:()=>{throw new Error('Must not prompt');}}});
+    assert.equal((await native.invoke('request-media','microphone')).ok,false);
+    assert.equal(await native.permission(['audio']),false);
+  }
+});
+
+test('Mac screen permission revoked after selection cannot authorize native display capture', async () => {
+  let status='granted';const source={id:'screen:1',name:'Display',display_id:'1',thumbnail:{toDataURL:()=>''}};
+  const native=await fixture({platform:'darwin',sources:async()=>[source],systemPreferences:{getMediaAccessStatus:()=>status}});
+  await native.invoke('sources');await native.invoke('choose-screen',source.id);
+  status='denied';assert.equal((await native.capture()).video,undefined);
+  assert.equal(await native.permission([]),false,'Refused display selection is consumed');
+});
+
+test('a failed source refresh invalidates the earlier chooser selection', async () => {
+  const source={id:'screen:1',name:'Display',display_id:'1',thumbnail:{toDataURL:()=>''}};let calls=0;
+  const native=await fixture({sources:async()=>{if(++calls===1)return[source];throw new Error('Native enumeration refused');}});
+  await native.invoke('sources');await native.invoke('choose-screen',source.id);
+  await assert.rejects(native.invoke('sources'),/enumeration refused/);
+  assert.equal(await native.permission([]),false);
+  await assert.rejects(native.invoke('choose-screen',source.id),/available screen/);
 });

@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.4.0 — Desktop screen assistance (in development)
+## 0.4.1 — Screen and microphone recovery
+
+- Kept relay media-state messages reliable under video/audio load, so a receiver does not remain unaware of an enabled screen or microphone.
+- Published relay tracks independently from stalled or failed direct senders, with peer-specific recovery and an explicit **Retry through secure relay** action.
+- Added bounded screen-reader recovery, microphone track validation/cleanup, audio processing resumption after native prompts, and source/context/packet diagnostics.
+- Corrected macOS microphone refusal handling, shared overlapping permission prompts, invalidated stale screen selections, and rechecked Screen Recording access before capture.
+- Added regression cases for media queue saturation, capture backend failures, stopped microphone tracks during connection setup, and actual signed Mac microphone entitlements.
+- Added a guarded backend Cloudflare TURN adapter. It remains disabled unless an operator verifies free-only account controls; it does not itself create a spending cap. The shipped default retains finite Cloudflare Workers Free relay allowances and contacts no Metered service.
+
+## 0.4.0 — Desktop screen assistance
 
 - Focused Windows↔macOS delivery on screen sharing, optional microphone audio and attended input. Removed camera controls, capture and device preferences; Android delivery is deferred while its source changes remain.
 - Added one-click invitation rooms with automatic entry, host removal and invitation closure/rotation. Screen capture and native control remain independently consented.

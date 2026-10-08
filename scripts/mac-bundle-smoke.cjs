@@ -22,6 +22,13 @@ function command(file,args,input) {
   return result.stdout.trim();
 }
 function plistJSON(value) { return JSON.parse(command('plutil',['-convert','json','-o','-','-'],value)); }
+function signedEntitlements(bundle) {
+  const result=spawnSync('codesign',['--display','--entitlements','-',bundle],{encoding:'utf8',timeout:120000});
+  if(result.error || result.status!==0) throw new Error(`Read signed bundle entitlements failed: ${result.error?.message || result.stderr}`);
+  const xml=`${result.stdout}\n${result.stderr}`.match(/<\?xml[\s\S]*<\/plist>/)?.[0];
+  assert.ok(xml,'Signed bundle must expose its actual entitlements');
+  return plistJSON(xml);
+}
 function hash(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
 function health(origin) {
   return new Promise((resolve,reject)=>{
@@ -60,6 +67,15 @@ async function main() {
     assert.ok(metadata.CFBundleURLTypes?.some(item => item.CFBundleURLSchemes?.includes('auralink')), 'Installed room links must register the auralink scheme');
     command('lipo',[binary,'-verify_arch','arm64']);command('lipo',[helper,'-verify_arch','arm64']);
     command('codesign',['--verify','--deep','--strict',appBundle]);
+    // The capture/audio service can run in the generic Electron helper. Check
+    // both actual signatures, rather than only the intended build plist.
+    const microphoneEntitlements=[appBundle,path.join(appBundle,'Contents','Frameworks','Auralink Helper.app')].map(bundle=>{
+      assert.ok(fs.existsSync(bundle),'The signed audio service helper must be bundled');
+      const entitlements=signedEntitlements(bundle);
+      assert.equal(entitlements['com.apple.security.device.audio-input'],true,'Signed app and audio helper must permit microphone input under hardened runtime');
+      assert.equal(entitlements['com.apple.security.device.camera'],undefined,'Screen-only app must not carry a camera entitlement');
+      return {bundle:path.basename(bundle),audioInput:true,camera:false};
+    });
     const selfTest=JSON.parse(command(helper,['--self-test']));
     assert.equal(selfTest.passed,true);assert.equal(selfTest.inputPosted,false);
     assert.ok(selfTest.clickTrackingChecks>=25);assert.ok(selfTest.quartzClickFieldChecks>=22);
@@ -101,9 +117,9 @@ async function main() {
     await assert.rejects(health(room.url));
     assert.deepEqual(errors,[]);
     const results={passed:true,version:pkg.version,architecture:'arm64',dmg:path.basename(dmg),sha256:hash(fs.readFileSync(dmg)),
-      checks:['DMG integrity and mounted application','arm64 app and unpacked input helper','bundle usage descriptions','deep strict code signature verification',
+      checks:['DMG integrity and mounted application','arm64 app and unpacked input helper','bundle usage descriptions','deep strict code signature verification','signed app and audio helper microphone entitlements',
         'packaged source hashes match','safe native helper self-test','actual packaged Electron renderer launch','cold argument and warm open-url invitation delivery without navigation','pinned local HTTPS room starts and stops'],
-      permissions:info.permissions,helperSelfTest:selfTest,sourceParity,signing:'ad-hoc testing build; no Developer ID or notarization',
+      permissions:info.permissions,microphoneEntitlements,helperSelfTest:selfTest,sourceParity,signing:'ad-hoc testing build; no Developer ID or notarization',
       physicalDeviceTesting:'Not performed by this check. Microphone, screen capture, browser-to-LaunchServices room links and attended input require Mac owner permission and real-device testing.'};
     fs.writeFileSync(path.join(evidence,'mac-bundle-smoke.json'),JSON.stringify(results,null,2));
     console.log('Mac DMG verified: actual arm64 bundle, renderer, native helper, source and local TLS room. No hardware permission or remote input was requested.');

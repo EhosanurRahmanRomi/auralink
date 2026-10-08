@@ -85,6 +85,19 @@ async function main() {
     for (const context of contexts) await context.addInitScript(() => {
       window.qaCaptureCalls = []; const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
       navigator.mediaDevices.getUserMedia = async constraints => { qaCaptureCalls.push(constraints); return getUserMedia(constraints); };
+      window.qaEndNextAudioDuringReplacement = false; window.qaEndedAudioTrack = null;
+      const replaceTrack = RTCRtpSender.prototype.replaceTrack;
+      RTCRtpSender.prototype.replaceTrack = async function (track) {
+        if (qaEndNextAudioDuringReplacement && track?.kind === 'audio') {
+          qaEndNextAudioDuringReplacement = false;
+          await replaceTrack.call(this, track);
+          // stop() deliberately does not emit ended; dispatch the event that
+          // a hardware disconnect/privacy revocation sends during an await.
+          qaEndedAudioTrack = track; track.stop(); track.dispatchEvent(new Event('ended'));
+          await new Promise(resolve => setTimeout(resolve, 120)); return;
+        }
+        return replaceTrack.call(this, track);
+      };
     });
     await desktop.addInitScript(() => localStorage.setItem('auralink.preferences', JSON.stringify({ microphone: 'missing-previous-microphone' })));
     await mobile.addInitScript(() => {
@@ -121,6 +134,11 @@ async function main() {
     }
     phase = 'off and restart'; await a.locator('#mic-button').click(); await a.waitForFunction(() => document.getElementById('mic-level').value === 0);
     await b.waitForFunction(() => ![...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject));
+    phase = 'device ends while source is being attached';
+    await a.evaluate(() => { qaEndNextAudioDuringReplacement = true; }); await a.locator('#mic-button').click();
+    await a.waitForFunction(() => qaEndedAudioTrack?.readyState === 'ended' && !document.getElementById('mic-button').disabled && document.getElementById('mic-button').getAttribute('aria-label') === 'Turn microphone on' && document.getElementById('mic-level').value === 0 && !document.getElementById('voice-status').classList.contains('active'));
+    await b.waitForFunction(() => ![...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject));
+    const endedDuringAttachment = await a.evaluate(() => ({ readyState: qaEndedAudioTrack.readyState, microphoneOn: document.getElementById('mic-button').getAttribute('aria-label') === 'Turn microphone off', meter: document.getElementById('mic-level').value }));
     await a.locator('#mic-button').click(); await a.waitForFunction(() => document.getElementById('mic-button').getAttribute('aria-label') === 'Turn microphone off');
     const restarted = await proof(b); assert.ok(restarted.decodedMeanSquareEnergy > .000001);
     phase = 'sound test UI'; await b.locator('#audio-check-open').click();
@@ -136,8 +154,8 @@ async function main() {
     assert.deepEqual(errors, []);
     const result = { passed: true, environment: 'Installed Chromium browser; localhost HTTPS broker; two real renderer clients; synthetic48kHz microphone WAV; simulated persistent autoplay rejection on mobile viewport',
       verified: ['no microphone on join', 'one safe system-default retry for stale microphone', 'input meters detect audio', 'persistent replay failure keeps Enable sound visible', 'explicit Enable sound recovery',
-        'non-zero decoded audio energy in both directions', 'actual Opus and received packet diagnostics', 'mic off removes received stream', 'mic restart restores decoded sound', 'active microphone test reuses capture', 'speaker tone completes', 'leave releases audio', 'no horizontal overflow or JavaScript errors'],
-      limitations: ['No physical microphone/speaker, Android WebView audio hardware or internet path tested'], audio, restarted, errors };
+        'non-zero decoded audio energy in both directions', 'actual Opus and received packet diagnostics', 'mic off removes received stream', 'microphone ended during sender attachment leaves mic off and no remote stream', 'mic restart restores decoded sound', 'active microphone test reuses capture', 'speaker tone completes', 'leave releases audio', 'no horizontal overflow or JavaScript errors'],
+      limitations: ['No physical microphone/speaker, Android WebView audio hardware or internet path tested', 'Capture disconnection is an injected lifecycle event on an actual synthetic input track'], audio, endedDuringAttachment, restarted, errors };
     fs.writeFileSync(path.join(output, 'audio-browser.json'), JSON.stringify(result, null, 2)); console.log(JSON.stringify(result, null, 2));
   } catch (error) { throw new Error(`${phase}: ${error.stack}`); }
   finally { for (const context of contexts) await context.close().catch(() => {}); await browser?.close(); owner?.ws.terminate(); await broker?.stop(); }

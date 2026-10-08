@@ -323,3 +323,158 @@ test('a stalled encoder downgrades hardware then retires the stalled default cod
     media.sources.delete('screen');
   } finally { media?.close(); global.VideoEncoder = oldEncoder; global.VideoDecoder = oldDecoder; global.VideoFrame = oldFrame; Object.defineProperty(global, 'performance', oldPerformance); }
 });
+
+test('microphone/screen state survives a full audio queue and metadata pressure keeps only the latest deferred snapshot', async () => {
+  const { RelayMedia, RelayCipher } = await ready;
+  const transport = rtc(), key = randomBytes(32).toString('base64url'), media = new RelayMedia(transport, key);
+  const peer = media.addPeer('guest'); peer.active = true;
+  for (let index = 0; index < 3; index++) assert.equal(media.send('guest', { type: 'audio', sampleRate: 24000 }, new Uint8Array(20)), true);
+  assert.equal(media.send('guest', { type: 'state', mediaState: { audio: true, screen: true } }), true, 'Capture start cannot be dropped behind PCM');
+  for (let index = 1; index < 8; index++) assert.equal(media.send('guest', { type: 'keyframe' }), true);
+  assert.equal(media.send('guest', { type: 'state', mediaState: { audio: false, screen: true } }), true);
+  assert.equal(media.send('guest', { type: 'state', mediaState: { audio: true, screen: false } }), true);
+  assert.equal(peer.pendingMetadata, 8); assert.deepEqual(peer.deferredState.mediaState, { audio: true, screen: false });
+  while (peer.pendingMetadata || peer.pending || peer.deferredState) await peer.sendQueue;
+  const receiver = new RelayCipher(key, 'guest', 'owner'), packets = [];
+  for (const item of transport.calls) {
+    const plain = await receiver.open(item.data.relay); const length = new DataView(plain.buffer, plain.byteOffset, plain.byteLength).getUint16(0);
+    packets.push(JSON.parse(new TextDecoder().decode(plain.slice(2, length + 2))));
+  }
+  assert.deepEqual(packets.filter(item => item.type === 'state').map(item => item.mediaState), [{ audio: true, screen: true }, { audio: true, screen: false }]);
+  assert.equal(peer.sentAudioPackets, 3); assert.equal(peer.pendingMetadata, 0); receiver.close(); media.close();
+});
+
+test('a failing native screen reader switches to image capture without stopping the real source and releases every frame', async () => {
+  const { RelayMedia } = await ready;
+  const original = { processor: global.MediaStreamTrackProcessor, image: global.ImageCapture, set: global.setInterval, clear: global.clearInterval };
+  const timers = new Map(), clones = [], events = [], frames = []; let rejectRead, canceled = false, sequence = 0;
+  global.setInterval = callback => { const id = ++sequence; timers.set(id, callback); return id; }; global.clearInterval = id => timers.delete(id);
+  global.MediaStreamTrackProcessor = class { constructor() { this.readable = { getReader: () => ({ read: () => new Promise((resolve, reject) => { rejectRead = reject; }), cancel: async () => { canceled = true; } }) }; } };
+  global.ImageCapture = class { async grabFrame() { const frame = { width: 1920, height: 1080, closed: false, close() { this.closed = true; } }; frames.push(frame); return frame; } };
+  const transport = rtc(); transport.emit = (type, detail) => events.push({ type, detail });
+  const media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
+  const track = { enabled: true, stopped: false, stop() { this.stopped = true; }, clone() { const clone = { stopped: false, stop() { this.stopped = true; } }; clones.push(clone); return clone; } };
+  transport.localTracks.set('screen', { track }); let encoded = 0; media.encodeVideo = async () => { encoded++; };
+  try {
+    await media.syncSource('screen'); rejectRead(new Error('Native reader failed')); await new Promise(resolve => setImmediate(resolve));
+    const source = media.sources.get('screen'); assert.equal(source.captureBackend, 'Image capture'); assert.equal(canceled, true); assert.equal(clones[0].stopped, true);
+    await timers.get(source.timer)(); assert.equal(encoded, 1); assert.equal(frames[0].closed, true); assert.equal(track.stopped, false);
+    assert.ok(events.some(event => event.type === 'relay-capture' && event.detail.recovered === true));
+    media.close(); assert.equal(clones[1].stopped, true); assert.equal(timers.size, 0);
+  } finally { media.close(); global.MediaStreamTrackProcessor = original.processor; global.ImageCapture = original.image; global.setInterval = original.set; global.clearInterval = original.clear; }
+});
+
+test('compressed packets resume after an established reader fails and a same-resolution fallback replaces its encoder', async () => {
+  const { RelayMedia, RelayCipher, validEncodedVideo } = await ready;
+  const original = { processor: global.MediaStreamTrackProcessor, image: global.ImageCapture, encoder: global.VideoEncoder,
+    decoder: global.VideoDecoder, frame: global.VideoFrame, canvas: global.OffscreenCanvas, set: global.setInterval, clear: global.clearInterval };
+  const timers = new Map(), encoders = [], clones = [], capturedFrames = []; let sequence = 0, resolveRead, rejectRead;
+  global.setInterval = callback => { const id = ++sequence; timers.set(id, callback); return id; }; global.clearInterval = id => timers.delete(id);
+  global.MediaStreamTrackProcessor = class { constructor() { this.readable = { getReader: () => ({
+    read: () => new Promise((resolve, reject) => { resolveRead = resolve; rejectRead = reject; }), cancel: async () => {} }) }; } };
+  global.ImageCapture = class { async grabFrame() {
+    const frame = { width: 1920, height: 1080, closed: false, close() { this.closed = true; } }; capturedFrames.push(frame); return frame;
+  } };
+  global.VideoFrame = class {
+    constructor(frame, { timestamp = 0 } = {}) { this.displayWidth = frame.displayWidth || frame.width; this.displayHeight = frame.displayHeight || frame.height; this.timestamp = timestamp; this.closed = false; }
+    close() { this.closed = true; }
+  };
+  global.OffscreenCanvas = class { constructor(width, height) { this.width = width; this.height = height; } getContext() { return { drawImage() {} }; } };
+  global.VideoDecoder = class { static async isConfigSupported(config) { return { supported: config.codec === 'vp8', config }; } };
+  global.VideoEncoder = class {
+    static async isConfigSupported(config) { return { supported: config.codec === 'vp8', config }; }
+    constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; this.encodeQueueSize = 0; encoders.push(this); }
+    configure(config) { this.config = config; this.state = 'configured'; }
+    encode(frame, { keyFrame }) {
+      const bytes = vp8(this.config.width, this.config.height);
+      this.callbacks.output({ byteLength: bytes.length, type: keyFrame ? 'key' : 'delta', timestamp: frame.timestamp, copyTo: target => target.set(bytes) });
+    }
+    close() { this.state = 'closed'; }
+  };
+  const transport = rtc(), key = randomBytes(32).toString('base64url'), media = new RelayMedia(transport, key);
+  const peer = media.addPeer('guest'); peer.active = true; peer.videoCodecs = ['vp8'];
+  const track = { enabled: true, stopped: false, stop() { this.stopped = true; }, clone() { const clone = { stopped: false, stop() { this.stopped = true; } }; clones.push(clone); return clone; } };
+  transport.localTracks.set('screen', { track }); const settle = () => new Promise(resolve => setImmediate(resolve));
+  const receiver = new RelayCipher(key, 'guest', 'owner');
+  try {
+    await media.capabilities; await media.syncSource('screen');
+    const first = new global.VideoFrame({ width: 1920, height: 1080 }); resolveRead({ done: false, value: first }); await settle(); await peer.sendQueue;
+    assert.equal(transport.calls.length, 1, 'The original reader must emit an encrypted compressed frame before failing');
+    assert.equal(encoders[0].state, 'configured'); assert.equal(first.closed, true);
+    rejectRead(new Error('Native reader failed after successful streaming')); await settle();
+    const source = media.sources.get('screen'); assert.equal(source.captureBackend, 'Image capture');
+    assert.equal(encoders[0].state, 'closed', 'Recovery retires callbacks tied to the old reader generation');
+    assert.equal(source.encoder, null); assert.equal(clones[0].stopped, true);
+    await timers.get(source.timer)(); await peer.sendQueue;
+    assert.equal(transport.calls.length, 2, 'The same-resolution fallback must forward a newly encoded packet');
+    assert.equal(encoders.length, 2); assert.equal(encoders[1].state, 'configured');
+    const headers = [];
+    for (const call of transport.calls) {
+      const plain = await receiver.open(call.data.relay); assert.ok(plain);
+      const length = new DataView(plain.buffer, plain.byteOffset, plain.byteLength).getUint16(0);
+      const header = JSON.parse(new TextDecoder().decode(plain.slice(2, length + 2))); headers.push(header);
+      assert.equal(header.type, 'video-chunk'); assert.equal(header.codec, 'vp8'); assert.equal(header.chunkType, 'key');
+      assert.equal(header.width, 1920); assert.equal(header.height, 1080);
+      assert.equal(validEncodedVideo(header.codec, plain.slice(length + 2), header.width, header.height, true), true);
+    }
+    assert.notEqual(headers[0].stream, headers[1].stream, 'The recovered encoder starts a fresh decodable stream');
+    assert.equal(capturedFrames[0].closed, true); assert.equal(track.stopped, false);
+    media.close(); assert.equal(encoders[1].state, 'closed'); assert.equal(clones[1].stopped, true); assert.equal(timers.size, 0);
+  } finally {
+    receiver.close(); media.close(); global.MediaStreamTrackProcessor = original.processor; global.ImageCapture = original.image;
+    global.VideoEncoder = original.encoder; global.VideoDecoder = original.decoder; global.VideoFrame = original.frame; global.OffscreenCanvas = original.canvas;
+    global.setInterval = original.set; global.clearInterval = original.clear;
+  }
+});
+
+test('a native screen reader that accepts a track but never returns frames is recovered by a bounded watchdog', async () => {
+  const { RelayMedia } = await ready;
+  const original = { performance: Object.getOwnPropertyDescriptor(global, 'performance'), processor: global.MediaStreamTrackProcessor, image: global.ImageCapture, set: global.setInterval, clear: global.clearInterval };
+  let now = 1000, sequence = 0; const timers = new Map();
+  Object.defineProperty(global, 'performance', { configurable: true, value: { now: () => now } });
+  global.setInterval = callback => { const id = ++sequence; timers.set(id, callback); return id; }; global.clearInterval = id => timers.delete(id);
+  global.MediaStreamTrackProcessor = class { constructor() { this.readable = { getReader: () => ({ read: () => new Promise(() => {}), cancel: async () => {} }) }; } };
+  global.ImageCapture = class {};
+  const transport = rtc(), media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
+  transport.localTracks.set('screen', { track: { enabled: true, clone: () => ({ stop() {} }) } });
+  try {
+    await media.syncSource('screen'); const source = media.sources.get('screen'); now = 7001; timers.get(source.captureWatchdog)();
+    assert.equal(source.captureBackend, 'Image capture'); assert.equal(timers.size, 2); media.close(); assert.equal(timers.size, 0);
+  } finally { media.close(); Object.defineProperty(global, 'performance', original.performance); global.MediaStreamTrackProcessor = original.processor; global.ImageCapture = original.image; global.setInterval = original.set; global.clearInterval = original.clear; }
+});
+
+test('relay microphone diagnostics distinguish capture suspension from blocked incoming playback and report accepted PCM', async () => {
+  const { RelayMedia } = await ready;
+  const original = { context: global.AudioContext, worklet: global.AudioWorkletNode, stream: global.MediaStream };
+  const events = [], contexts = []; let worklet;
+  global.AudioContext = class {
+    constructor() { this.state = 'suspended'; contexts.push(this); }
+    createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+    async resume() { this.state = 'running'; this.onstatechange?.(); }
+    async close() { this.state = 'closed'; }
+  };
+  global.AudioWorkletNode = class { constructor() { this.port = { postMessage() {} }; worklet = this; } connect() {} disconnect() {} };
+  global.MediaStream = class { constructor(tracks) { this.tracks = tracks; } };
+  const transport = rtc(); transport.emit = (type, detail) => events.push({ type, detail });
+  const media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true; media.audioModule = async () => {};
+  transport.localTracks.set('audio', { track: { enabled: true } });
+  try {
+    await media.syncSource('audio'); const source = media.sources.get('audio');
+    worklet.port.onmessage({ data: { buffer: new Int16Array(2400).buffer, sampleRate: 24000, sampleCount: 2400, meanSquareEnergy: .01 } }); await peer.sendQueue;
+    assert.deepEqual(media.audioDiagnostics('guest'), { captureContextState: 'running', playbackContextState: 'off', sentAudioPackets: 1, capturedAudioPackets: 1, capturedAudioSamples: 2400, capturedAudioEnergy: .01, microphoneLevel: .1 });
+    contexts[0].state = 'suspended'; contexts[0].onstatechange();
+    assert.equal(events.filter(event => event.type === 'playback-blocked').at(-1).detail.blocked, false, 'A paused outgoing microphone must not be mislabeled as incoming playback');
+    assert.equal(events.filter(event => event.type === 'relay-audio-state').at(-1).detail.captureContextState, 'suspended');
+    await media.resumePlayback(); assert.equal(source.context.state, 'running');
+  } finally { media.close(); global.AudioContext = original.context; global.AudioWorkletNode = original.worklet; global.MediaStream = original.stream; }
+});
+
+test('an unsupported relay microphone AudioContext is reported instead of rejecting an unobserved capture startup promise', async () => {
+  const { RelayMedia } = await ready;
+  const original = global.AudioContext, events = []; global.AudioContext = class { constructor() { throw new Error('Unsupported sample rate'); } };
+  const transport = rtc(); transport.emit = (type, detail) => events.push({ type, detail });
+  const media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
+  transport.localTracks.set('audio', { track: { enabled: true } });
+  try { await media.syncSource('audio'); assert.equal(media.sources.has('audio'), false); assert.ok(events.some(event => event.type === 'error' && /microphone processing/.test(event.detail.error.message))); }
+  finally { media.close(); global.AudioContext = original; }
+});
