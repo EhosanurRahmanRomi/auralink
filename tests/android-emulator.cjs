@@ -15,6 +15,7 @@ const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
 const {findRoomAction}=require('./android-room-action.cjs');
+const {visibleInWebView}=require('./android-hierarchy.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
 const sdk=process.env.ANDROID_SDK_ROOT || path.join(project,'.tools','android-sdk');
@@ -74,7 +75,7 @@ async function findNode(predicate,timeout=30000) {
       if(phase!=='production APK lobby' || recovered)throw new Error('Android reported an application ANR after the permitted cold-start recovery');
       await tap(wait);await delay(2000);deadline=Math.max(deadline,Date.now()+30000);continue;
     }
-    const found=nodes.find(predicate);if(found)return found;await delay(800);
+    const found=nodes.find(node=>predicate(node,nodes));if(found)return found;await delay(800);
   }while(Date.now()<deadline);
   throw new Error(`Android UI element absent during ${phase}`);
 }
@@ -664,7 +665,7 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       publicPhase('native Android fullscreen presentation');
       const fullscreenProcess=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
       await tapRoomAction(node=>node['resource-id']==='fullscreen-button');
-      await findNode(node=>node['resource-id']==='presentation-fullscreen-exit' && visible(node));
+      await findNode((node,nodes)=>node['resource-id']==='presentation-fullscreen-exit' && visibleInWebView(node,nodes));
       await screenshot('android-emulator-fullscreen.png');
       const beforeFullscreenFrames=(await relayStats()).frames;
       await page.waitForFunction(first=>document.getElementById('public-screen')?.getVideoPlaybackQuality().totalVideoFrames>first,beforeFullscreenFrames,{timeout:20000});

@@ -24,6 +24,47 @@ async function prepare(page, forceRTC) {
     window.qaAudioContexts = [];
     const Audio = AudioContext; window.AudioContext = new Proxy(Audio, { construct(target, args) { const context = Reflect.construct(target, args); qaAudioContexts.push(context); return context; } });
     window.qaRTC = []; window.qaBrowserSockets = 0; window.qaCaptureCalls = [];
+    window.qaMicrophoneRequests = []; window.qaMicrophoneStreams = []; window.qaNotices = [];
+    window.qaSafeErrorName = name => ['NotAllowedError', 'PermissionDeniedError', 'NotReadableError', 'TrackStartError', 'NotFoundError', 'OverconstrainedError', 'AbortError', 'NotSupportedError', 'InvalidStateError', 'SecurityError', 'TypeError', 'Error'].includes(name) ? name : 'OtherError';
+    window.qaSafeAudioText = text => {
+      const safe = [
+        'Your microphone is off', 'Microphone unavailable · check sound', 'Microphone paused by your device',
+        'Microphone disconnected. Turn it on to retry.', 'Tap Test microphone, then speak.',
+        'Input detected. Your microphone is working.', 'Listening… speak into your microphone.', 'Microphone test stopped.',
+        'Microphone processing needs a tap', 'Room audio needs a tap',
+        'Resume audio processing so the other person can hear your microphone.', 'Enable playback to hear the other participants.',
+        'Playback is still blocked. Check your device sound permission, then tap Enable sound again.',
+        'Allow microphone access in your device privacy settings, then try again. Windows: Settings → Privacy & security → Microphone, including desktop apps.',
+        'Allow Glance-Port in System Settings → Privacy & Security → Microphone, then quit and reopen the app if macOS requests it.',
+        'Your microphone could not start. Close another app using it, check the device connection, or select System default in Preferences.',
+        'No microphone was found. Connect one and check the selected device in Preferences.',
+        'Incoming relay audio could not start. Open Check sound and enable sound, or rejoin the room.',
+        'Relay microphone processing could not start. Check microphone permission, then turn the microphone off and on again.'
+      ];
+      if (safe.includes(text)) return text;
+      if (text?.startsWith('Microphone: ')) return safe.includes(text.slice(12)) ? text : 'Microphone error: text omitted.';
+      if (text?.endsWith(' · input detected')) return 'Microphone input detected: device label omitted.';
+      if (text?.endsWith(' · listening')) return 'Microphone listening: device label omitted.';
+      return text ? 'Other text omitted.' : '';
+    };
+    const notices = document.getElementById('toast-region');
+    if (notices) {
+      new MutationObserver(records => {
+        for (const record of records) for (const node of record.addedNodes) if (node.nodeType === 1 && node.classList.contains('toast')) {
+          qaNotices.push({ error: node.classList.contains('error'), text: qaSafeAudioText(node.textContent) });
+          if (qaNotices.length > 20) qaNotices.shift();
+        }
+      }).observe(notices, { childList: true });
+    }
+    window.qaNativeSocketEvents = { open: 0, message: 0, error: 0, closes: [] };
+    window.auralink?.onInternetEvent?.(event => {
+      if (['open', 'message', 'error'].includes(event?.type)) qaNativeSocketEvents[event.type]++;
+      else if (event?.type === 'close') {
+        qaNativeSocketEvents.closes.push({ code: Number.isInteger(event.code) ? event.code : null,
+          reason: event.reason === 'Public connection limit reached. Try again later.' ? 'Public connection limit reached. Try again later.' : event.reason === 'Coordinator unavailable. Reconnect.' ? 'Coordinator unavailable. Reconnect.' : 'Close reason omitted.' });
+        if (qaNativeSocketEvents.closes.length > 10) qaNativeSocketEvents.closes.shift();
+      }
+    });
     window.qaSourcePaints = 0; window.qaEncodes = 0; window.qaEncoded = 0; window.qaCodecFailures = 0;
     const Encoder = VideoEncoder; window.VideoEncoder = new Proxy(Encoder, { construct(target, args) {
       const callbacks = args[0]; const encoder = Reflect.construct(target, [{ ...callbacks, output: (...values) => { qaEncoded++; return callbacks.output(...values); }, error: (...values) => { qaCodecFailures++; return callbacks.error(...values); } }]);
@@ -37,7 +78,24 @@ async function prepare(page, forceRTC) {
     navigator.mediaDevices.getUserMedia = async config => {
       if (config.video || !config.audio) throw new Error('Only synthetic microphone input is allowed in this fixture.');
       qaCaptureCalls.push('synthetic-microphone');
-      return nativeMicrophone(config);
+      const audio = typeof config.audio === 'object' ? config.audio : {};
+      // Chromium's file-input fixture recommends disabling processing for the
+      // prerecorded tone. Keep native capture and production permission IPC;
+      // this explicit test override does not validate default mic processing.
+      // https://chromium.googlesource.com/chromium/src/+/HEAD/media/base/media_switches.cc
+      const fixtureAudio = { ...audio, echoCancellation: { exact: false }, noiseSuppression: { exact: false }, autoGainControl: { exact: false } };
+      const request = { completed: false, errorName: null,
+        productionRequestedProcessing: Object.fromEntries(['echoCancellation', 'noiseSuppression', 'autoGainControl'].map(key => [key, typeof audio[key] === 'boolean' ? audio[key] : null])),
+        fixtureRequestedProcessing: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
+      qaMicrophoneRequests.push(request);
+      try {
+        const stream = await nativeMicrophone({ ...config, audio: fixtureAudio }); request.completed = true;
+        request.actualProcessing = stream.getAudioTracks().map(track => {
+          const settings = track.getSettings();
+          return Object.fromEntries(['echoCancellation', 'noiseSuppression', 'autoGainControl'].map(key => [key, typeof settings[key] === 'boolean' ? settings[key] : null]));
+        });
+        qaMicrophoneStreams.push(stream); return stream;
+      } catch (error) { request.errorName = qaSafeErrorName(error?.name); throw error; }
     };
     navigator.mediaDevices.getDisplayMedia = async () => {
       qaCaptureCalls.push('synthetic-screen'); const canvas = document.createElement('canvas'); canvas.width = 2560; canvas.height = 1440;
@@ -83,18 +141,89 @@ async function receivedAudio(page) {
   });
   return audio;
 }
+
+async function audioFailureDiagnosis(page) {
+  if (page.isClosed()) return { unavailable: 'Application window closed.' };
+  return page.evaluate(async () => {
+    const safeText = window.qaSafeAudioText || (() => 'Audio instrumentation not installed.');
+    const enumValue = (value, choices) => choices.includes(value) ? value : null;
+    const number = value => Number.isFinite(value) ? value : null;
+    const trackState = track => {
+      const settings = track.getSettings();
+      return { readyState: enumValue(track.readyState, ['live', 'ended']), enabled: track.enabled, muted: track.muted,
+        sampleRate: number(settings.sampleRate), channelCount: number(settings.channelCount),
+        processing: Object.fromEntries(['echoCancellation', 'noiseSuppression', 'autoGainControl'].map(key => [key, typeof settings[key] === 'boolean' ? settings[key] : null])) };
+    };
+    const label = (id, choices) => enumValue(document.getElementById(id)?.getAttribute('aria-label'), choices);
+    let permissions = null;
+    try {
+      const info = await window.auralink?.getInfo?.();
+      if (info?.permissions) permissions = Object.fromEntries(['microphone', 'screen', 'accessibility'].map(key => [key, enumValue(info.permissions[key], ['granted', 'denied', 'restricted', 'not-determined', 'not-required', 'unknown'])]));
+    } catch { permissions = { unavailable: 'Permission status read failed.' }; }
+    return {
+      joinedRoomVisible: document.getElementById('session')?.hidden === false,
+      micEnabled: document.getElementById('mic-button')?.classList.contains('enabled') === true,
+      micDisabled: document.getElementById('mic-button')?.disabled === true,
+      micLabel: label('mic-button', ['Turn microphone on', 'Turn microphone off']),
+      presentationMicLabel: label('presentation-mic-button', ['Turn microphone on', 'Turn microphone off']),
+      microphoneStatus: safeText(document.getElementById('voice-status-text')?.textContent),
+      microphoneStatusError: document.getElementById('voice-status')?.classList.contains('error') === true,
+      microphoneMeter: number(document.getElementById('mic-level')?.value),
+      microphoneTestStatus: safeText(document.getElementById('mic-test-status')?.textContent),
+      audioBannerVisible: document.getElementById('audio-banner')?.hidden === false,
+      audioBannerTitle: safeText(document.getElementById('audio-banner-title')?.textContent),
+      audioBannerText: safeText(document.getElementById('audio-banner-text')?.textContent),
+      permissions,
+      audioMeasurements: [...document.querySelectorAll('#rtc-stats .stat-row')].filter(row => ['Audio received', 'Audio sent', 'Microphone level', 'Microphone source', 'Microphone processing', 'Audio playback processing', 'Captured audio', 'Playback'].includes(row.querySelector('span')?.textContent)).map(row => {
+        const label = row.querySelector('span').textContent, value = row.querySelector('strong')?.textContent;
+        const safe = ['—', 'off', 'live', 'ended', 'paused', 'running', 'suspended', 'interrupted', 'closed', 'Enabled', 'No remote microphone', 'Tap Enable sound'];
+        return { label, value: safe.includes(value) || /^(?:[0-9]{1,12} (?:packets|blocks)|[0-9]{1,3}%)$/.test(value || '') ? value : 'Measurement value omitted.' };
+      }),
+      contexts: (window.qaAudioContexts || []).slice(-20).map(context => ({ state: enumValue(context.state, ['running', 'suspended', 'interrupted', 'closed']), sampleRate: number(context.sampleRate) })),
+      captureCalls: (window.qaCaptureCalls || []).filter(value => ['synthetic-microphone', 'synthetic-screen'].includes(value)).slice(-20),
+      microphoneRequests: (window.qaMicrophoneRequests || []).slice(-10),
+      microphoneTracks: (window.qaMicrophoneStreams || []).slice(-10).flatMap(stream => stream.getAudioTracks().map(trackState)),
+      receivedAudio: [...document.querySelectorAll('audio[data-peer]')].map(audio => ({ hasStream: Boolean(audio.srcObject),
+        paused: audio.paused, muted: audio.muted, volume: audio.volume, readyState: audio.readyState, currentTime: number(audio.currentTime),
+        playbackBlocked: audio.dataset.blocked === 'true', tracks: audio.srcObject?.getAudioTracks().map(trackState) || [] })),
+      rtcStates: (window.qaRTC || []).slice(-10).map(pc => ({ connection: enumValue(pc.connectionState, ['new', 'connecting', 'connected', 'disconnected', 'failed', 'closed']),
+        ice: enumValue(pc.iceConnectionState, ['new', 'checking', 'connected', 'completed', 'disconnected', 'failed', 'closed']),
+        signaling: enumValue(pc.signalingState, ['stable', 'have-local-offer', 'have-remote-offer', 'have-local-pranswer', 'have-remote-pranswer', 'closed']),
+        senderAudioTracks: pc.getSenders().filter(sender => sender.track?.kind === 'audio').map(sender => trackState(sender.track)),
+        receiverAudioTracks: pc.getReceivers().filter(receiver => receiver.track?.kind === 'audio').map(receiver => trackState(receiver.track)) })),
+      browserSocketsCreated: number(window.qaBrowserSockets), nativeSocketEvents: window.qaNativeSocketEvents || null,
+      notices: window.qaNotices || []
+    };
+  }).catch(() => ({ unavailable: 'Audio state snapshot failed.' }));
+}
 async function main() {
-  fs.mkdirSync(results, { recursive: true }); const apps = [], profiles = []; let phase = 'launch'; let errors = 0;
+  fs.mkdirSync(results, { recursive: true }); const apps = [], profiles = [], windows = []; let phase = 'launch'; let errors = 0;
   const wav = path.join(results, 'invitation-electron-synthetic-microphone.wav'); writeTone(wav);
   const proof = { passed: false, coordinator: 'Deployed public Cloudflare Worker', nativeInputInjected: false, physicalDifferentNetworkTest: false };
+  proof.microphoneFixture = {
+    source: 'Looping synthetic WAV through native getUserMedia fake device', sampleRate: 48000, channels: 1, frequencyHz: 440,
+    processing: 'Fixture-only raw input constraints disable echo cancellation, noise suppression and automatic gain control; production requestMedia preflight, native capture and real relay worklets remain active.',
+    outputDevice: 'Chromium fake final OS output stream; normal browser audio mixer and clock remain active.',
+    productionDefaultProcessingVerified: false, physicalMicrophoneVerified: false, physicalSpeakerVerified: false, generatedOscillatorUsed: false
+  };
   const sourceFiles=['src/main.cjs', 'src/preload.cjs', 'src/core/internet-client.cjs', 'src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js'];
   const hashSource=file=>crypto.createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex');
   const sourceHashes=Object.fromEntries(sourceFiles.map(file=>[file,hashSource(file)]));
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
   async function launch(invitation) {
     const profile = fs.mkdtempSync(path.join(results, 'invitation-electron-profile-')); profiles.push(profile);
-    const app = await _electron.launch({ args: [root, '--smoke-test', `--user-data-dir=${profile}`, '--autoplay-policy=no-user-gesture-required', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`, ...(invitation ? [invitation] : [])], env, timeout: 60000 }); apps.push(app);
-    const page = await app.firstWindow(); page.on('pageerror', () => errors++); await page.locator('#host-button').waitFor(); return page;
+    // Replace only the final OS sink so a CI VM does not need audio hardware.
+    // https://chromium.googlesource.com/chromium/src/+/HEAD/media/audio/audio_manager_base.cc
+    const app = await _electron.launch({ args: [root, '--smoke-test', `--user-data-dir=${profile}`, '--autoplay-policy=no-user-gesture-required', '--disable-audio-output', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`, ...(invitation ? [invitation] : [])], env, timeout: 60000 }); apps.push(app);
+    const page = await app.firstWindow(); const windowProof = { page, app, role: invitation ? 'guest' : 'host', pageErrors: 0 };
+    windows.push(windowProof); page.on('pageerror', () => { errors++; windowProof.pageErrors++; }); await page.locator('#host-button').waitFor();
+    windowProof.fixtureCommandLine = await app.evaluate(({ app }, expectedWav) => ({
+      fakeDevice: app.commandLine.hasSwitch('use-fake-device-for-media-stream'), fakeUi: app.commandLine.hasSwitch('use-fake-ui-for-media-stream'),
+      fakeAudioFileMatchesExpected: app.commandLine.getSwitchValue('use-file-for-fake-audio-capture') === expectedWav,
+      fakeFinalOutput: app.commandLine.hasSwitch('disable-audio-output')
+    }), wav);
+    assert.ok(Object.values(windowProof.fixtureCommandLine).every(Boolean), 'Native test process must contain every declared audio fixture switch');
+    return page;
   }
   try {
     const host = await launch(); await prepare(host, true); await host.locator('#quick-name').fill('Desktop host');
@@ -112,7 +241,8 @@ async function main() {
       await page.locator('#diagnostics-close').click();
     }
     phase = 'explicit synthetic microphones'; for (const page of [host, guest]) await page.locator('#mic-button').click();
-    phase = 'bidirectional native WSS audio'; proof.audio = { hostReceiver: await receivedAudio(host), guestReceiver: await receivedAudio(guest) };
+    proof.audio = {}; phase = 'host receives guest native WSS audio'; proof.audio.hostReceiver = await receivedAudio(host);
+    phase = 'guest receives host native WSS audio'; proof.audio.guestReceiver = await receivedAudio(guest);
     proof.audioProcessing = [];
     for (const page of [host, guest]) {
       await page.locator('#diagnostics-toggle').click();
@@ -138,8 +268,36 @@ async function main() {
     await host.locator('#end-button').click(); await host.waitForFunction(() => document.getElementById('session').hidden); assert.equal(errors, 0);
     for(const file of sourceFiles) assert.equal(hashSource(file),sourceHashes[file],'Production source changed during this live test');
     proof.sourceHashes = sourceHashes;
-    proof.passed = true; proof.boundary = 'Two same-PC production Electron apps and real public native WSS; synthetic 1440p screen frames and decoded microphone tones in both directions plus microphone restart, forced direct-path failure. No hardware sensors, physical Mac capture/control or different-carrier proof.';
-  } catch (error) { proof.failedStage = phase; proof.failureType = error.name; proof.failureSummary = String(error.message).split('\n')[0].replace(/(?:https?:|auralink:)\/\/\S+/g, '[private invitation removed]').slice(0,200); process.exitCode = 1; }
+    proof.fixtureCommandLines = windows.map(({ role, fixtureCommandLine }) => ({ role, ...fixtureCommandLine }));
+    proof.microphoneRequests = await Promise.all(windows.map(async ({ role, page }) => ({ role, requests: await page.evaluate(() => qaMicrophoneRequests) })));
+    for (const { requests } of proof.microphoneRequests) {
+      assert.ok(requests.length > 0, 'Each actual app must complete native fake microphone capture');
+      for (const request of requests) {
+        assert.equal(request.completed, true); assert.equal(request.errorName, null);
+        for (const key of ['echoCancellation', 'noiseSuppression', 'autoGainControl']) {
+          assert.equal(request.productionRequestedProcessing[key], true, 'Production microphone processing request must remain unchanged');
+          assert.equal(request.fixtureRequestedProcessing[key], false);
+        }
+        assert.ok(request.actualProcessing.length > 0, 'Native microphone must report actual audio track processing settings');
+        for (const settings of request.actualProcessing) for (const key of ['echoCancellation', 'noiseSuppression', 'autoGainControl']) assert.equal(settings[key], false, 'The native prerecorded WAV fixture must honor raw processing settings');
+      }
+    }
+    proof.passed = true; proof.boundary = 'Two same-PC production Electron apps and real public native WSS; synthetic 1440p screens and looping WAV microphones through native fake getUserMedia with fixture-only raw processing, real relay worklets and a Chromium fake final OS output stream. Strict decoded audio energy in both directions and microphone restart, forced direct-path failure. No production default audio processing, hardware microphone/speaker, physical Mac capture/control or different-carrier proof.';
+  } catch (error) {
+    proof.failedStage = phase; proof.failureType = ['TimeoutError', 'AssertionError', 'TypeError', 'Error'].includes(error.name) ? error.name : 'OtherError';
+    proof.failureSummary = error.name === 'TimeoutError' ? 'A required live media or interface condition did not complete within its unchanged timeout.' : 'A required live runtime assertion failed; exception text omitted.';
+    proof.failureDiagnostics = await Promise.all(windows.map(async ({ page, app, role, pageErrors }) => ({ role, pageErrors,
+      renderer: await audioFailureDiagnosis(page),
+      native: await app.evaluate(({ app, BrowserWindow }, expectedWav) => ({
+        platform: process.platform, windowCount: BrowserWindow.getAllWindows().length,
+        fakeDevice: app.commandLine.hasSwitch('use-fake-device-for-media-stream'), fakeUi: app.commandLine.hasSwitch('use-fake-ui-for-media-stream'),
+        fakeAudioFile: app.commandLine.hasSwitch('use-file-for-fake-audio-capture'),
+        fakeAudioFileMatchesExpected: app.commandLine.getSwitchValue('use-file-for-fake-audio-capture') === expectedWav,
+        fakeFinalOutput: app.commandLine.hasSwitch('disable-audio-output')
+      }), wav).catch(() => ({ unavailable: 'Native state snapshot failed.' }))
+    })));
+    process.exitCode = 1;
+  }
   finally {
     for (const app of apps.reverse()) await app.close().catch(() => {});
     for (const profile of profiles) { const resolved = fs.realpathSync(profile); if (resolved.startsWith(fs.realpathSync(results) + path.sep) && path.basename(resolved).startsWith('invitation-electron-profile-')) fs.rmSync(resolved, { recursive: true, force: true }); }
