@@ -54,7 +54,7 @@ $aapt2 = Join-Path $buildTools 'aapt2.exe'
 $resources = Join-Path $outPath 'resources.zip'
 $unsigned = Join-Path $outPath 'unsigned.apk'
 $aligned = Join-Path $outPath 'aligned.apk'
-Invoke-BuildTool $aapt2 @('compile','--dir',(Join-Path $androidPath 'res'),'-o',$resources)
+Invoke-BuildTool $aapt2 @('compile','--no-crunch','--dir',(Join-Path $androidPath 'res'),'-o',$resources)
 Invoke-BuildTool $aapt2 @('link','-o',$unsigned,'--manifest',(Join-Path $androidPath 'AndroidManifest.xml'),'-I',$platformJar,'--auto-add-overlay',$resources)
 $libraries = @((Join-Path $androidPath 'libs/Java-WebSocket-1.6.0.jar'),(Join-Path $androidPath 'libs/slf4j-api-2.0.13.jar'))
 $classpath = (@($platformJar) + $libraries) -join ';'
