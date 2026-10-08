@@ -1,6 +1,6 @@
 # Android test companion
 
-Auralink 0.4.1 uses a bundled Android WebView for calls and native Android services for room connections, screen consent, audio routing and attended input. Android 10 or newer is required. Tap **Open a room** and share the room code or invitation link, or paste another person's invitation. The default Internet coordinator requires no account, private service address or pairing code. Private group connections and nearby Windows invitations remain available in Advanced options. Nearby connections pin the invitation certificate; Internet connections verify the service's normal certificate chain and hostname. This release includes Windows, macOS Apple Silicon and Android.
+Auralink 0.4.1 uses the installed Android System WebView for calls and native Android services for room connections, screen consent, audio routing and attended input. Android 10 or newer is required. Tap **Open a room** and share the room code or invitation link, or paste another person's invitation. The default Internet coordinator requires no account, private service address or pairing code. Private group connections and nearby Windows invitations remain available in Advanced options. Nearby connections pin the invitation certificate; Internet connections verify the service's normal certificate chain and hostname. This release includes Windows, macOS Apple Silicon and Android.
 
 ## Try phone screen sharing
 

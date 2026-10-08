@@ -644,15 +644,43 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     const before=await relayStats(),oldPixels=await imageHash();await adb(['shell','input','keyevent','24']);
     const backgroundDeadline=Date.now()+30000;let background;
     do {background=await relayStats();if(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels)break;await delay(300);}while(Date.now()<backgroundDeadline);
-    assert.ok(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels,'Native screen pixels and both-direction encrypted audio must advance during actual Home');
+    assert.ok(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels,'Native screen pixels, phone microphone upload and reverse PCM transmission must advance during actual Home');
     const top=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));assert.ok(top?.includes(homePackage),'Actual Android Home remains foreground while media advances');
     await callServiceTypes(0x10|0x80);assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
+    // Stop only the synthetic sender's local capture before bringing Android
+    // back. Keep the remote audio track advertised, so its processing context
+    // remains observable. The returned counter cannot be supplied by a freshly
+    // restarted sender; this proves delivery across Home/return, without
+    // claiming exactly when a hidden decoder ran or that a speaker was audible.
+    await page.evaluate(async id=>{
+      publicRTC.relayMedia.stopSource('audio');
+      publicTone?.stop();publicTone?.disconnect();window.publicTone=null;
+      await publicRTC.relayMedia.peers.get(id)?.sendQueue;
+    },peerId);
+    const reversePacketsWhenStopped=(await relayStats()).row.sentAudioPackets;
+    await delay(1000);
+    assert.equal((await relayStats()).row.sentAudioPackets,reversePacketsWhenStopped,'Synthetic reverse PCM must remain stopped before Android returns');
+    const stoppedTop=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
+    assert.ok(stoppedTop?.includes(homePackage),'Android Home must remain foreground when the reverse sender stops');
     await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);await findNode(label('Turn microphone off'));
     assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
     await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+    await tapRoomAction(node=>node['resource-id']==='diagnostics-toggle');
+    await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio received');
+    const returnedAudioText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
+    const returnedAudio=/Audio received\s+(\d+) packets/.exec(returnedAudioText);
+    assert.ok(returnedAudio && Number(returnedAudio[1])>Number(nativeAudio[1]),'Android incoming PCM must advance across Home/return after the reverse sender has stopped');
+    await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio playback processing');
+    const returnedProcessingText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
+    const returnedProcessing=/Audio playback processing\s+(running|suspended|interrupted|off)/.exec(returnedProcessingText);
+    assert.equal(returnedProcessing?.[1],'running','Android incoming PCM playback processing must be running after Home/return');
+    assert.equal((await relayStats()).row.sentAudioPackets,reversePacketsWhenStopped,'The synthetic reverse sender must remain stopped through the returned Android counter check');
+    await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
     const summary={passed:true,coordinator:'Deployed public Worker via native system PKI and Node hostname-verified WSS',route:'Secure relay',directRTCImpossible:true,allDirectClosed:true,
       actualProjection:{width:background.width,height:background.height,decodedFrames:background.frames,changedPixelsDuringHome:true},
-      audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:background.row.sentAudioPackets,actualAndroidPcmPacketsDecoded:Number(nativeAudio[1]),physicalMicrophoneAndSpeakerVerified:false},
+      audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:reversePacketsWhenStopped,actualAndroidPcmPacketsDecoded:Number(returnedAudio[1]),
+        actualAndroidPcmPacketsBeforeHome:Number(nativeAudio[1]),actualAndroidPcmPacketsAfterHomeReturn:Number(returnedAudio[1]),reversePcmDeliveredAcrossHomeReturn:true,
+        reverseSenderStoppedWhileHomeForeground:true,playbackProcessingAfterReturn:returnedProcessing[1],exactHiddenDecoderTimingVerified:false,physicalMicrophoneAndSpeakerVerified:false},
       encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,encryptedSent:wire.sent,encryptedReceived:wire.received,homeMediaAdvanced:true,sameProcessAndRoomOnReturn:true,newCaptureAndControlRemainConsentRequired:true};
     assert.equal(wire.encryptedEnvelopesOnly,true);assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>publicErrors),[]);
     checkpoint('nativePublicRelayMedia',summary);
