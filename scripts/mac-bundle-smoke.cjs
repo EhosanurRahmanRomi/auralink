@@ -23,7 +23,9 @@ function command(file,args,input) {
 }
 function plistJSON(value) { return JSON.parse(command('plutil',['-convert','json','-o','-','-'],value)); }
 function signedEntitlements(bundle) {
-  const result=spawnSync('codesign',['--display','--entitlements','-',bundle],{encoding:'utf8',timeout:120000});
+  // Apple's documented extraction command explicitly requests XML; modern
+  // codesign otherwise need not return a plist suitable for plutil.
+  const result=spawnSync('codesign',['--display','--entitlements','-','--xml',bundle],{encoding:'utf8',timeout:120000});
   if(result.error || result.status!==0) throw new Error(`Read signed bundle entitlements failed: ${result.error?.message || result.stderr}`);
   // Current codesign can omit the optional XML declaration. The plist itself,
   // including its closing tag, is required; an absent entitlement still fails.
