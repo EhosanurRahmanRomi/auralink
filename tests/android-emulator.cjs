@@ -887,7 +887,7 @@ async function runUI(fixture) {
   await findNativeRoomAction(label('Turn microphone on'));
   await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.remoteState.audio===false,fixture.peerId,{timeout:15000});
   await tapRoomAction(label('Leave room'));
-  await findNativeRoomAction(label('Enter invitation'));
+  await findNativeRoomAction(node=>node['resource-id']==='join-button' && node.enabled==='true');
   await audioMode('MODE_NORMAL');
   audio.checks.push('Owner microphone stop updates receiver media state','Leaving the room releases Android communication audio mode');
   checkpoint('ownerAudioStopAndRouteCleanup');
