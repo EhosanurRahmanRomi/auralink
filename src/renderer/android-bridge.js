@@ -11,6 +11,7 @@
   const screenStopListeners = new Set();
   const emergencyListeners = new Set();
   const mediaErrorListeners = new Set();
+  const invitationListeners = new Set();
   let screenSequence = -1;
   let screenCaptureId = null;
   let captureRequestNumber = 0;
@@ -37,6 +38,17 @@
     socket.dispatchEvent(event);
   }
 
+  function relayPacketSizeAllowed(raw, direction = 'outgoing') {
+    if (typeof raw !== 'string' || new TextEncoder().encode(raw).length > 262144) return false;
+    let packet; try { packet = JSON.parse(raw); } catch { return false; }
+    const field = direction === 'incoming' ? 'from' : 'to';
+    const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+    if (!exact(packet, ['type', field, 'data']) || packet.type !== 'signal' || typeof packet[field] !== 'string' || !packet[field] || packet[field].length > 128 || !exact(packet.data, ['relay'])) return false;
+    const relay = packet.data.relay;
+    if (!exact(relay, ['version', 'epoch', 'counter', 'nonce', 'ciphertext']) || relay.version !== 1 || !Number.isSafeInteger(relay.counter) || relay.counter < 1 || !/^[A-Za-z0-9_-]{16}$/.test(relay.epoch) || !/^[A-Za-z0-9_-]{16}$/.test(relay.nonce) || typeof relay.ciphertext !== 'string' || !/^[A-Za-z0-9_-]+$/.test(relay.ciphertext) || relay.ciphertext.length > 240000) return false;
+    try { const size = atob(relay.ciphertext.replaceAll('-', '+').replaceAll('_', '/')).length; return size >= 16 && size <= 180000; } catch { return false; }
+  }
+
   class NativeSocket extends EventTarget {
     constructor(url) {
       super();
@@ -61,7 +73,7 @@
 
     send(data) {
       if (this._state !== 1) throw new DOMException('The connection is not open.', 'InvalidStateError');
-      if (typeof data !== 'string' || new TextEncoder().encode(data).length > 65536) throw new TypeError('Signaling accepts JSON text up to 64 KB.');
+      if (typeof data !== 'string' || (new TextEncoder().encode(data).length > 65536 && (!this.url.endsWith('/internet/ws') || !relayPacketSizeAllowed(data)))) throw new TypeError('Signaling accepts JSON text up to 64 KB, or a bounded encrypted Internet relay packet.');
       invoke('sendSocket', { socketId: this.id, data }).catch((error) => { if (this._state < 2) this.fail(error.message); });
     }
 
@@ -93,7 +105,7 @@
         if (this._state !== 0) { invoke('closeSocket', { socketId: this.id }).catch(() => {}); return; }
         this._state = 1; dispatch(this, 'open');
       } else if (message.type === 'message' && this._state === 1) {
-        if (typeof message.data === 'string' && message.data.length <= 65536) dispatch(this, 'message', { data: message.data });
+        if (typeof message.data === 'string' && (new TextEncoder().encode(message.data).length <= 65536 || this.url.endsWith('/internet/ws') && relayPacketSizeAllowed(message.data, 'incoming'))) dispatch(this, 'message', { data: message.data });
       } else if (message.type === 'close') this.finish(message.code, message.reason);
       else if (message.type === 'error') this.fail(message.message);
     }
@@ -105,6 +117,11 @@
     if (!message || typeof message !== 'object' || Array.isArray(message)) return;
     if (message.event === 'socket') {
       sockets.get(message.socketId)?.nativeEvent(message); return;
+    }
+    if (message.event === 'app-invitation') {
+      if (typeof message.code !== 'string' || message.code.length > 128 || !/^A1\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/i.test(message.code)) return;
+      for (const listener of invitationListeners) { try { listener(message.code); } catch { /* Invitations never change native consent. */ } }
+      return;
     }
     if (message.event === 'control-stop' || message.event === 'media-error') {
       const listeners = message.event === 'control-stop' ? emergencyListeners : mediaErrorListeners;
@@ -136,7 +153,7 @@
       screenSequence = -1;
       screenCaptureId = null;
       captureRequestNumber++;
-      for (const socket of [...sockets.values()]) { socket.close(); socket.finish(1000, String(message.reason || 'App moved to the background.')); }
+      for (const socket of [...sockets.values()]) { socket.close(); socket.finish(1000, String(message.reason || 'The Android call ended.')); }
       for (const request of requests.values()) { clearTimeout(request.timer); request.reject(new Error('Android session stopped.')); }
       requests.clear();
       for (const listener of stopListeners) { try { listener(message.reason); } catch { /* A UI listener cannot reopen the native session. */ } }
@@ -155,6 +172,7 @@
     value: Object.freeze({
       platform: 'android',
       getInfo: () => invoke('getInfo'),
+      getPendingInvitation: () => invoke('getPendingInvitation'),
       trustInvite: (invite) => {
         if (typeof invite !== 'string' || invite.length > 4096) return Promise.reject(new TypeError('Invalid room invitation.'));
         stopped = false;
@@ -211,6 +229,10 @@
       onMediaError: (listener) => {
         if (typeof listener !== 'function') return () => {};
         mediaErrorListeners.add(listener); return () => mediaErrorListeners.delete(listener);
+      },
+      onInvitation: (listener) => {
+        if (typeof listener !== 'function') return () => {};
+        invitationListeners.add(listener); return () => invitationListeners.delete(listener);
       },
       onSessionStop: (listener) => {
         if (typeof listener !== 'function') return () => {};

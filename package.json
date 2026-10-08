@@ -1,7 +1,7 @@
 {
   "name": "auralink",
-  "version": "0.3.1",
-  "description": "Peer-hosted calls, presentations and attended remote assistance",
+  "version": "0.4.0",
+  "description": "One-click screen sharing and attended remote control",
   "private": true,
   "main": "src/main.cjs",
   "author": "Ehosanur Rahman Romi",
@@ -30,6 +30,9 @@
   "build": {
     "appId": "local.auralink.desktop",
     "productName": "Auralink",
+    "protocols": [
+      { "name": "Auralink room invitation", "schemes": ["auralink"] }
+    ],
     "compression": "normal",
     "directories": {
       "output": "release"
@@ -81,9 +84,8 @@
       "category": "public.app-category.productivity",
       "icon": "build/icon.svg",
       "extendInfo": {
-        "NSCameraUsageDescription": "Use your camera only when you enable video in a room.",
         "NSMicrophoneUsageDescription": "Use your microphone only when you enable audio in a room.",
-        "NSScreenCaptureUsageDescription": "Share a screen you select with approved room participants.",
+        "NSScreenCaptureUsageDescription": "Share a screen you select with the people joining your invitation room.",
         "NSLocalNetworkUsageDescription": "Connect directly to devices you invite for private calls, screen sharing and attended remote assistance."
       },
       "identity": "-",

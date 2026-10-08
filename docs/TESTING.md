@@ -1,70 +1,59 @@
-# Device testing
+# Desktop device testing
 
-Use matching app versions on every endpoint. The 0.3 beta has **Nearby** and **Internet** connection modes. Start with the Nearby baseline below, then test Internet from genuinely different networks. Microphone, camera and remote-input permission remain separate from connecting or admitting a participant.
+The active milestone is **Windows↔Apple Silicon macOS screen sharing, optional microphone audio and attended control**. Use matching versions. Camera calls and Android delivery are deferred. Package launch and synthetic media do not prove physical sound or MacBook permission behavior.
 
-## Current verification status
+## Room and invitation
 
-The private Internet coordinator has passing policy/security tests, real local workerd/SQLite/WebSocket tests and a Wrangler deployment dry run. Public Cloudflare deployment and same-PC native/browser Internet integration checks passed; physical different-network and cross-country tests remain pending. The 0.2 packaged builds and synthetic media tests establish specific build/runtime outcomes, not every physical microphone, speaker, camera or network combination. Record what actually passed on your devices before treating the beta as ready for everyday use.
+1. Click **Open a room**. No service-address/pairing form should appear. Screen and microphone remain off.
+2. Share **Copy link** privately and open it on the other device. The landing page offers **Open Auralink** and code-copy fallback. Paste the invitation into **Join room** if OS link handling is unavailable.
+3. Guest entry is automatic. Entry alone must never activate capture or input.
+4. In **Manage people**, test **Remove**: guest media/input stop, but deliberate rejoin remains possible. **Remove & close invite** must invalidate that old code.
+5. Test **Lock room** and **New invitation**. Existing guests stay when the invitation closes; old codes cannot admit newcomers.
+6. Owner quit must end the room. A native link received during an existing room must not silently replace it or start capture.
 
-## Nearby baseline
+An invitation is a long capability, not a guessable six-digit number. Blocking rejects the current connection and closes the old capability; it cannot permanently recognize a fresh anonymous app. Keep invitations out of reports/screenshots.
 
-Start with Windows and Android on the same Wi-Fi and matching release versions. Select **Nearby**, keep the desktop room host open, select its Wi-Fi address, paste the invitation on the phone and approve admission. Guest-network/client isolation can block this. Nearby Android joins a desktop-hosted room; closing that host ends the room.
+## Screen across different networks
 
-If Windows asks about network access, allow Auralink on your trusted private network. Both the room connection and WebRTC media need network access; keep Windows Firewall enabled. On the phone, the microphone, camera, sharing and leave controls appear above the presentation area as soon as admission completes.
+Put Windows on home Wi-Fi/Ethernet and the Mac on a separate Internet connection. Same-PC/same-Wi-Fi clients do not establish different-network connectivity.
 
-The release APK uses the retained development signing key and can update the project's 0.1.0 APK. An APK downloaded from a CI artifact uses a temporary key and cannot update that installation. Use the published release APK for this test.
+1. Share a full display. Confirm readable text and changing content on the receiver; an online badge is insufficient.
+2. Record actual resolution, frame rate, codec, route and traffic from **Connection details** after ten seconds. Try Auto, 720p, 1080p and 1440p.
+3. Test Windows→Mac and Mac→Windows independently. A selector is a maximum; report received dimensions.
+4. Scroll text and move a window to check motion/delay. Test minimizing/backgrounding and returning. Static content can hide a stalled encoder.
+5. With blocked direct RTC, verify **Secure relay** or a useful failure. Direct success does not establish relay.
+6. Test Wi-Fi change, endpoint quit and capture cancellation. Reconnect/new-room entry must not inherit capture or control.
 
-## Internet from different networks
+Free relay budgets are finite. Current WebSocket limits reserve up to 512 MiB of wire media and 30 minutes per room, plus global daily byte/message caps. The timer is an upper bound: two 1080p/1440p feeds at illustrative 3–4.5 Mbps each can exhaust that room budget in roughly 6–9 minutes including base64url expansion, before audio/metadata. One presenter, static content or lower quality can use less. These are estimates, not promised durations. Exhaustion must stop fallback visibly. TURN remains optional/disabled until provider-enforced free quota, disabled overages and genuine expiry are verified.
 
-Follow [the free service setup](../internet-service/README.md) after the coordinator is deployed. It supplies a public `workers.dev` address and normal TLS, so you do not need your own domain or a Nearby certificate pin. Keep the account on the free plan. A direct-only deployment may connect many network pairs but cannot cover every restrictive router or mobile carrier.
+Basic JPEG fallback is slower than encoded transport. Judge high-quality fallback by actual codec, resolution and motion; a 4 fps presentation does not satisfy that goal.
 
-1. Put Windows on home Wi-Fi and Android on **mobile data with Wi-Fi turned off**, or use two separate internet connections. Two devices on the same Wi-Fi do not establish different-network connectivity. Later repeat with the Mac on another network and, when possible, a trusted person in another country.
-2. On each device, configure **Internet** with the same deployed service address and its private pairing key. Keep the app open. Confirm the device appears in the private paired-device list. The directory admits at most 32 paired devices. Share the pairing key only with trusted testers; do not post it publicly or include it in a bug report.
-3. Start an Internet room on one device. On the other, select that available host or paste its Internet invitation **inside Auralink**. The coordinator provides protocol endpoints, not a hosted browser calling page. Confirm the guest waits and the owner sees the expected name. Try **Decline** first: the guest must receive no call or screen. Request again, then approve.
-4. Test voice in both directions using the audio steps below. Enable cameras separately, then share one screen. Check that actual video updates and speech is audible, rather than relying only on connection status or packet counters.
-5. Inspect **Connection details**. Record whether the selected WebRTC route is direct or relayed when the app supplies that diagnostic. Success with a direct connection does not prove TURN fallback, and success on one carrier does not establish every network combination. Never include ICE credentials, invitations or pairing/device tokens in a screenshot.
-6. Request control of a shared full display. Confirm that room admission alone cannot move the owner's pointer or phone. Complete the separate app/native owner consent and perform only the harmless input steps below. Revoke, stop sharing and disconnect in separate tests; each must stop further remote input.
-7. Test directory lifecycle: leave a room while remaining online, reconnect without inheriting old control, and close the host app. Its room must end and its directory entry must become offline. **Forget this device** must remove its registration; the old token must no longer reconnect it. Ordinary healthy coordinator hibernation preserves a verified consent lease. At 15 minutes, Internet control must expire and require fresh owner consent while the call may continue.
-8. Add a third and fourth approved person. Try a fifth request: the four-person room cap includes its owner. Confirm declined/pending devices cannot signal, receive media or control another participant.
+## Microphone and speaker
 
-Test Windows hosting and joining, Mac hosting and joining, and Android Internet hosting and joining separately. Phone background/projection and OS permission limits still apply. Use headphones for the first audio test, keep the devices charged and note OS/WebView versions.
+Microphones start off. Use headphones when devices are near each other.
 
-### Optional free relay fallback
+1. Save input/output under **Settings → Sound**. Turn the microphone off/on after changing input.
+2. Use **Check sound → Test microphone** and speak. The local test lasts at most ten seconds and records no file. Play the speaker test and confirm audible output.
+3. Enable microphones deliberately. Speak Windows→Mac, then Mac→Windows; check both sender meter and actual receiving sound. Tap **Enable sound** when prompted.
+4. Record sent/received counters and playback state. Packet counts or synthetic decoded energy alone do not prove physical speakers.
+5. Test mute/restart, USB disconnect/system-default recovery and Bluetooth after wired/built-in equipment works.
 
-TURN is disabled by default. Do not enable it until your provider account's free quota, overage behavior and genuinely expiring credential are verified. Configure it using the service guide; API keys belong in Worker secrets, not the app or source repository. An issuance/session limit in Auralink does **not** guarantee a provider billing cap or bound all copied-credential usage.
+Windows microphone privacy must allow desktop apps; macOS needs Microphone permission. A flat meter suggests input/permission; a moving meter without received packets suggests transport; packets without sound suggest output/playback. Report the failing direction and these observations.
 
-To establish fallback, use a network pair that cannot connect directly and verify that the selected route actually becomes relayed. If direct traversal already works, report that TURN was not exercised. Start with a short audio-only session, inspect the provider's usage dashboard, then test video/screen sharing briefly within the available free allowance. Do not spend the whole allowance on a long maximum-quality test.
+## Attended input
 
-The default optional relay room deadline is ten minutes from offering usable TURN configuration. **The whole room ends at that deadline even if its eventual route is direct**, because the coordinator cannot reliably prove every client's route. Check that capture/input stop, the directory remains usable and a new room gets a fresh admission. Expired credentials, provider errors or exhausted app issuance limits must fall back to direct-only behavior; no paid fallback should be selected.
+Share a **full display**. Window presentation is viewing-only for native input. The controller requests control; the screen owner separately approves in the app and completes native consent. Room entry alone must never move the pointer.
 
-## Audio
+Use a harmless editor: click, short drag, scrolling, English-US ASCII, Enter, Backspace and supported host shortcuts. Mac input needs **Accessibility** and capture needs **Screen Recording**; macOS 15+ Nearby may need **Local Network**. Restart after permission changes when required.
 
-Microphones start off after admission. Test voice before starting screen sharing:
+On the Mac, double-click a harmless Finder folder and confirm it opens; triple-click an ordinary editable word/line to test native click-count behavior. Verify Command-based copy/paste/select-all in that editor. Change display arrangement, resolution or scaling while sharing: capture/control must stop, and selecting a display again must require a fresh approval. Repeat with an external display being connected or removed if available.
 
-1. Choose the microphone and audio output in **Settings → Camera and sound**, then **Save preferences**. If you change the microphone during a call, turn it off and on to apply the choice.
-2. In the room, select **Check sound → Test microphone** and speak. The test runs for at most ten seconds; it does not record a file. Select **Play speaker test** and confirm the tone is audible. Check Windows/macOS microphone privacy permission or Android's microphone permission if the meter stays still.
-3. Enable the microphone on each device. Use headphones when the devices are nearby. On Android, start with **Speaker on**, raise the call/media volume, and test built-in audio before trying Bluetooth.
-4. Speak from Windows to the phone, then from the phone to Windows. Confirm each sender's local microphone meter moves. Tap **Enable sound** on the receiving device if the prompt appears.
-5. Open **Connection details** on each device. While speaking, compare **Audio sent**, **Audio received**, **Microphone level** and **Playback**. Packet counts should increase; increasing counts alone do not prove the speaker is audible.
+Test each stop separately: owner **Stop control**, controller release, **Stop sharing**, disconnect, host quit and emergency shortcut. Further input must cease immediately. Replaced sockets/new rooms or expired 15-minute control leases require fresh consent. Secure/UAC desktops, locked screens and protected dialogs are outside support.
 
-If the sender's meter is flat, check its selected microphone and system permission. If its meter moves but the receiver has no audio packets, report that direction and the connection state. If packets arrive but speech is silent, report the receiving output, speaker-test result and Playback status. Never include an invitation or room key in a report.
+## Nearby and reporting
 
-## Desktop presentation and input
+For a local baseline use **Other connection options → Nearby / private room → Nearby**, selecting the reachable host adapter. Share the invitation and approve admission. Keep Windows Firewall enabled. Guest-network isolation/wrong adapters can block this.
 
-Share a full desktop display. A window-only presentation does not accept native desktop control. Select the shared display on the other endpoint and request control. The owner confirms both app review and native consent. Test a harmless text editor: clicks, scroll, ASCII typing and Backspace. Revoke and verify further input stops.
+Report release, OS, host direction, networks, route/codec/resolution/fps, permissions and reproducible steps. For sound include meter, speaker test and failing direction; for input include full display vs window and native consent. Exclude invitations, pairing/device tokens, ICE credentials and account identifiers.
 
-On the MacBook Air M4, open the Apple Silicon DMG, drag Auralink into **Applications**, and launch it from there. This test build is ad-hoc signed and unnotarized; use macOS's app review/open flow without disabling Gatekeeper globally. On macOS 15+, allow Auralink under **Privacy & Security → Local Network** when connecting nearby devices. Grant **Microphone**, **Camera**, **Screen Recording** and **Accessibility** only for the features you test. Restart after permission changes when required. Test Mac hosting and joining separately. Its hosted build checks establish the packaged app starts, but physical Mac media and remote input still need this test.
-
-## Phone presentation and input
-
-Choose **Share screen** on Android and accept its system capture consent. Auralink requests the whole phone display so input coordinates match the shared picture; app-only selection is not offered by this build. Android 13+ also requests optional notification permission. Allow it if you want the **Stop sharing** notification outside the app.
-
-First confirm the phone picture appears on the desktop. Then select it and request control. Enable the explicitly named **Auralink attended control** accessibility service when instructed; sideloaded apps may require **Allow restricted settings** in Android's app settings before enabling it. Return to Auralink and approve a fresh control request, including its separate native owner confirmation. Enabling Accessibility alone grants nobody access.
-
-Phone capture remains limited to 12 fps and a maximum 1280/1920-pixel long edge according to the preset. Test readable text, motion and rotation at these actual limits; do not report this as native 2K/30fps capture. The phone shares microphone audio rather than Android system sound.
-
-Test taps, short drags, scrolling, **Esc / Back**, **Home** and ASCII in a normal editable field. Support differs by target app; it is not unrestricted PC keyboard emulation. Protected screens and password editing remain outside support. After a rotation changes capture dimensions, request and approve control again.
-
-Use the floating **Stop control** button and verify further input stops. Stop sharing and confirm both picture and input end. If notification permission is disabled, return to Auralink and select **Stop sharing**, or use Android's capture control where available. Also test lock, peer disconnect and system capture cancellation. Leaving Auralink without active screen sharing ends the phone room; new microphone/camera capture and owner approvals require the app in the foreground.
-
-Report release, OS/WebView versions, Nearby/Internet mode, network arrangement, approval steps and reproducible behavior. For Internet include direct/relay route when verified, each device's network and whether a provider/session limit was reached. For audio include the failing direction, local meter response, speaker-test result and packet counts. For screen/control include whether a picture appeared, Accessibility was enabled and native confirmation completed. Build and synthetic tests do not establish these hardware outcomes. Exclude service secrets, invitations, device tokens, ICE credentials and account identifiers.
+[Android development details](../android/README.md) are preserved without claiming physical iQOO success for this desktop milestone.

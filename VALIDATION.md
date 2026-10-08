@@ -2,9 +2,21 @@
 
 Tests record specific behavior. They do not certify unrestricted device control, physical media quality, internet reachability or absolute security.
 
-## 0.3.0 Internet beta checks
+## 0.4.0 desktop screen-sharing revision in progress
 
-The current source adds a private Internet directory and coordinator alongside Nearby mode. The deployed service is reachable at `https://auralink-private-coordinator.auralink-internet-service.workers.dev` using normal certificate-chain and hostname verification. Pairing secrets and device tokens are not part of the public installers or source archive.
+The current milestone is Windows and Apple Silicon macOS: open an invitation room with one click, share its link, and let the invited device join without an admission prompt. Each screen owner deliberately starts capture and separately approves remote control. Camera calls are removed; microphone audio remains optional. Android work is retained in source and deferred from this release milestone.
+
+The current source passes 150 unit tests covering invitation parsing, admission, revocation, encrypted media, codec resource limits and native lifecycle. The native display check also covers Electron 44.6's legacy empty-device permission stage: it requires a current owner-selected source and still rejects camera requests. The initial blocked-P2P browser test displayed screen pixels and decoded microphone audio over the limited JPEG compatibility path; that result alone did not establish compressed performance.
+
+The public coordinator now enables invitation rooms and encrypted WebSocket relay. Its deployed smoke passes normal HTTPS/WSS validation, automatic invitation entry, encrypted duplex packets, separate control consent, revocation, removal and room teardown. Two actual Electron apps using the production preload and native WSS displayed synthetic 2560×1440 H.264 screen frames at 22.3 and 18.1 fps, one presenter at a time in each direction. Direct WebRTC was deliberately restricted to relay-only without TURN and then closed; no browser socket or hardware sensor was substituted for the native transport. Source hashes and actual playback-frame counts are saved in `test-results/invitation-electron-live.json`.
+
+Fresh Windows/macOS package verification is being completed. Physical Windows-to-Mac tests on different networks remain required; same-PC tests do not establish the user's MacBook permissions, native input or carrier connectivity. Earlier release reports below describe historical binaries.
+
+The default relay has finite shared room/day allowances. It forwards client-encrypted packets using keys issued by the coordinator; the coordinator is a trusted key distributor. This is not a claim of encryption against a malicious key distributor. No paid relay, card or overage plan has been enabled.
+
+## Historical 0.3.0 Internet beta checks
+
+The 0.3.0 source added a private Internet directory and coordinator alongside Nearby mode. The service used normal certificate-chain and hostname verification. Pairing secrets and device tokens were excluded from the public installers and source archive.
 
 | Check | What it establishes |
 |---|---|
@@ -17,7 +29,7 @@ The current source adds a private Internet directory and coordinator alongside N
 | Native desktop lifecycle tests | Canceled asynchronous room preparation cannot replace a newer broker or leave a late listener running; stale screen enumeration cannot authorize a source |
 | Android policy and bridge tests | Normal Internet CA/hostname verification remains separate from LAN pinning; room/socket loss invalidates consent immediately; capture IDs keep late results, frames and stops scoped to the originating share |
 
-The deeper review fixed reproduced asynchronous room/capture/control races, stale callbacks, lost consent/relay state through hibernation and two fetch behaviors specific to Cloudflare. The live relay is still disabled. Its optional path is covered with a fake provider in the actual Workers runtime; that does not establish that Metered's free account supports provider-enforced credential expiry. The account's activated allowance was a 500 MB trial. No paid plan or overage option was enabled.
+The 0.3.0 review fixed reproduced asynchronous room/capture/control races, stale callbacks, lost consent/relay state through hibernation and two fetch behaviors specific to Cloudflare. TURN was disabled in that release. Its optional path was covered with a fake provider in the actual Workers runtime; that did not establish that Metered's free account supported provider-enforced credential expiry. The account's activated allowance was a 500 MB trial. No paid plan or overage option was enabled.
 
 Current evidence is saved locally as `test-results/internet-public-native.json`, `internet-public-browser.json`, `internet-desktop.json`, `internet-electron-media.json`, `internet-browser.json` and the standard platform evidence files. A successful same-PC WebRTC path through a public signaling service does not establish media connectivity between different countries, restrictive routers or mobile carriers.
 
@@ -55,8 +67,8 @@ Mac hosted build checks do not grant the user's TCC permissions or prove physica
 
 ## Remaining limits
 
-- Nearby supports same-network operation. The private Internet directory is deployed; media currently attempts direct WebRTC with STUN. TURN is disabled, so some network pairs cannot connect.
-- Desktop presentation targets at most 1440p/30; Android initially caps the longest edge at 1280/1920 with at most about 12fps and JPEG/video-frame conversion. Selection is a ceiling, not a measured-quality promise.
+- Internet rooms prefer direct WebRTC with STUN, then use compressed encrypted WebSocket relay when direct transport fails. TURN is disabled. HTTPS/WSS blocking, service outages and finite shared budgets can still prevent connections.
+- Desktop presentation targets at most 1440p/30. The measured same-PC compressed result is 18–22 fps; source capability, decoder, network and congestion can reduce it. Engines without a common video codec use the explicitly labeled 4 fps JPEG compatibility path. Android is deferred from the current release.
 - Voice uses microphone audio. Desktop/phone system playback capture is absent.
 - Desktop input follows OS permission boundaries, including the Windows secure/UAC desktop and locked screens. It does not inspect or block ordinary desktop password fields. Android refuses password-field editing and cannot bypass lock screens, protected content or OS permission surfaces.
 - ASCII/host layout limits apply; arbitrary Unicode and complete OS keyboard support are absent.

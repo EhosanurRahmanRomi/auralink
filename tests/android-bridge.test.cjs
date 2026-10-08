@@ -17,7 +17,7 @@ function setup({ android = true, existing, reject, response } = {}) {
       ok: !reject?.(message), result: response ? response(message) : message.method === 'getInfo' ? { platform: 'android', nativeControl: false } : { ok: true },
       error: 'Native permission declined.' })));
   } };
-  vm.runInNewContext(source, { window, EventTarget, Event, MessageEvent, DOMException, TextEncoder, URL, setTimeout, clearTimeout, queueMicrotask });
+  vm.runInNewContext(source, { window, EventTarget, Event, MessageEvent, DOMException, TextEncoder, URL, atob, setTimeout, clearTimeout, queueMicrotask });
   return { window, messages, bridge: window.auralink, receive: data => window.__auralinkNativeReceive(JSON.stringify(data)) };
 }
 
@@ -25,6 +25,20 @@ test('ordinary browser and Electron retain their original transport and privileg
   assert.equal(setup({ android: false }).bridge, undefined);
   const desktop = { platform: 'win32', hostRoom: () => {} };
   assert.equal(setup({ existing: desktop }).bridge, desktop);
+});
+
+test('Android invitations use an explicit one-shot RPC and bounded live callback without media actions', async () => {
+  const code = `A1.89bf3734-2920-41c1-bbce-439085f9037e.${'A'.repeat(43)}`;
+  const { bridge, receive, messages } = setup({ response: message => message.method === 'getPendingInvitation' ? code : { ok: true } });
+  const invitations = []; const remove = bridge.onInvitation(value => invitations.push(value));
+  assert.equal(await bridge.getPendingInvitation(), code);
+  assert.deepEqual(messages.map(message => message.method), ['getPendingInvitation']);
+  receive({ event: 'app-invitation', code });
+  receive({ event: 'app-invitation', code: 'https://example.com/' });
+  receive({ event: 'app-invitation', code: code + '.extra' });
+  assert.deepEqual(invitations, [code]);
+  remove(); receive({ event: 'app-invitation', code }); assert.equal(invitations.length, 1);
+  assert.deepEqual(messages.map(message => message.method), ['getPendingInvitation']);
 });
 
 test('Android bridge exposes attended screen/input RPCs without desktop room hosting', async () => {
@@ -171,4 +185,21 @@ test('native TLS/signaling failures and lifecycle stops close every room socket'
   const third = bridge.createSocket('wss://host:4443/ws'); await flush();
   assert.equal(third.readyState, 0);
   third.close(); receive({ event: 'socket', socketId: third.id, type: 'close', code: 1000 }); await flush();
+});
+
+test('only exact bounded encrypted Internet relay signals may exceed the normal native bridge size', async () => {
+  const { bridge, receive, messages } = setup();
+  const relay = { version: 1, epoch: 'a'.repeat(16), counter: 1, nonce: 'b'.repeat(16), ciphertext: Buffer.alloc(80000, 7).toString('base64url') };
+  const packet = { type: 'signal', to: 'room-peer', data: { relay } }; const raw = JSON.stringify(packet);
+  const socket = bridge.createInternetSocket('wss://service.example/internet/ws'); await flush(); receive({ event: 'socket', socketId: socket.id, type: 'open' });
+  const received = []; socket.addEventListener('message', event => received.push(event.data));
+  socket.send(raw); await flush(); assert.equal(messages.find(message => message.method === 'sendSocket').args.data, raw);
+  for (const invalid of [{ ...packet, extra: true }, { ...packet, type: 'join' }, { ...packet, data: { relay, description: 'not-relay' } }, { ...packet, data: { relay: { ...relay, counter: 0 } } }, { ...packet, data: { relay: { ...relay, plaintext: 'forbidden' } } }, { ...packet, data: { relay: { ...relay, ciphertext: Buffer.alloc(180001).toString('base64url') } } }]) assert.throws(() => socket.send(JSON.stringify(invalid)), /64 KB/);
+  const incoming = JSON.stringify({ type: 'signal', from: 'room-peer', data: { relay } });
+  receive({ event: 'socket', socketId: socket.id, type: 'message', data: incoming });
+  receive({ event: 'socket', socketId: socket.id, type: 'message', data: JSON.stringify({ type: 'signal', from: 'room-peer', data: { relay, screen: true } }) });
+  assert.deepEqual(received, [incoming]);
+  const nearby = bridge.createSocket('wss://host.example/ws'); await flush(); receive({ event: 'socket', socketId: nearby.id, type: 'open' });
+  assert.throws(() => nearby.send(raw), /64 KB/);
+  socket.close(); nearby.close(); receive({ event: 'socket', socketId: socket.id, type: 'close' }); receive({ event: 'socket', socketId: nearby.id, type: 'close' }); await flush();
 });

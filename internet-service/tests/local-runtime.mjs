@@ -10,7 +10,7 @@ export async function createLocalCoordinator(options = {}) {
     durableObjects: { COORDINATOR: { className: 'AuralinkCoordinator', useSQLite: true } },
     bindings: { PAIRING_KEY: pairingKey, RELAY_ENABLED: 'false', ...options.bindings },
     ...(options.outbound ? { outboundService: options.outbound } : {}),
-    ...(options.persist ? { durableObjectsPersist: options.persist } : {}) }));
+    ...(options.persist ? { resourcePersistencePath: options.persist } : {}) }));
   const url = (await mf.ready).toString().replace(/\/$/, '');
   return { mf, url, pairingKey, close: () => mf.dispose() };
 }

@@ -76,6 +76,8 @@ public final class AndroidSecurityHarness {
     check(PinnedTls.context(invitation) != javax.net.ssl.SSLContext.getDefault(), "Pinned context is instance scoped");
     internetPolicies(invitation);
     membershipPolicies();
+    relayPolicies();
+    appInvitationPolicies();
     controlPolicies();
     System.out.println("POLICIES_PASS checks=" + checks);
   }
@@ -158,6 +160,41 @@ public final class AndroidSecurityHarness {
     check(ownership.claim(oldTicket) && ownership.activeMatches(oldTicket), "Replacement consent can claim only after the old projection releases ownership");
     check(!ownership.release(replacement) && ownership.activeMatches(oldTicket), "Delayed prior teardown cannot release the newly started projection");
     check(ownership.release(oldTicket) && !ownership.activeMatches(oldTicket), "Owner stop releases exact active capture ownership");
+  }
+  private static void relayPolicies() {
+    String epoch = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[12]);
+    String small = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[16]);
+    String maximum = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[180000]);
+    check(RelayMediaPolicy.valid(5, 1, epoch, 1, epoch, small), "Smallest encrypted media envelope is accepted");
+    check(RelayMediaPolicy.valid(5, 1, epoch, 9007199254740991d, epoch, maximum), "Largest bounded encrypted frame and safe counter are accepted");
+    check(!RelayMediaPolicy.valid(6, 1, epoch, 1, epoch, small), "Additional encrypted envelope fields are rejected");
+    check(!RelayMediaPolicy.valid(4, 1, epoch, 1, epoch, small), "Missing encrypted envelope fields are rejected");
+    check(!RelayMediaPolicy.valid(5, 2, epoch, 1, epoch, small), "Unknown encrypted media version is rejected");
+    for (double counter : new double[] {0, -1, 1.5, Double.NaN, Double.POSITIVE_INFINITY, 9007199254740992d})
+      check(!RelayMediaPolicy.valid(5, 1, epoch, counter, epoch, small), "Nonpositive, fractional and unsafe counters are rejected");
+    check(!RelayMediaPolicy.valid(5, 1, epoch + "A", 1, epoch, small), "Malformed encrypted stream epoch is rejected");
+    check(!RelayMediaPolicy.valid(5, 1, epoch, 1, epoch.substring(1), small), "Malformed encrypted nonce is rejected");
+    check(!RelayMediaPolicy.valid(5, 1, epoch, 1, epoch, small.substring(1)), "Ciphertext smaller than an authentication tag is rejected");
+    check(!RelayMediaPolicy.valid(5, 1, epoch, 1, epoch, maximum + "AA"), "Oversized encrypted frame is rejected before decoding");
+    check(!RelayMediaPolicy.valid(5, 1, epoch, 1, epoch, small + "="), "Padded noncanonical ciphertext is rejected");
+    check(!RelayMediaPolicy.valid(5, 1, epoch, 1, epoch, small.substring(0, small.length() - 1) + "B"), "Noncanonical trailing ciphertext bits are rejected");
+    check(RelayMediaPolicy.validKey(java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32])), "Exact 32-byte admitted room key is accepted");
+    check(!RelayMediaPolicy.validKey(small), "Undersized admitted room key is rejected");
+    check(RelayMediaPolicy.SIGNAL_LIMIT == 65536 && RelayMediaPolicy.WIRE_LIMIT == 262144, "Only encrypted Internet media has a larger transport limit");
+  }
+  private static void appInvitationPolicies() throws Exception {
+    final String key = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
+    final String code = "A1.550e8400-e29b-41d4-a716-446655440000." + key;
+    final String link = "auralink://join#code=" + code;
+    check(AppInvitation.parse(link).equals(code), "An external app link supplies only its exact room capability");
+    for (final String invalid : new String[] {
+      "https://join#code=" + code, "auralink://other#code=" + code, "auralink://user@join#code=" + code,
+      "auralink://join:443#code=" + code, "auralink://join/#code=" + code, "auralink://join?other=1#code=" + code,
+      link + "&extra=1", link + "\n", "auralink://join#code=" + code.replace("A1.", "A1%2e"),
+      "auralink://join#code=" + code.replace("550e8400-e29b-41d4-a716-446655440000", "invalid-room"),
+      "auralink://join#code=" + code.substring(0, code.length() - 1) + "B", "auralink://join#code="
+    }) refuses(() -> AppInvitation.parse(invalid), "Malformed external app link cannot change the current room");
+    refuses(() -> AppInvitation.parse(null), "Missing external app link is rejected");
   }
   private static void internetSocket(Properties values, boolean shouldOpen) throws Exception {
     InternetServiceEndpoint endpoint = InternetServiceEndpoint.parse(values.getProperty("service"));

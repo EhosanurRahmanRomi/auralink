@@ -1,5 +1,7 @@
 'use strict';
 
+// Historical 0.3 camera/private-admission fixture; not a 0.4 release check.
+// Current screen/audio/native-public coverage is maintained separately.
 // Explicit opt-in: two independent, actual production Electron apps use their
 // bundled renderer/preload/native WSS against the private public coordinator.
 // Chromium supplies synthetic camera/WAV microphone data; no OS input, screen

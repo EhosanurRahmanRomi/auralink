@@ -14,13 +14,14 @@ function run(command,args) {
 }
 try {
   const compiler=run('swiftc',['--version']);
-  run('swiftc',['-O','-whole-module-optimization','-target','arm64-apple-macos13.0',source,'-framework','ApplicationServices','-o',output]);
+  run('swiftc',['-O','-whole-module-optimization','-target','arm64-apple-macos13.0',source,'-framework','ApplicationServices','-framework','AppKit','-o',output]);
   fs.chmodSync(output,0o755);
   run('lipo',[output,'-verify_arch','arm64']);
   run('codesign',['--force','--sign','-',output]);
   const selfTest=JSON.parse(run(output,['--self-test']));
   assert.equal(selfTest.passed,true);
   assert.equal(selfTest.inputPosted,false);
+  assert.ok(selfTest.clickTrackingChecks>=25);assert.ok(selfTest.quartzClickFieldChecks>=22);
   const out=path.join(project,'test-results');fs.mkdirSync(out,{recursive:true});
   fs.writeFileSync(path.join(out,'mac-helper-build.json'),JSON.stringify({passed:true,architecture:'arm64',minimumSystemVersion:'13.0',compiler,selfTest,signing:'ad-hoc; no Developer ID or notarization'},null,2));
   console.log(`Compiled and checked arm64 native helper (${selfTest.checks} safe checks, no input posted).`);

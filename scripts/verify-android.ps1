@@ -21,7 +21,7 @@ foreach ($needed in @($aaptPath, $javaPath, $apksignerPath)) {
     if (-not (Test-Path -LiteralPath $needed)) { throw "Missing verification tool: $needed" }
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $evidencePath) | Out-Null
-$evidence = [ordered]@{ StartedAt=(Get-Date).ToUniversalTime().ToString('o'); Passed=$false; DeviceTested=$false; DeviceInstallationExecuted=$false; Checks=@(); Caveats=@('No installation, launch, camera, microphone or networking test on a real Android device or emulator was performed.','Android capture/input use MediaProjection and Accessibility, require separate owner approvals, and need physical-device validation.','Reliable cross-network connectivity and sustained high-resolution quality depend on actual devices and networks.','APK uses a private local development signing identity; public app-store distribution is untested.') }
+$evidence = [ordered]@{ StartedAt=(Get-Date).ToUniversalTime().ToString('o'); Passed=$false; DeviceTested=$false; DeviceInstallationExecuted=$false; Checks=@(); Caveats=@('This artifact check performs no installation, launch, microphone or networking test on a real Android device or emulator.','Android capture/input use MediaProjection and Accessibility, require separate owner approvals, and need physical-device validation.','Reliable cross-network connectivity and sustained high-resolution quality depend on actual devices and networks.','APK uses a private local development signing identity; public app-store distribution is untested.') }
 
 function Invoke-VerificationTool([string]$Tool, [string[]]$Arguments) {
     $lines = @(& $Tool @Arguments 2>&1 | ForEach-Object { "$_" })
@@ -67,14 +67,15 @@ try {
     Assert-Verification ($manifest -match 'android:usesCleartextTraffic\(.*?\)=\(type 0x12\)0x0') 'APK must disable cleartext network traffic'
     Assert-Verification ($manifest -match 'android:exported\(.*?\)=\(type 0x12\)0xffffffff') 'APK launcher must be exported'
     $permissions = @([regex]::Matches($badging, "uses-permission: name='([^']+)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-    $expectedPermissions = @('android.permission.INTERNET','android.permission.CAMERA','android.permission.RECORD_AUDIO','android.permission.ACCESS_NETWORK_STATE','android.permission.MODIFY_AUDIO_SETTINGS','android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION','android.permission.FOREGROUND_SERVICE_MICROPHONE','android.permission.FOREGROUND_SERVICE_CAMERA','android.permission.POST_NOTIFICATIONS' | Sort-Object)
-    Assert-Verification (($permissions -join ',') -ceq ($expectedPermissions -join ',')) 'APK permissions differ from the expected calling, capture-service and audio-routing permissions'
-    $optionalFeatures = @('android.hardware.camera.any','android.hardware.camera','android.hardware.camera.autofocus','android.hardware.microphone')
+    $expectedPermissions = @('android.permission.INTERNET','android.permission.RECORD_AUDIO','android.permission.ACCESS_NETWORK_STATE','android.permission.CHANGE_NETWORK_STATE','android.permission.MODIFY_AUDIO_SETTINGS','android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION','android.permission.FOREGROUND_SERVICE_MICROPHONE','android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK','android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE','android.permission.POST_NOTIFICATIONS' | Sort-Object)
+    Assert-Verification (($permissions -join ',') -ceq ($expectedPermissions -join ',')) 'APK permissions differ from the reviewed room, screen-capture and microphone permissions'
+    Assert-Verification ($badging -notmatch 'android\.permission\.(CAMERA|FOREGROUND_SERVICE_CAMERA)' -and $badging -notmatch 'android\.hardware\.camera') 'Screen and audio app must not request camera access or camera hardware'
+    $optionalFeatures = @('android.hardware.microphone')
     foreach ($feature in $optionalFeatures) {
         Assert-Verification ($badging -match "uses-feature-not-required: name='$([regex]::Escape($feature))'") "APK hardware feature must be optional: $feature"
     }
     $evidence.Manifest = [ordered]@{ Package='local.auralink.mobile'; VersionName=$projectVersion; VersionCode=$actualVersionCode; MinimumSDK=29; TargetSDK=36; MainActivity='local.auralink.mobile.MainActivity'; Debuggable=$false; AllowBackup=$false; UsesCleartextTraffic=$false; LauncherExported=$true; Permissions=$permissions; OptionalHardwareFeatures=$optionalFeatures }
-    $evidence.Checks += 'Actual binary manifest has expected package, launcher, SDK levels, non-debuggable/security flags and ten reviewed calling, capture-service, notification and audio-routing permissions'
+    $evidence.Checks += 'Actual binary manifest has expected package, launcher, SDK levels, security flags and eleven reviewed room, screen-capture, microphone, notification and audio-routing permissions; no camera permission or hardware feature'
 
     $signature = Invoke-VerificationTool $javaPath @('-jar',$apksignerPath,'verify','--verbose','--print-certs','--min-sdk-version','29',$ApkPath)
     Assert-Verification ($signature -match 'Verified using v3 scheme .*: true') 'APK v3 signature verification failed'
@@ -100,11 +101,11 @@ try {
         $dexMagic = [Text.Encoding]::ASCII.GetString($dex, 0, 8)
         Assert-Verification ($dexMagic -match '^dex\n0[0-9]{2}\x00$') 'APK classes.dex does not contain a valid DEX header'
         $dexText = [Text.Encoding]::ASCII.GetString($dex)
-        foreach ($class in @('Llocal/auralink/mobile/MainActivity;','Llocal/auralink/mobile/PinnedTls;','Llocal/auralink/mobile/PinnedRoomClient;','Llocal/auralink/mobile/Invitation;','Llocal/auralink/mobile/InternetServiceEndpoint;','Llocal/auralink/mobile/RoomMembership;','Llocal/auralink/mobile/ProjectionOwnership;','Llocal/auralink/mobile/ScreenShareService;','Llocal/auralink/mobile/AttendedAccessibilityService;','Llocal/auralink/mobile/AttendedControlPolicy;','Llocal/auralink/mobile/CallAudio;')) {
+        foreach ($class in @('Llocal/auralink/mobile/MainActivity;','Llocal/auralink/mobile/AppInvitation;','Llocal/auralink/mobile/PinnedTls;','Llocal/auralink/mobile/PinnedRoomClient;','Llocal/auralink/mobile/Invitation;','Llocal/auralink/mobile/InternetServiceEndpoint;','Llocal/auralink/mobile/RoomMembership;','Llocal/auralink/mobile/ProjectionOwnership;','Llocal/auralink/mobile/RelayMediaPolicy;','Llocal/auralink/mobile/ScreenShareService;','Llocal/auralink/mobile/CallSessionService;','Llocal/auralink/mobile/AttendedAccessibilityService;','Llocal/auralink/mobile/AttendedControlPolicy;','Llocal/auralink/mobile/CallAudio;')) {
             Assert-Verification ($dexText.Contains($class)) "APK classes.dex is missing required native class: $class"
         }
         $assetResults = @()
-        foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js')) {
+        foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js')) {
             $packagedBytes = Read-ApkEntry $archive "assets/renderer/$file"
             $sourceHash = (Get-FileHash -LiteralPath (Join-Path $projectPath "src/renderer/$file") -Algorithm SHA256).Hash.ToLowerInvariant()
             $packagedHash = Get-BytesSHA256 $packagedBytes
@@ -114,7 +115,7 @@ try {
         $privateEntries = @($entryNames | Where-Object { $_ -match '(?i)(\.jks$|\.keystore$|signing-password|(^|/)\.private/|(^|/)\.tools/|^android/libs/|^src/.*\.java$)' })
         Assert-Verification ($privateEntries.Count -eq 0) 'APK unexpectedly contains private keys, build tools or unrequested project source'
         $evidence.Contents = [ordered]@{ EntryCount=$entryNames.Count; EntryPathsUseForwardSlashes=$true; IconAndResourceTablePresent=$true; LegalNoticesPresent=$true; HasClassesDEX=$true; ABIIndependentDEX=$true; DEXBytes=$dex.Length; DEXSHA256=(Get-BytesSHA256 $dex); RequiredNativeClassesPresent=$true; PrivateBuildMaterialPresent=$false; RendererAssets=$assetResults; AllRendererAssetsMatch=$true }
-        $evidence.Checks += 'APK includes executable DEX/native class descriptors and all seven renderer assets match current source SHA256 without private build material'
+        $evidence.Checks += 'APK includes executable DEX/native class descriptors and all nine renderer assets match current source SHA256 without private build material'
     } finally { $archive.Dispose() }
     $buildRecordPath = Join-Path $projectPath 'release/Android-build.json'
     if (Test-Path -LiteralPath $buildRecordPath) {

@@ -1,15 +1,16 @@
 {
   "name": "auralink-internet-service",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Private paired-device signaling for Auralink on Cloudflare Workers Free",
+  "description": "Invitation rooms, private paired-device signaling and bounded encrypted media forwarding on Cloudflare Workers Free",
   "scripts": {
     "dev": "wrangler dev --local",
     "deploy": "wrangler deploy",
     "check": "wrangler deploy --dry-run --outdir .wrangler/build",
-    "test": "node --test ../tests/internet-service.test.cjs",
-    "test:runtime": "node --test tests/runtime.test.mjs"
+    "test": "node --test ../tests/internet-service.test.cjs tests/audit.test.mjs",
+    "test:runtime": "node --test tests/runtime.test.mjs",
+    "test:deployed": "node tests/deployed-smoke.mjs"
   },
   "devDependencies": {
     "miniflare": "5.20261006.0-alpha",

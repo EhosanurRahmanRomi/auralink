@@ -1,4 +1,5 @@
 /* Native desktop transport keeps certificate and room authorization outside the renderer. */
+import { relayPacketSizeAllowed } from './internet.js';
 let nextSocket = 0;
 export function createDesktopInternetSocket(bridge, url) {
   return new DesktopInternetSocket(bridge, url);
@@ -30,7 +31,7 @@ class DesktopInternetSocket extends EventTarget {
   }
   send(data) {
     if (this.readyState !== 1) throw new DOMException('The internet connection is not open.', 'InvalidStateError');
-    if (typeof data !== 'string' || new TextEncoder().encode(data).length > 65536) throw new TypeError('Internet signaling accepts text up to 64 KB.');
+    if (typeof data !== 'string' || (new TextEncoder().encode(data).length > 65536 && !relayPacketSizeAllowed(data))) throw new TypeError('Internet signaling accepts text up to 64 KB, or a bounded encrypted relay packet.');
     this.bridge.internetSend({ socketId: this.id, data }).catch(() => {
       if (this.readyState === 3) return;
       this.dispatchEvent(new Event('error')); this.close();

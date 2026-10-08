@@ -128,7 +128,7 @@ async function main() {
     await phone.waitForFunction(() => document.getElementById('share-button').getAttribute('aria-label') === 'Stop sharing screen');
     await host.page.waitForFunction(() => { const video = document.getElementById('phone-screen'); return video?.videoWidth > 0 && video.videoHeight > video.videoWidth; }, undefined, { timeout: 20000 });
     await phone.waitForFunction(() => qaPhone.acked.length >= 3);
-    assert.deepEqual(await phone.evaluate(() => qaPhone.options), { quality: '720p', microphone: false, camera: false });
+    assert.deepEqual(await phone.evaluate(() => qaPhone.options), { quality: '720p', microphone: false });
     const decoded = await host.page.evaluate(async peerId => {
       const video = document.getElementById('phone-screen'); const report = await rtc.peers.get(peerId).pc.getStats(); const rows = [];
       report.forEach(row => { if (row.type === 'inbound-rtp' && row.kind === 'video') rows.push({ decoded: row.framesDecoded, received: row.bytesReceived }); });
@@ -159,7 +159,7 @@ async function main() {
     await phone.waitForFunction(() => document.getElementById('toast-region').textContent.includes('Update Android System WebView'));
     assert.equal(await phone.evaluate(() => qaPhone.started), 1, 'Unsupported frame generation must fail before requesting another native projection');
     result = { passed: true, environment: 'Real HTTPS broker and RTC engine; mobile UI; explicit native Android bridge fixture producing720x1280JPEG frames',
-      verified: ['no projection on join', 'phone share button calls native consent contract', 'quality and current microphone/camera flags passed', 'JPEGs become explicit VideoFrames with native acknowledgments while canvas capture and DOM image decoding are disabled',
+      verified: ['no projection on join', 'phone share button calls native consent contract', 'quality and current microphone flag passed', 'JPEGs become explicit VideoFrames with native acknowledgments while canvas capture and DOM image decoding are disabled',
         'desktop actually decodes portrait RTP video', 'bad JPEG acknowledged and following frames recover', 'phone accepts control only after explicit review', 'approved input bound to remote peer/session', 'owner revocation rejects late input', 'stop releases stream and frame subscription', 'older WebView gets update guidance before native projection starts'],
       limitations: ['Native projection approval, Accessibility and Android background lifecycle are fixtures; a physical phone test is required'], decoded, errors };
     assert.deepEqual(errors, []); assert.deepEqual(await host.page.evaluate(() => fixtureErrors), []);

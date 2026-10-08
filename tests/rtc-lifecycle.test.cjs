@@ -39,14 +39,14 @@ test('overlapping diagnostics share a snapshot and discard results of a removed 
 
 test('capture teardown during source replacement stops media and cannot attach the remaining sources', async () => {
   const { RoomRTC } = await moduleReady; let release; let entered; const pending = new Promise(resolve => { release = resolve; });
-  const started = new Promise(resolve => { entered = resolve; }); let cameraAttached = false, stopped = 0;
-  const audio = { kind: 'audio', stop() { stopped++; } }; const camera = { kind: 'video', stop() { stopped++; } };
+  const started = new Promise(resolve => { entered = resolve; }); let screenAttached = false, stopped = 0;
+  const audio = { kind: 'audio', stop() { stopped++; } }; const screen = { kind: 'video', stop() { stopped++; } };
   const rtc = new RoomRTC({ selfId: 'owner', signal() {} });
   const entry = { info: { id: 'guest' }, senders: new Map([
     ['audio', { track: null, async replaceTrack() { entered(); await pending; } }],
-    ['camera', { track: null, async replaceTrack() { cameraAttached = true; } }],
+    ['screen', { track: null, async replaceTrack() { screenAttached = true; } }],
   ]), pc: { close() {} } };
-  rtc.peers.set('guest', entry); rtc.localTracks.set('camera', { track: camera });
+  rtc.peers.set('guest', entry); rtc.localTracks.set('screen', { track: screen });
   const replacement = rtc.setTrack('audio', audio, {}); await started; rtc.close(); release(); await replacement;
-  assert.equal(stopped, 2); assert.equal(cameraAttached, false); assert.equal(rtc.peers.size, 0);
+  assert.equal(stopped, 2); assert.equal(screenAttached, false); assert.equal(rtc.peers.size, 0);
 });

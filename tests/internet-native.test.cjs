@@ -4,6 +4,59 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { internetOrigin, probeInternetService, InternetMembership, NativeInternetClient } = require('../src/core/internet-client.cjs');
 
+function mediaFixture(peer, incoming = false) {
+  return { type: 'signal', [incoming ? 'from' : 'to']: peer, data: { relay: { version: 1, epoch: 'a'.repeat(16), nonce: 'b'.repeat(16),
+    counter: 1, ciphertext: Buffer.alloc(70000, 77).toString('base64url') } } };
+}
+function nativeFixture(relayEnabled = true) {
+  class Socket extends EventEmitter { constructor(url, options) { super(); this.readyState = 1; this.options = options; this.sent = []; }
+    send(value) { this.sent.push(value); } ping() {} close(code) { this.emit('close', code, 'Closed'); } terminate() {} }
+  const events = [], client = new NativeInternetClient('https://service.example', 'media-test', event => events.push(event), () => {}, { Socket });
+  const deliver = value => client.ws.emit('message', Buffer.from(JSON.stringify(value)), false);
+  client.send(JSON.stringify({ type: 'join', roomId: 'room', roomKey: 'fixture' }));
+  deliver({ type: 'welcome', selfId: 'owner', room: { id: 'room' }, peers: [{ id: 'guest' }], websocketRelayEnabled: relayEnabled,
+    ...(relayEnabled ? { relayKey: Buffer.alloc(32, 61).toString('base64url') } : {}) });
+  return { client, events, deliver };
+}
+
+test('native media transport admits bounded ciphertext only for welcome-enabled current room peers', () => {
+  const { client, events, deliver } = nativeFixture();
+  try {
+    assert.equal(client.ws.options.maxPayload, 262144);
+    const outgoing = mediaFixture('guest'); client.send(JSON.stringify(outgoing)); assert.equal(client.ws.sent.at(-1), JSON.stringify(outgoing));
+    const incoming = mediaFixture('guest', true); deliver(incoming);
+    assert.equal(JSON.parse(events.at(-1).data).data.relay.ciphertext, incoming.data.relay.ciphertext);
+    assert.equal(client.membership.grant, null);
+    assert.throws(() => client.send(JSON.stringify(mediaFixture('unapproved'))), /encrypted media/);
+    client.send('{"type":"leave"}'); assert.throws(() => client.send(JSON.stringify(outgoing)), /encrypted media/);
+  } finally { client.close(); }
+});
+
+test('native transport rejects oversized plaintext, metadata and malformed encrypted envelopes in both directions', () => {
+  const variants = [value => { value.data.relay.counter = Number.MAX_SAFE_INTEGER + 1; }, value => { value.data.codec = 'plaintext'; },
+    value => { value.data.relay.codec = 'plaintext'; }, value => { value.data.relay.ciphertext = 'a'.repeat(23); },
+    value => { value.data.relay.ciphertext = Buffer.alloc(180001).toString('base64url'); }, value => { value.extra = 'spoofed'; }];
+  for (const modify of variants) {
+    const { client, deliver, events } = nativeFixture(); const outgoing = mediaFixture('guest'); modify(outgoing);
+    assert.throws(() => client.send(JSON.stringify(outgoing)), /encrypted media/);
+    const incoming = mediaFixture('guest', true); modify(incoming); const before = events.filter(event => event.type === 'message').length;
+    deliver(incoming); assert.equal(client.closed, true); assert.equal(events.filter(event => event.type === 'message').length, before);
+  }
+  for (const enabled of [false, true]) {
+    const { client, deliver } = nativeFixture(enabled);
+    assert.throws(() => client.send(JSON.stringify({ type: 'signal', to: 'guest', data: { plaintext: 'x'.repeat(70000) } })), /encrypted media/);
+    deliver(enabled ? { type: 'signal', from: 'guest', data: { plaintext: 'x'.repeat(70000) } } : mediaFixture('guest', true));
+    assert.equal(client.closed, true);
+  }
+});
+
+test('late encrypted media after peer departure cannot reach privileged native listeners', () => {
+  const { client, events, deliver } = nativeFixture();
+  deliver({ type: 'peer-left', peerId: 'guest' }); const count = events.filter(event => event.type === 'message').length;
+  deliver(mediaFixture('guest', true)); assert.equal(client.closed, true);
+  assert.equal(events.filter(event => event.type === 'message').length, count);
+});
+
 test('Internet service uses standard HTTPS with a credential-free fixed socket path', () => {
   assert.equal(internetOrigin('https://auralink.example/'), 'https://auralink.example');
   for (const url of ['http://host/', 'https://name:secret@host/', 'https://host/other', 'https://host/?token=secret', 'https://host/#secret', 'https://host/\n', 'https://host/a/..', 'https://host/?', 'https://host/#', 'https://host\\']) assert.throws(() => internetOrigin(url));

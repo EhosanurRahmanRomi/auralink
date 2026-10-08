@@ -7,3 +7,6 @@ RELAY_ENABLED="false"
 # METERED_APP_DOMAIN="your-app.metered.live"
 # METERED_API_KEY="credential-scoped-key-from-your-dashboard"
 # METERED_CREDENTIAL_EXPIRES_AT="2026-10-07T23:00:00Z"
+PUBLIC_ROOMS="false"
+# Optional encrypted media forwarding with strict finite free-beta quotas.
+WEBSOCKET_RELAY="false"

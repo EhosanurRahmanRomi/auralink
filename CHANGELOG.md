@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — Desktop screen assistance (in development)
+
+- Focused Windows↔macOS delivery on screen sharing, optional microphone audio and attended input. Removed camera controls, capture and device preferences; Android delivery is deferred while its source changes remain.
+- Added one-click invitation rooms with automatic entry, host removal and invitation closure/rotation. Screen capture and native control remain independently consented.
+- Added validated installed-app invitations and a fragment-only landing page; an incoming link does not silently replace an active room.
+- Added bounded authenticated WebSocket fallback, strict native envelope gates and visible free-budget errors. Encoded high-quality screen performance is validated separately from the limited JPEG compatibility mode.
+- Preserved screen/audio slots, tightened asynchronous teardown and kept desktop media active while minimized. Deferred Android retains its document and owner-visible session service during ordinary backgrounding.
+- Converted browser coverage to actual decoded synthetic screen/audio and independent consent. Physical Windows↔Mac quality, sound, permissions and input require separate evidence.
+
 ## 0.3.1 — Guided Internet setup
 
 - Creating an Internet room with a missing or invalid service address now opens the relevant Settings field with persistent setup instructions, before room admission or audio preparation begins.

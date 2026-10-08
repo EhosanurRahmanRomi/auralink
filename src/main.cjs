@@ -8,6 +8,7 @@ const {parseInvite, fingerprint, certificateDecisionForPin} = require('./core/in
 const {createBroker} = require('./core/broker.cjs');
 const {ControlGate, createAdapter} = require('./native/control.cjs');
 const {probeInternetService, NativeInternetClient} = require('./core/internet-client.cjs');
+const {parseAppInvitation} = require('./core/app-invitation.cjs');
 
 app.setName('Auralink');
 let win, broker, adapter, gate, selectedSource, currentSource;
@@ -18,6 +19,24 @@ const pins = new Map();
 const sources = new Map();
 const localPage = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
 const testing = process.argv.includes('--smoke-test');
+let ownsInstance = true;
+let pendingInvitation = process.argv.map(parseAppInvitation).find(Boolean) || null;
+function deliverInvitation(value) {
+  const code = parseAppInvitation(value); if (!code) return;
+  pendingInvitation = code;
+  if (win && !win.isDestroyed()) {
+    if (win.isMinimized()) win.restore(); win.show(); win.focus();
+    if (!win.webContents.isLoadingMainFrame()) win.webContents.send('auralink:invitation', code);
+  }
+}
+// Only installed apps claim the protocol. QA/source launches retain independent
+// profiles and never alter the user's default URI handler.
+if (app.isPackaged && !testing) {
+  ownsInstance = app.requestSingleInstanceLock();
+  if (!ownsInstance) app.quit();
+  else app.on('second-instance', (_event, argv) => { const url = argv.find(value => parseAppInvitation(value)); if (url) deliverInvitation(url); else if (win) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); } });
+}
+app.on('open-url', (event, value) => { event.preventDefault(); deliverInvitation(value); });
 const mediaPermissions=new Set(['media','display-capture','speaker-selection']);
 const networkPermissions=new Set(['local-network','local-network-access','loopback-network']);
 
@@ -37,11 +56,11 @@ function permissionStatus(type) {
   try { return systemPreferences.getMediaAccessStatus(type); } catch { return 'unknown'; }
 }
 function permissionInfo() {
-  return { microphone:permissionStatus('microphone'), camera:permissionStatus('camera'), screen:permissionStatus('screen'),
+  return { microphone:permissionStatus('microphone'), screen:permissionStatus('screen'),
     accessibility:process.platform === 'darwin' ? (systemPreferences.isTrustedAccessibilityClient(false) ? 'granted' : 'denied') : 'not-required' };
 }
 async function requestMedia(type) {
-  if (!['microphone','camera'].includes(type)) throw new Error('Choose microphone or camera permission.');
+  if (type !== 'microphone') throw new Error('Only microphone permission is supported.');
   let status=permissionStatus(type);
   if (process.platform === 'darwin' && status === 'not-determined') {
     const granted=await systemPreferences.askForMediaAccess(type);
@@ -51,8 +70,8 @@ async function requestMedia(type) {
   return {ok,status,reason:ok ? null : `Allow Auralink ${type} access in ${process.platform === 'darwin' ? 'System Settings → Privacy & Security' : 'Windows Settings → Privacy & security'}. Restart Auralink after changing access.`};
 }
 const settingsLinks = {
-  darwin:{microphone:'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',camera:'x-apple.systempreferences:com.apple.preference.security?Privacy_Camera',screen:'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',accessibility:'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',network:'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork'},
-  win32:{microphone:'ms-settings:privacy-microphone',camera:'ms-settings:privacy-webcam'},
+  darwin:{microphone:'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',screen:'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',accessibility:'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',network:'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork'},
+  win32:{microphone:'ms-settings:privacy-microphone'},
 };
 
 function assertSender(event) {
@@ -69,9 +88,13 @@ function pinOrigin(origin, fp) { pins.set(new URL(origin).hostname, fp); }
 function certificateDecision(request, callback) {
   callback(certificateDecisionForPin(pins.get(request.hostname),request.certificate.data,request.verificationResult));
 }
-function emergencyStop() {
+function emergencyStop(reason) {
   revoke().catch(()=>{});
-  if (win && !win.isDestroyed()) win.webContents.send('auralink:emergency-stop');
+  if (win && !win.isDestroyed()) win.webContents.send('auralink:emergency-stop', typeof reason === 'string' ? reason : undefined);
+}
+function displayLayoutChanged() {
+  sourceOperation++; sources.clear(); selectedSource = null; currentSource = null;
+  emergencyStop('Display layout changed. Select a screen and approve control again.');
 }
 function probeCertificate(origin, expected) {
   return new Promise((resolve, reject) => {
@@ -97,8 +120,15 @@ function acceptedForControl(peerId) {
 }
 
 app.whenReady().then(async () => {
+  if (!ownsInstance) return;
+  if (app.isPackaged && !testing && process.platform === 'win32') app.setAsDefaultProtocolClient('auralink');
   adapter = createAdapter({onError:emergencyStop});
   gate = new ControlGate(adapter,{onFailure:emergencyStop});
+  screen.on('display-removed', displayLayoutChanged);
+  screen.on('display-added', displayLayoutChanged);
+  screen.on('display-metrics-changed', (_event, _display, metrics) => {
+    if (metrics.some(metric => ['bounds', 'scaleFactor', 'rotation'].includes(metric))) displayLayoutChanged();
+  });
   session.defaultSession.setCertificateVerifyProc(certificateDecision);
   session.defaultSession.setPermissionRequestHandler(async (contents, permission, callback, details = {}) => {
     if (!trustedContent(contents,details) || !supportedPermission(permission)) return callback(false);
@@ -106,16 +136,23 @@ app.whenReady().then(async () => {
       // Browser consent alone cannot override the macOS TCC decision. Ask only
       // for the sensor requested by the local getUserMedia action.
       if (permission === 'media') {
-        const types=details.mediaTypes || [];
-        for (const type of types) {
-          const mediaType=type === 'audio' ? 'microphone' : type === 'video' ? 'camera' : null;
-          if (mediaType && !(await requestMedia(mediaType)).ok) return callback(false);
+        const types=details.mediaTypes;
+        if (!Array.isArray(types)) return callback(false);
+        // Electron 44.6 reports getDisplayMedia through `media` with an empty
+        // device list before invoking the separate display-source handler.
+        // Permit that legacy stage only after the owner selected a current
+        // source; the handler below consumes and revalidates that selection.
+        if (!types.length) {
+          if (!selectedSource || !sources.has(selectedSource.id) || Date.now()-selectedSource.at > 30000) return callback(false);
+        } else {
+          if (types.some(type => type !== 'audio')) return callback(false);
+          if (!(await requestMedia('microphone')).ok) return callback(false);
         }
       }
       callback(trustedContent(contents,details));
     } catch { callback(false); }
   });
-  session.defaultSession.setPermissionCheckHandler((contents, permission, origin, details = {}) => Boolean(trustedContent(contents,details) && supportedPermission(permission)));
+  session.defaultSession.setPermissionCheckHandler((contents, permission, origin, details = {}) => Boolean(trustedContent(contents,details) && supportedPermission(permission) && (permission !== 'media' || details.mediaType !== 'video')));
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     if (!win || !request.frame || request.frame !== win.webContents.mainFrame || !selectedSource || Date.now()-selectedSource.at > 30000) return callback({});
     const chosen = selectedSource; selectedSource = null;
@@ -199,6 +236,7 @@ app.whenReady().then(async () => {
     if (internetClient && args?.socketId === internetClient.socketId) internetClient.close();
     return { ok: true };
   });
+  handle('pending-invitation', () => { const code = pendingInvitation; pendingInvitation = null; return code; });
   handle('sources', async () => {
     const operation=roomOperation, request=++sourceOperation;
     const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:320,height:180},fetchWindowIcons:false});
@@ -251,7 +289,7 @@ app.whenReady().then(async () => {
   });
   handle('info',()=>({version:app.getVersion(),platform:process.platform,hostname:os.hostname(),addresses:localAddresses(),nativeControl:Boolean(adapter.available),nativeSupports:adapter.supports,permissions:permissionInfo(),emergencyShortcut:process.platform==='darwin'?'Command+Option+Shift+Q':'Ctrl+Alt+Shift+Q',testing}));
 
-  win=new BrowserWindow({width:1380,height:880,minWidth:900,minHeight:650,show:false,icon:path.join(__dirname,'..','build','icon.png'),backgroundColor:'#090e19',title:'Auralink',autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,spellcheck:false}});
+  win=new BrowserWindow({width:1380,height:880,minWidth:900,minHeight:650,show:false,icon:path.join(__dirname,'..','build','icon.png'),backgroundColor:'#090e19',title:'Auralink',autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,spellcheck:false,backgroundThrottling:false}});
   win.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   win.webContents.on('will-navigate',event=>event.preventDefault());
   win.webContents.on('render-process-gone',()=>{internetClient?.close();emergencyStop();});

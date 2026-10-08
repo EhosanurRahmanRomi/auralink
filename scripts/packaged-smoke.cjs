@@ -29,7 +29,8 @@ async function run() {
 
     const sourcePaths = ['src/main.cjs', 'src/preload.cjs', 'src/core/broker.cjs', 'src/core/invite.cjs',
       'src/native/control.cjs', 'src/native/windows-input.ps1', 'src/renderer/index.html',
-      'src/renderer/styles.css', 'src/renderer/app.js', 'src/renderer/rtc.js'];
+      'src/renderer/styles.css', 'src/renderer/app.js', 'src/renderer/rtc.js',
+      'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/core/app-invitation.cjs'];
     evidence.sourceParity = await application.evaluate(({ app, globalShortcut }, value) => {
       const fromApp = process.mainModule.require.bind(process.mainModule);
       const fileSystem = fromApp('node:fs');

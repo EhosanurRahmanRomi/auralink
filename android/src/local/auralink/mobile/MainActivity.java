@@ -47,7 +47,7 @@ import javax.net.ssl.HttpsURLConnection;
 public final class MainActivity extends Activity {
     private static final String PAGE = "https://appassets.androidplatform.net/assets/index.html";
     private static final String HOST = "appassets.androidplatform.net";
-    private static final Set<String> ASSETS = new HashSet<>(Arrays.asList("index.html", "styles.css", "app.js", "rtc.js", "android-bridge.js", "internet.js", "desktop-internet.js"));
+    private static final Set<String> ASSETS = new HashSet<>(Arrays.asList("index.html", "styles.css", "app.js", "rtc.js", "android-bridge.js", "internet.js", "desktop-internet.js", "relay-media.js", "audio-worklet.js"));
     private final ExecutorService workers = Executors.newSingleThreadExecutor();
     private WebView webView;
     private FrameLayout root;
@@ -59,11 +59,16 @@ public final class MainActivity extends Activity {
     private InternetServiceEndpoint internetService;
     private PinnedRoomClient socket;
     private String socketId;
+    private String pendingInvitation;
+    private boolean invitationListenerReady;
+    private boolean invitationConsumed;
+    private boolean websocketRelayEnabled;
     private PermissionRequest mediaRequest;
     private long mediaGeneration;
     private int nextPermissionCode = 1000, mediaPermissionCode, notificationPermissionCode, projectionPermissionCode;
     private boolean runtimePermissionsPending, permissionResultDeferred;
     private final java.util.ArrayDeque<Runnable> pausedEvents = new java.util.ArrayDeque<>();
+    private int pausedEventBytes;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final RoomMembership roomMembership = new RoomMembership();
     private String projectionRequest;
@@ -76,6 +81,10 @@ public final class MainActivity extends Activity {
     private boolean notificationLaunchDeferred;
     private int deferredProjectionCode;
     private CallAudio callAudio;
+    private String callId, lastSessionEnd = "";
+    private boolean callStarting, displayRecoveryPending;
+    private int callRequiredTypes;
+    private final ArrayList<Runnable> callReady = new ArrayList<>(), callFailed = new ArrayList<>();
     private AlertDialog controlDialog;
     private final Runnable projectionDeadline = () -> {
         if (projectionRequest != null) { String id = projectionRequest; clearProjectionRequest(); reject(id, "Android screen permission timed out. Try sharing again."); ScreenShareService.stopCurrent("Screen permission timed out."); if (!foreground) stopSession(); }
@@ -98,6 +107,9 @@ public final class MainActivity extends Activity {
         });
         root.requestApplyInsets();
         WebView.setWebContentsDebuggingEnabled(false);
+        // Keep the renderer at the application priority during an explicit
+        // foreground call. Android can still reclaim it; handle that honestly.
+        webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true); settings.setDomStorageEnabled(true);
         settings.setAllowFileAccess(false); settings.setAllowContentAccess(false);
@@ -113,17 +125,17 @@ public final class MainActivity extends Activity {
                 // before removing it, and offer a fresh page without rejoining.
                 if (failed != webView) return true;
                 generation++; foreground = false; invitation = null; internetService = null;
-                webView = null; mediaRequest = null; pausedEvents.clear();
+                webView = null; mediaRequest = null; invitationListenerReady = false; pausedEvents.clear(); pausedEventBytes = 0;
                 runtimePermissionsPending = false; permissionResultDeferred = false;
                 clearProjectionRequest(); closeSocket(); revokeControl("Android display process stopped.");
-                if (callAudio != null) callAudio.stop();
+                stopCallService("Android display process stopped."); if (callAudio != null) callAudio.stop();
                 if (fullscreen != null) { root.removeView(fullscreen); fullscreen = null; fullscreenCallback = null; }
                 root.removeView(failed); failed.destroy();
-                new AlertDialog.Builder(MainActivity.this).setTitle("Display stopped")
-                    .setMessage("Android stopped the display process. Your room, screen share and control approval have ended. Reopen Auralink to connect again.")
-                    .setPositiveButton("Reopen", (dialog, which) -> recreate())
-                    .setNegativeButton("Close", (dialog, which) -> finish())
-                    .setOnCancelListener(dialog -> finish()).show();
+                lastSessionEnd = "Android stopped the display process. Your call, screen share and control approval ended.";
+                displayRecoveryPending = true;
+                // Do not attach a dialog to a stopped Activity. Returning to
+                // the app presents recovery rather than crashing a second time.
+                if (!isFinishing() && !isDestroyed() && hasWindowFocus()) showDisplayRecovery();
                 return true;
             }
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) { return !PAGE.equals(request.getUrl().toString().split("#", 2)[0]); }
@@ -152,7 +164,35 @@ public final class MainActivity extends Activity {
             }
             @Override public void onHideCustomView() { exitFullscreen(); }
         });
-        foreground = true; webView.loadUrl(PAGE);
+        foreground = true; invitationConsumed = saved != null && saved.getBoolean("invitationConsumed", false);
+        if (!invitationConsumed) acceptInvitationIntent(getIntent()); webView.loadUrl(PAGE);
+    }
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent); setIntent(intent); acceptInvitationIntent(intent); deliverPendingInvitation();
+    }
+    @Override protected void onSaveInstanceState(Bundle saved) {
+        super.onSaveInstanceState(saved);
+        // Save only the consumed marker; never serialize capabilities, native
+        // admission, media or control grants to restore a terminated call.
+        saved.putBoolean("invitationConsumed", invitationConsumed);
+    }
+    private void acceptInvitationIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction()) || intent.getData() == null) return;
+        try { pendingInvitation = AppInvitation.parse(intent.getData().toString()); invitationConsumed = false; }
+        catch (IllegalArgumentException invalid) { /* Untrusted OS links cannot change the current room. */ }
+    }
+    private void deliverPendingInvitation() {
+        if (!trustedPage() || !invitationListenerReady || pendingInvitation == null) return;
+        String code = consumePendingInvitation();
+        deliver(json("event", "app-invitation", "code", code));
+    }
+    private String consumePendingInvitation() {
+        String code = pendingInvitation; pendingInvitation = null;
+        if (code != null) {
+            invitationConsumed = true;
+            if (getIntent() != null && Intent.ACTION_VIEW.equals(getIntent().getAction())) setIntent(new Intent(getIntent()).setData(null));
+        }
+        return code;
     }
     private WebResourceResponse blocked() {
         return new WebResourceResponse("text/plain", "UTF-8", 403, "Blocked", java.util.Collections.emptyMap(), new ByteArrayInputStream(new byte[0]));
@@ -170,14 +210,15 @@ public final class MainActivity extends Activity {
         return nextPermissionCode++;
     }
     private boolean projectionSession() { return localDocument() && (ScreenShareService.active() || projectionStarting); }
-    private boolean transportPage() { return trustedPage() || ownPermissionPause() || projectionSession(); }
+    private boolean callSession() { return localDocument() && callId != null && (callStarting || CallSessionService.active(callId)); }
+    private boolean transportPage() { return trustedPage() || ownPermissionPause() || projectionSession() || callSession(); }
     private boolean ownPermissionPause() {
         return !foreground && !destroyed && ((runtimePermissionsPending && mediaRequest != null) || projectionPermissionPending) &&
             webView != null && PAGE.equals(webView.getUrl());
     }
     private final class NativeBridge {
         @JavascriptInterface public void postMessage(String value) {
-            if (value == null || value.length() > 70000) return;
+            if (value == null || value.length() > RelayMediaPolicy.BRIDGE_LIMIT) return;
             runOnUiThread(() -> dispatch(value));
         }
     }
@@ -193,14 +234,14 @@ public final class MainActivity extends Activity {
     private void reject(String id, String error) { deliver(json("requestId", id, "ok", false, "error", error)); }
     private void dispatch(String value) {
         if (!trustedPage()) {
-            // An owned permission dialog or an explicitly active screen
-            // service can keep existing transport and approved input alive.
+            // An owned permission dialog or explicitly active foreground
+            // session can keep existing transport and approved input alive.
             // New invitations, capture and owner grants require foreground.
-            if (ownPermissionPause() || projectionSession()) {
+            if (ownPermissionPause() || projectionSession() || callSession()) {
                 try {
                     String method = new JSONObject(value).getString("method");
                     if (!"sendSocket".equals(method) && !"closeSocket".equals(method) && !"ackScreenFrame".equals(method) &&
-                        !"applyInput".equals(method) && !"revokeControl".equals(method) && !"stopScreenShare".equals(method)) return;
+                        !"applyInput".equals(method) && !"revokeControl".equals(method) && !"stopScreenShare".equals(method) && !"setAudioRoute".equals(method)) return;
                 } catch (Exception ignored) { return; }
             } else return;
         }
@@ -209,11 +250,17 @@ public final class MainActivity extends Activity {
             JSONObject request = new JSONObject(value); id = request.getString("requestId");
             if (!id.matches("r[0-9]{1,16}")) return;
             String method = request.getString("method"); Object args = request.opt("args");
+            if (value.length() > 70000 && !"sendSocket".equals(method)) throw new IllegalArgumentException("Native request is too large.");
             if ("getInfo".equals(method)) {
                 boolean enabled = AttendedAccessibilityService.current() != null;
                 reply(id, json("platform", "android", "version", installedVersion(), "nativeControl", true,
                     "supports", new JSONArray(Arrays.asList("tap", "swipe", "wheel", "editable-text", "back", "home")), "accessibilityEnabled", enabled, "notificationAvailable", notificationsAvailable(),
-                    "capabilities", json("hostRoom", false, "screenShare", true, "remoteInputHost", true, "accessibilityEnabled", enabled, "screenMaxEdge", 1920, "screenMaxFps", 12)));
+                    "lastSessionEnd", lastSessionEnd,
+                    "capabilities", json("hostRoom", false, "screenShare", true, "remoteInputHost", true, "accessibilityEnabled", enabled, "screenMaxEdge", 1920, "screenMaxFps", 12, "foregroundCallService", true, "foregroundRoomService", true)));
+                lastSessionEnd = "";
+            } else if ("getPendingInvitation".equals(method)) {
+                invitationListenerReady = true;
+                String code = consumePendingInvitation(); reply(id, code == null ? JSONObject.NULL : code);
             } else if ("startScreenShare".equals(method)) {
                 startProjection(id, args instanceof JSONObject ? (JSONObject)args : new JSONObject());
             } else if ("stopScreenShare".equals(method)) {
@@ -245,8 +292,23 @@ public final class MainActivity extends Activity {
                 reply(id, json("available", service != null, "active", service != null && service.active(), "peerId", service == null || service.controller() == null ? JSONObject.NULL : service.controller()));
             } else if ("setAudioRoute".equals(method)) {
                 JSONObject route = args instanceof JSONObject ? (JSONObject)args : new JSONObject();
-                boolean ok = callAudio.update(route.optBoolean("active", true), route.optBoolean("speaker", true));
-                reply(id, json("ok", ok, "speaker", route.optBoolean("speaker", true), "reason", ok ? "" : "Android audio focus is busy. Retry after the other call ends."));
+                final String requestId = id; final boolean active = route.optBoolean("active", true), speaker = route.optBoolean("speaker", true);
+                Runnable update = () -> {
+                    boolean ok = callAudio.update(active && (foreground || callSession() || projectionSession()), speaker);
+                    reply(requestId, json("ok", ok, "speaker", speaker, "reason", ok ? "" : "Android audio focus is busy. Retry after the other call ends."));
+                    if (!foreground && !transportPage()) stopSession("Call media ended while Auralink was in the background.");
+                };
+                if (active && roomMembership.hasRoom()) {
+                    // An explicitly admitted device room keeps its network
+                    // session visible. Playback is added only for real media.
+                    int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+                    if (route.optBoolean("playback", false)) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
+                    ensureCallService(types, update,
+                        () -> reject(requestId, "Android could not keep the call active. Return to Auralink and reconnect."));
+                } else {
+                    if (!roomMembership.hasRoom()) stopCallService("Room ended.");
+                    update.run();
+                }
             } else if ("copyText".equals(method)) {
                 if (!(args instanceof String) || ((String)args).length() > 4096) throw new IllegalArgumentException("Invalid clipboard text.");
                 ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Auralink", (String)args)); reply(id, json("ok", true));
@@ -313,7 +375,8 @@ public final class MainActivity extends Activity {
             } else if ("sendSocket".equals(method)) {
                 JSONObject options = (JSONObject)args;
                 if (socket == null || !socket.isOpen() || !socketId.equals(options.getString("socketId"))) throw new IllegalArgumentException("Socket is not open.");
-                String data = options.getString("data"); if (data.length() > 65536) throw new IllegalArgumentException("Message is too large.");
+                String data = options.getString("data");
+                if (!validSocketMessage(data, true)) throw new IllegalArgumentException("Invalid or oversized room message.");
                 if (internetService != null) {
                     JSONObject outgoing = new JSONObject(data); String operation = outgoing.optString("type");
                     if (roomMembership.endForOutbound(operation)) {
@@ -322,6 +385,7 @@ public final class MainActivity extends Activity {
                     }
                 }
                 socket.send(data); reply(id, json("ok", true));
+                if (!foreground && !transportPage()) stopSession("Room ended while Auralink was in the background.");
             } else if ("closeSocket".equals(method)) {
                 JSONObject options = (JSONObject)args;
                 if (socketId != null && socketId.equals(options.getString("socketId"))) closeSocket();
@@ -334,13 +398,17 @@ public final class MainActivity extends Activity {
             if (destroyed || generation != serial || !id.equals(socketId)) return;
             // A disconnected background session cannot retain WebView media or
             // projection consent, even while an approved projection was active.
-            if (!foreground && ("close".equals(type) || "error".equals(type))) { stopSession(); return; }
-            if (!foreground && ownPermissionPause() && !projectionSession()) {
-                if (pausedEvents.size() >= 64) { stopSession(); return; }
-                pausedEvents.add(() -> event(serial, id, type, data, code, reason)); return;
+            if (!foreground && ("close".equals(type) || "error".equals(type))) { stopSession("Connection ended while Auralink was in the background."); return; }
+            if (!foreground && ownPermissionPause() && !projectionSession() && !callSession()) {
+                int bytes = data == null ? 0 : data.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+                if (pausedEvents.size() >= 64 || pausedEventBytes + bytes > 1048576) { stopSession(); return; }
+                pausedEventBytes += bytes;
+                pausedEvents.add(() -> { pausedEventBytes -= bytes; event(serial, id, type, data, code, reason); }); return;
             }
             if (!transportPage()) return;
+            if ("message".equals(type) && !validSocketMessage(data, false)) { stopSession("The service sent an invalid room message."); return; }
             if ("message".equals(type) && !observeBroker(data)) return;
+            if (!foreground && !transportPage()) { stopSession("Room ended while Auralink was in the background."); return; }
             deliver(json("event", "socket", "socketId", id, "type", type, "data", data == null ? JSONObject.NULL : data,
                 "code", code, "reason", reason == null ? "" : reason, "message", reason == null ? "" : reason));
             if ("close".equals(type)) { closeSocket(); }
@@ -352,13 +420,71 @@ public final class MainActivity extends Activity {
         clearRoomState("Room connection closed.");
         if (previous != null) previous.cancel();
     }
+    private boolean validSocketMessage(String raw, boolean outbound) {
+        if (raw == null || raw.length() > RelayMediaPolicy.WIRE_LIMIT) return false;
+        try {
+            JSONObject message = new JSONObject(raw), data = message.optJSONObject("data");
+            if (data == null || !data.has("relay")) return raw.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= RelayMediaPolicy.SIGNAL_LIMIT;
+            if (internetService == null || !websocketRelayEnabled || !"signal".equals(message.opt("type")) || message.length() != 3 || data.length() != 1 || !roomMembership.hasRoom()) return false;
+            Object peer = message.opt(outbound ? "to" : "from");
+            if (!(peer instanceof String) || !roomMembership.allows((String)peer)) return false;
+            JSONObject relay = data.optJSONObject("relay");
+            if (relay == null || !(relay.opt("version") instanceof Number) || !(relay.opt("counter") instanceof Number) ||
+                !(relay.opt("epoch") instanceof String) || !(relay.opt("nonce") instanceof String) || !(relay.opt("ciphertext") instanceof String)) return false;
+            return RelayMediaPolicy.valid(relay.length(), ((Number)relay.opt("version")).doubleValue(), (String)relay.opt("epoch"),
+                ((Number)relay.opt("counter")).doubleValue(), (String)relay.opt("nonce"), (String)relay.opt("ciphertext")) &&
+                raw.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= RelayMediaPolicy.WIRE_LIMIT;
+        } catch (Exception malformed) { return false; }
+    }
     private void clearRoomState(String reason) {
-        roomMembership.clear(); String pendingProjection = projectionRequest; clearProjectionRequest();
+        roomMembership.clear(); websocketRelayEnabled = false; String pendingProjection = projectionRequest; clearProjectionRequest();
         if (pendingProjection != null) reject(pendingProjection, reason);
         revokeControl(reason); ScreenShareService.stopCurrent(reason);
+        stopCallService(reason);
         if (mediaRequest != null) { mediaRequest.deny(); mediaRequest = null; }
         mediaPermissionCode = 0; runtimePermissionsPending = false; permissionResultDeferred = false;
         if (callAudio != null) callAudio.stop();
+    }
+    private void ensureCallService(int types, Runnable ready, Runnable failed) {
+        if (!localDocument() || !roomMembership.hasRoom() || socket == null || !socket.isOpen()) { failed.run(); return; }
+        if (CallSessionService.active(callId)) {
+            boolean sensitive = (types & ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE) != 0;
+            if ((!sensitive || trustedPage()) && CallSessionService.addMediaTypes(callId, types)) ready.run(); else failed.run();
+            return;
+        }
+        // Android 14+ checks while-in-use microphone permission when
+        // creating the service. Starting a new call always requires visibility.
+        if (!trustedPage()) { failed.run(); return; }
+        callRequiredTypes |= types; callReady.add(ready); callFailed.add(failed);
+        if (callStarting) return;
+        callStarting = true; callId = java.util.UUID.randomUUID().toString();
+        final String ticket = callId; final long serial = roomMembership.epoch();
+        CallSessionService.prepare(ticket, new CallSessionService.Listener() {
+            public void started() {
+                if (destroyed || !ticket.equals(callId) || roomMembership.epoch() != serial || !localDocument()) {
+                    CallSessionService.stop(ticket, "Call start was superseded."); return;
+                }
+                callStarting = false;
+                if (!CallSessionService.addMediaTypes(ticket, callRequiredTypes)) { stopCallService("Android could not activate call media."); return; }
+                ArrayList<Runnable> completions = new ArrayList<>(callReady); callReady.clear(); callFailed.clear();
+                for (Runnable completion : completions) completion.run();
+            }
+            public void stopped(String reason) {
+                if (destroyed || !ticket.equals(callId) || roomMembership.epoch() != serial) return;
+                stopSession(reason);
+            }
+        });
+        try { startForegroundService(new Intent(this, CallSessionService.class).putExtra("ticket", ticket).putExtra("types", callRequiredTypes)); }
+        catch (RuntimeException denied) {
+            stopCallService("Android could not start an active call service.");
+            deliver(json("event", "media-error", "reason", "Android could not keep this call active. Return to Auralink and reconnect."));
+        }
+    }
+    private void stopCallService(String reason) {
+        String previous = callId; callId = null; callStarting = false; callRequiredTypes = 0;
+        ArrayList<Runnable> failures = new ArrayList<>(callFailed); callReady.clear(); callFailed.clear();
+        if (previous != null) CallSessionService.stop(previous, reason);
+        for (Runnable failure : failures) failure.run();
     }
     private boolean observeBroker(String data) {
         try {
@@ -368,7 +494,11 @@ public final class MainActivity extends Activity {
                 clearRoomState("Room admission changed.");
                 JSONArray peers = message.optJSONArray("peers"); ArrayList<String> identities = new ArrayList<>();
                 if (peers != null) for (int index = 0; index < peers.length(); index++) identities.add(peers.getJSONObject(index).getString("id"));
-                roomMembership.begin(message.getString("selfId"), identities);
+                if (!roomMembership.begin(message.getString("selfId"), identities)) return false;
+                websocketRelayEnabled = internetService != null && roomMembership.hasRoom() && message.optBoolean("websocketRelayEnabled", false) &&
+                    message.opt("relayKey") instanceof String && RelayMediaPolicy.validKey((String)message.opt("relayKey"));
+                if (roomMembership.hasRoom()) ensureCallService(ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE, () -> {},
+                    () -> stopSession("Android could not keep the room open. Return to Auralink and reconnect."));
             } else if ("pending".equals(type) && internetService != null) {
                 if (!roomMembership.observePending(message.optString("selfId"), message.optJSONObject("room") == null ? "" : message.optJSONObject("room").optString("id"))) return false;
             } else if ("peer-joined".equals(type)) roomMembership.add(message.getJSONObject("peer").getString("id"));
@@ -454,13 +584,13 @@ public final class MainActivity extends Activity {
                 if (destroyed || roomMembership.epoch() != serial || !ticket.equals(projectionId)) return;
                 String pending = projectionRequest; clearProjectionRequest();
                 if (pending != null) reject(pending, reason);
-                if (foreground) deliver(json("event", "screen", "type", "stopped", "captureId", ticket, "reason", reason));
-                else stopSession();
+                if (foreground || callSession()) deliver(json("event", "screen", "type", "stopped", "captureId", ticket, "reason", reason));
+                else stopSession("Screen sharing ended while Auralink was in the background.");
             }
         });
         Intent service = new Intent(this, ScreenShareService.class).putExtra("ticket", ticket).putExtra("consent", data)
             .putExtra("maxEdge", "1080p".equals(options.optString("quality")) ? 1920 : 1280)
-            .putExtra("microphone", options.optBoolean("microphone", false)).putExtra("camera", options.optBoolean("camera", false));
+            .putExtra("microphone", options.optBoolean("microphone", false));
         try { startForegroundService(service); }
         catch (Exception failure) { clearProjectionRequest(); reject(requestId, "Android could not start screen sharing. Return to the app and retry."); }
     }
@@ -508,8 +638,7 @@ public final class MainActivity extends Activity {
             request.getOrigin().getPort() != -1 || mediaRequest != null) { request.deny(); return; }
         ArrayList<String> needed = new ArrayList<>();
         for (String resource : request.getResources()) {
-            String permission = PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource) ? Manifest.permission.CAMERA :
-                PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource) ? Manifest.permission.RECORD_AUDIO : null;
+            String permission = PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource) ? Manifest.permission.RECORD_AUDIO : null;
             if (permission == null) { request.deny(); return; }
             if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) needed.add(permission);
         }
@@ -525,19 +654,24 @@ public final class MainActivity extends Activity {
         if (!trustedPage() || !roomMembership.hasRoom() || mediaGeneration != roomMembership.epoch() || socket == null || !socket.isOpen()) { request.deny(); return; }
         ArrayList<String> granted = new ArrayList<>();
         for (String resource : request.getResources()) {
-            if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource) && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) granted.add(resource);
+            if (!PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)) { request.deny(); return; }
             if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource) && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) granted.add(resource);
         }
         if (granted.isEmpty()) request.deny(); else {
-            try {
+            int required = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+            if (Build.VERSION.SDK_INT >= 30 && granted.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) required |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+            final long serial = mediaGeneration;
+            ensureCallService(required, () -> {
+                if (!trustedPage() || roomMembership.epoch() != serial || !roomMembership.hasRoom() || !CallSessionService.active(callId)) { request.deny(); return; }
+                try {
                 if (ScreenShareService.active() && Build.VERSION.SDK_INT >= 30) {
                     int types = 0;
                     if (granted.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
-                    if (granted.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
                     ScreenShareService.addMediaTypes(types);
                 }
-                request.grant(granted.toArray(new String[0]));
-            } catch (Exception failure) { request.deny(); deliver(json("event", "media-error", "reason", "Android could not keep the microphone or camera active. Stop screen sharing, enable the device, then share again.")); }
+                    request.grant(granted.toArray(new String[0]));
+                } catch (Exception failure) { request.deny(); deliver(json("event", "media-error", "reason", "Android could not keep the microphone active. Return to the app and retry.")); }
+            }, () -> { request.deny(); deliver(json("event", "media-error", "reason", "Android could not start the microphone service. Return to the app and retry.")); });
         }
     }
     @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
@@ -560,30 +694,50 @@ public final class MainActivity extends Activity {
         if (fullscreenCallback != null) fullscreenCallback.onCustomViewHidden(); fullscreenCallback = null;
     }
     @Override public void onBackPressed() { if (fullscreen != null) exitFullscreen(); else super.onBackPressed(); }
-    private void stopSession() {
-        // Destroy the active document as well as signaling. onPause alone does
-        // not guarantee MediaStream tracks or peer data channels are stopped.
+    private void showDisplayRecovery() {
+        if (!displayRecoveryPending || isFinishing() || isDestroyed()) return;
+        displayRecoveryPending = false;
+        new AlertDialog.Builder(this).setTitle("Call display stopped")
+            .setMessage("Android stopped the display process. Your room, screen share and control approval have ended. Reopen Auralink to connect again.")
+            .setPositiveButton("Reopen", (dialog, which) -> recreate())
+            .setNegativeButton("Close", (dialog, which) -> finish()).setOnCancelListener(dialog -> finish()).show();
+    }
+    private void stopSession() { stopSession("Android ended this session. Return to Auralink and reconnect."); }
+    private void stopSession(String reason) {
+        // Actual loss of the native session destroys media tracks/channels.
+        // Ordinary Activity pause uses pauseIdleSession and retains the page.
         if (webView != null) {
-            deliver(json("event", "session-stop", "reason", "Android app moved to the background."));
+            lastSessionEnd = reason;
+            deliver(json("event", "session-stop", "reason", reason));
             foreground = false; generation++; invitation = null; internetService = null; closeSocket();
             clearProjectionRequest(); revokeControl("Android session ended."); if (callAudio != null) callAudio.stop();
-            runtimePermissionsPending = false; permissionResultDeferred = false; pausedEvents.clear();
+            runtimePermissionsPending = false; permissionResultDeferred = false; pausedEvents.clear(); pausedEventBytes = 0;
             if (mediaRequest != null) { mediaRequest.deny(); mediaRequest = null; }
-            exitFullscreen(); webView.loadUrl("about:blank"); webView.onPause();
+            exitFullscreen(); invitationListenerReady = false; webView.loadUrl("about:blank"); webView.onPause();
         }
     }
+    private void pauseIdleSession() {
+        // Do not navigate away from the document for an ordinary app switch.
+        // An unadmitted directory/pending connection has no room foreground
+        // service. Close it while retaining the selected page on return.
+        if (socket != null || roomMembership.hasRoom()) deliver(json("event", "session-stop", "reason", "The inactive room closed while Auralink was in the background."));
+        generation++; invitation = null; internetService = null; closeSocket();
+        runtimePermissionsPending = false; permissionResultDeferred = false; pausedEvents.clear(); pausedEventBytes = 0;
+        foreground = false; if (webView != null) webView.onPause();
+    }
     @Override protected void onPause() {
-        if (runtimePermissionsPending && mediaRequest != null || projectionPermissionPending || projectionSession()) foreground = false;
-        else stopSession();
+        if (runtimePermissionsPending && mediaRequest != null || projectionPermissionPending || projectionSession() || callSession()) foreground = false;
+        else pauseIdleSession();
         super.onPause();
     }
-    @Override protected void onStop() { if (!foreground && !ownPermissionPause() && !projectionSession()) stopSession(); super.onStop(); }
+    @Override protected void onStop() { super.onStop(); }
     @Override protected void onResume() {
         super.onResume(); foreground = true;
         if (webView != null) {
             webView.onResume();
-            if (!PAGE.equals(webView.getUrl())) webView.loadUrl(PAGE);
+            if (!localDocument()) webView.loadUrl(PAGE);
             else {
+                deliver(json("event", "session-resume"));
                 while (!pausedEvents.isEmpty()) pausedEvents.poll().run();
                 if (permissionResultDeferred) { permissionResultDeferred = false; runtimePermissionsPending = false; completeMedia(); }
                 if (notificationLaunchDeferred) { notificationLaunchDeferred = false; launchScreenConsent(); }
@@ -591,8 +745,10 @@ public final class MainActivity extends Activity {
                     int code = deferredProjectionCode; Intent consent = deferredProjectionConsent; deferredProjectionResult = false; deferredProjectionConsent = null;
                     finishProjectionPermission(code, consent);
                 }
+                deliverPendingInvitation();
             }
         }
+        if (displayRecoveryPending) showDisplayRecovery();
     }
     @Override protected void onDestroy() {
         destroyed = true; foreground = false; generation++; closeSocket(); workers.shutdownNow();

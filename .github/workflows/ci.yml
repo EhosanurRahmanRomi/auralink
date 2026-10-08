@@ -3,6 +3,11 @@ name: Auralink checks and installers
 on:
   push:
   workflow_dispatch:
+    inputs:
+      build_android:
+        description: Build the deferred Android test package
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,6 +35,8 @@ jobs:
         run: npm ci --prefix internet-service
       - name: Actual workerd and SQLite coordinator
         run: npm run test:runtime --prefix internet-service
+      - name: Coordinator reservation and canonical invitation policies
+        run: npm test --prefix internet-service
       - name: Free Worker deployment bundle
         run: npm run check --prefix internet-service
       - name: JavaScript syntax
@@ -48,6 +55,10 @@ jobs:
         run: node tests/phone-share-browser.cjs
       - name: Internet pairing, consent and real WebRTC through coordinator
         run: node tests/internet-browser.cjs
+      - name: One-click invitation rooms and host moderation
+        run: node tests/invitation-browser.cjs
+      - name: Encrypted video and audio with direct WebRTC blocked
+        run: node tests/websocket-relay-browser.cjs
       - name: Desktop app and room teardown
         run: npm run test:desktop
       - name: Keep test evidence
@@ -93,6 +104,7 @@ jobs:
           retention-days: 7
 
   macos-installer:
+    needs: checks
     name: macOS Apple Silicon DMG
     runs-on: macos-15
     timeout-minutes: 25
@@ -110,6 +122,16 @@ jobs:
         run: node -e "if(process.platform !== 'darwin' || process.arch !== 'arm64') process.exit(1)"
       - name: Install locked dependencies
         run: npm ci
+      - name: Install isolated browser and coordinator fixture
+        run: |
+          npm ci --prefix internet-service
+          npx playwright install chromium
+          node <<'JS'
+          const fs = require('node:fs');
+          fs.appendFileSync(process.env.GITHUB_ENV, 'AURALINK_TEST_BROWSER=' + require('playwright').chromium.executablePath() + '\n');
+          JS
+      - name: Actual Apple Silicon compressed relay decoder and invitation UI
+        run: node tests/websocket-relay-browser.cjs
       - name: JavaScript syntax and protocol permissions
         run: |
           npm run check
@@ -130,10 +152,12 @@ jobs:
             test-results/mac-helper-build.json
             test-results/mac-bundle-smoke.json
             test-results/mac-lobby.png
+            test-results/websocket-relay-browser.json
           if-no-files-found: error
           retention-days: 7
 
   android-apk:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_android
     name: Android companion APK
     needs: checks
     runs-on: windows-latest

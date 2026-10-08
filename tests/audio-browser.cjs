@@ -79,8 +79,8 @@ async function main() {
     owner = await fixture(broker);
     browser = await chromium.launch({ executablePath: browserPath, headless: true, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
       `--use-file-for-fake-audio-capture=${wav}`, '--autoplay-policy=user-gesture-required', '--disable-features=WebRtcHideLocalIpsWithMdns'] });
-    const desktop = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1350, height: 900 }, permissions: ['microphone', 'camera'] });
-    const mobile = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true, permissions: ['microphone', 'camera'] });
+    const desktop = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1350, height: 900 }, permissions: ['microphone'] });
+    const mobile = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true, permissions: ['microphone'] });
     contexts.push(desktop, mobile);
     for (const context of contexts) await context.addInitScript(() => {
       window.qaCaptureCalls = []; const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);

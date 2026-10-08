@@ -129,16 +129,16 @@ async function main() {
         draw.fillStyle = '#ffffff'; draw.font = '48px sans-serif'; draw.fillText(`Synthetic 720p frame ${frame++}`, 70, 95);
       };
       paint(); window.syntheticTimer = setInterval(paint, 65);
-      const stream = canvas.captureStream(15); await rtc.setTrack('camera', stream.getVideoTracks()[0], stream);
+      const stream = canvas.captureStream(15); await rtc.setTrack('screen', stream.getVideoTracks()[0], stream);
       window.syntheticAudio = new AudioContext(); await syntheticAudio.resume();
       const oscillator = syntheticAudio.createOscillator(); oscillator.frequency.value = 220;
       const destination = syntheticAudio.createMediaStreamDestination(); oscillator.connect(destination); oscillator.start();
       await rtc.setTrack('audio', destination.stream.getAudioTracks()[0], destination.stream);
     });
     for (const receiver of [bravo, charlie]) await waitFor(receiver.page, id => {
-      const video = document.getElementById(`media-${id}-camera`);
+      const video = document.getElementById(`media-${id}-screen`);
       return video?.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2;
-    }, alpha.id, 'Receiver did not decode genuine adaptive camera frames');
+    }, alpha.id, 'Receiver did not decode genuine adaptive screen frames');
     const decoded = [];
     for (const receiver of [bravo, charlie]) {
       const stats = await receiver.page.evaluate(async id => {
@@ -167,10 +167,10 @@ async function main() {
 
     // End one media source and prove the remaining peer connections remain available.
     await alpha.page.evaluate(async () => {
-      const old = rtc.localTracks.get('camera'); await rtc.setTrack('camera', null); old.track.stop(); clearInterval(syntheticTimer);
+      const old = rtc.localTracks.get('screen'); await rtc.setTrack('screen', null); old.track.stop(); clearInterval(syntheticTimer);
     });
     for (const receiver of [bravo, charlie]) await waitFor(receiver.page,
-      id => !rtc.peers.get(id).remoteTracks.has('camera'), alpha.id, 'Stopped camera remained visible');
+      id => !rtc.peers.get(id).remoteTracks.has('screen'), alpha.id, 'Stopped screen remained visible');
     for (const client of clients) {
       const errors = await client.page.evaluate(() => rtcEvents.errors);
       assert.deepEqual(errors, [], `${client.name} emitted WebRTC errors`);

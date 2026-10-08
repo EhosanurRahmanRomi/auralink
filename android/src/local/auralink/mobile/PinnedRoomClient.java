@@ -22,7 +22,7 @@ public final class PinnedRoomClient extends WebSocketClient {
         setConnectionLostTimeout(20);
     }
     public PinnedRoomClient(InternetServiceEndpoint service, Listener listener) throws Exception {
-        super(service.socketUri(), new Draft_6455(Collections.<IExtension>emptyList(), 65536), Collections.<String,String>emptyMap(), 10000);
+        super(service.socketUri(), new Draft_6455(Collections.<IExtension>emptyList(), RelayMediaPolicy.WIRE_LIMIT), Collections.<String,String>emptyMap(), 10000);
         this.listener = listener; this.internet = true;
         // Normal platform certificate-chain validation; no invitation trust manager.
         setSocketFactory(SSLContext.getDefault().getSocketFactory());
@@ -36,7 +36,7 @@ public final class PinnedRoomClient extends WebSocketClient {
         parameters.setProtocols(new String[]{"TLSv1.3", "TLSv1.2"});
     }
     @Override public void onOpen(ServerHandshake handshake) { listener.opened(); }
-    @Override public void onMessage(String message) { if (message.length() <= 65536) listener.message(message); else cancel(); }
+    @Override public void onMessage(String message) { if (message.length() <= (internet ? RelayMediaPolicy.WIRE_LIMIT : RelayMediaPolicy.SIGNAL_LIMIT)) listener.message(message); else cancel(); }
     @Override public void onClose(int code, String reason, boolean remote) { listener.closed(code, reason); }
     @Override public void onError(Exception error) { listener.failed(error); }
     public void cancel() {

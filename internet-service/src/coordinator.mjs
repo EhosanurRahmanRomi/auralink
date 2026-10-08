@@ -1,11 +1,41 @@
 // Platform-independent room policy. Transport adapters never supply peer identity.
 export const LIMITS = Object.freeze({ devices: 32, sockets: 64, unauthenticated: 8,
   participants: 4, pending: 8, messageBytes: 65536, authMs: 10000,
-  admissionMs: 60000, idleMs: 120000, roomStartMs: 30000, controlMs: 15 * 60000 });
+  admissionMs: 60000, idleMs: 120000, roomStartMs: 30000, controlMs: 15 * 60000,
+  publicClients: 48, publicRooms: 16, rooms: 48, publicSessionMs: 60 * 60000,
+  publicBootstrapDaily: 1024, publicCreateDaily: 256, sourceDaily: 64,
+  sourceBootstrapMinute: 8, sourceCreateHour: 8, sourceCounters: 256,
+  publicCommandsDaily: 20000, publicRoomCommandsHourly: 2000 });
 export const DIRECT_ICE = Object.freeze([{ urls: 'stun:stun.cloudflare.com:3478' }]);
+export const WEBSOCKET_RELAY_LIMITS = Object.freeze({ maxMessageBytes: 262144, roomBytes: 536870912,
+  roomSeconds: 1800, dailyBytes: 1073741824, dailyMessages: 300000, senderBytesPer5s: 6291456,
+  senderPacketsPer5s: 600, reservationBytes: 2097152, reservationMessages: 256 });
 const encoder = new TextEncoder();
 const SECRET = /^[A-Za-z0-9_-]{32,128}$/;
 function validSecret(value) { return typeof value === 'string' && SECRET.test(value); }
+function keysAre(value, keys) { return value && typeof value === 'object' && !Array.isArray(value) &&
+  Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key)); }
+// Canonical unpadded base64url needs no full binary copy to validate. The final
+// sextet must have zero unused bits; otherwise several strings encode one value.
+export function canonicalBase64url(value, minimumBytes, maximumBytes) {
+  if (typeof value !== 'string' || value.length < Math.ceil(minimumBytes * 4 / 3) ||
+      value.length > Math.ceil(maximumBytes * 4 / 3) || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  const remainder = value.length % 4;
+  if (remainder === 1 || (remainder === 2 && !/[AQgw]$/.test(value)) ||
+      (remainder === 3 && !/[AEIMQUYcgkosw048]$/.test(value))) return false;
+  const bytes = Math.floor(value.length * 3 / 4);
+  return bytes >= minimumBytes && bytes <= maximumBytes;
+}
+export function validRelaySignal(message) {
+  if (!keysAre(message, ['type', 'to', 'data']) || message.type !== 'signal' ||
+      typeof message.to !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(message.to) || !keysAre(message.data, ['relay'])) return false;
+  const relay = message.data.relay;
+  if (!keysAre(relay, ['version', 'epoch', 'counter', 'nonce', 'ciphertext']) || relay.version !== 1 ||
+      typeof relay.epoch !== 'string' || typeof relay.nonce !== 'string' ||
+      !/^[A-Za-z0-9_-]{16}$/.test(relay.epoch || '') || !/^[A-Za-z0-9_-]{16}$/.test(relay.nonce || '') ||
+      !Number.isSafeInteger(relay.counter) || relay.counter < 1) return false;
+  return canonicalBase64url(relay.ciphertext, 16, 180000);
+}
 export function cleanName(value) {
   if (typeof value !== 'string') return null;
   return value.normalize('NFKC').replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069<>]/g, '')
@@ -13,6 +43,12 @@ export function cleanName(value) {
 }
 export async function digest(value) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(value)))]
+    .map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+export async function sourceHash(address, serverSecret) {
+  if (!validSecret(serverSecret)) throw new Error('Rate limit key unavailable.');
+  const key = await crypto.subtle.importKey('raw', encoder.encode(serverSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return [...new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(`auralink-source-v1:${address}`)))]
     .map(byte => byte.toString(16).padStart(2, '0')).join('');
 }
 function equal(a, b) {
@@ -40,7 +76,8 @@ function positive(value, fallback, maximum) {
   return Number.isInteger(parsed) && parsed > 0 && parsed <= maximum ? parsed : fallback;
 }
 function peerInfo(peer) { return { id: peer.id, name: peer.name, role: peer.role }; }
-function roomInfo(room) { return { id: room.id, name: room.name, maxParticipants: LIMITS.participants }; }
+function roomInfo(room) { return { id: room.id, name: room.name, maxParticipants: LIMITS.participants,
+  ...(room.access === 'invite' ? { access: 'invite', inviteEnabled: Boolean(room.roomKeyHash), expiresAt: room.expiresAt } : {}) }; }
 function validSession(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(value); }
 function validatedIce(supplied) {
   if (!Array.isArray(supplied) || supplied.length > 12) return null;
@@ -62,16 +99,43 @@ export class Coordinator {
     this.store = store; this.env = env; this.now = now; this.fetcher = fetcher;
     this.devices = new Map(store.loadDevices().map(device => [device.id, device]));
     this.rooms = new Map(store.loadRooms().map(room => [room.id, room]));
+    this.publicBudget = store.loadPublicBudget?.() || { day: '', bootstrap: 0, create: 0, sources: {} };
+    this.mediaBudget = store.loadMediaBudget?.() || { day: '', bytes: 0, messages: 0, rooms: {} };
+    this.mediaBudgetValid = typeof this.mediaBudget.day === 'string' && Number.isSafeInteger(this.mediaBudget.bytes) &&
+      this.mediaBudget.bytes >= 0 && Number.isSafeInteger(this.mediaBudget.messages) && this.mediaBudget.messages >= 0 &&
+      this.mediaBudget.rooms && typeof this.mediaBudget.rooms === 'object' && !Array.isArray(this.mediaBudget.rooms) &&
+      Object.keys(this.mediaBudget.rooms).length <= LIMITS.rooms && Object.entries(this.mediaBudget.rooms).every(([id, budget]) =>
+        /^[a-f0-9-]{36}$/.test(id) && Number.isSafeInteger(budget.bytes) && budget.bytes >= 0 &&
+        Number.isFinite(budget.startAt) && budget.startAt <= this.now());
+    this.mediaKeys = new Map(); this.mediaKeyPending = new Map();
     this.sockets = new Map(); this.requests = new Map(); this.grants = new Map(); this.iceCache = new Map(); this.icePending = new Map();
+    let restoredPublic = 0;
     for (const { transport, attachment } of restored) {
       if (!attachment || attachment.version !== 1 || !attachment.connectionId) {
         transport.close(1008, 'Connection state unavailable.'); continue;
       }
       const client = { ...attachment, transport };
-      if (client.deviceId && !this.devices.has(client.deviceId)) {
+      const publicIdentity = client.mode === 'public' && env.PUBLIC_ROOMS === 'true' &&
+        /^public-[a-f0-9-]{36}$/.test(client.deviceId || '') && /^[a-f0-9]{64}$/.test(client.sourceHash || '') &&
+        Number.isFinite(client.sessionDeadline) && client.sessionDeadline > this.now() &&
+        client.sessionDeadline <= this.now() + LIMITS.publicSessionMs;
+      if ((client.mode === 'public' && (!publicIdentity || restoredPublic >= LIMITS.publicClients)) ||
+          (client.deviceId && client.mode !== 'public' && !this.devices.has(client.deviceId))) {
         transport.close(1008, 'Device registration unavailable.'); continue;
       }
+      if (client.mode === 'public') restoredPublic++;
+      // Credits are already charged in SQLite. A stale/corrupt lease is thrown
+      // away without refund; restoration can never mint uncharged allowances.
+      if (client.mediaLease && !this.validMediaLease(client, this.rooms.get(client.roomId))) delete client.mediaLease;
       this.sockets.set(client.connectionId, client);
+    }
+    let publicRooms = 0;
+    for (const room of [...this.rooms.values()]) if (room.access === 'invite') {
+      if (env.PUBLIC_ROOMS !== 'true' || publicRooms >= LIMITS.publicRooms || !Number.isFinite(room.createdAt) ||
+          !Number.isFinite(room.expiresAt) || room.createdAt > this.now() || room.expiresAt <= this.now() ||
+          room.expiresAt - room.createdAt > LIMITS.publicSessionMs || !/^public-[a-f0-9-]{36}$/.test(room.ownerDeviceId || '')) {
+        this.endRoom(room, 'Public room state expired. Create a new room to continue.');
+      } else publicRooms++;
     }
     // Restore only the same authenticated sockets under an unexpired owner consent lease.
     for (const client of this.sockets.values()) {
@@ -128,13 +192,14 @@ export class Coordinator {
       this.saveRequests(owner);
     }
   }
-  attach(transport) {
+  attach(transport, source = null) {
     const waiting = [...this.sockets.values()].filter(client => !client.deviceId).length;
     if (this.sockets.size >= LIMITS.sockets || waiting >= LIMITS.unauthenticated) {
       transport.close(1013, 'Coordinator is busy. Try later.'); return null;
     }
     const client = { version: 1, connectionId: crypto.randomUUID(), authDeadline: this.now() + LIMITS.authMs,
-      lastSeen: this.now(), rateStart: this.now(), rateCount: 0, transport };
+      lastSeen: this.now(), rateStart: this.now(), rateCount: 0,
+      ...(typeof source === 'string' && /^[a-f0-9]{64}$/.test(source) ? { sourceHash: source } : {}), transport };
     this.sockets.set(client.connectionId, client); this.save(client); return client.connectionId;
   }
   save(client) {
@@ -146,6 +211,51 @@ export class Coordinator {
   }
   error(client, message) { this.send(client, { type: 'error', message }); }
   current(client) { return this.sockets.get(client.connectionId) === client; }
+  publicAllowance(client, kind) {
+    if (!/^[a-f0-9]{64}$/.test(client.sourceHash || '')) return false;
+    const day = new Date(this.now()).toISOString().slice(0, 10);
+    if (this.publicBudget.day !== day) this.publicBudget = { day, bootstrap: 0, create: 0, sources: {} };
+    const budget = this.publicBudget;
+    if (!budget.sources || typeof budget.sources !== 'object' || Array.isArray(budget.sources)) return false;
+    let source = budget.sources[client.sourceHash];
+    if (!source) {
+      if (Object.keys(budget.sources).length >= LIMITS.sourceCounters) return false;
+      source = budget.sources[client.sourceHash] = { daily: 0, minute: -1, bootstrap: 0, hour: -1, create: 0 };
+    }
+    const minute = Math.floor(this.now() / 60000), hour = Math.floor(this.now() / 3600000);
+    if (source.minute !== minute) { source.minute = minute; source.bootstrap = 0; }
+    if (source.hour !== hour) { source.hour = hour; source.create = 0; }
+    if (kind === 'bootstrap') {
+      if (budget.bootstrap >= LIMITS.publicBootstrapDaily || source.daily >= LIMITS.sourceDaily || source.bootstrap >= LIMITS.sourceBootstrapMinute) return false;
+      budget.bootstrap++; source.daily++; source.bootstrap++;
+    } else {
+      if (budget.create >= LIMITS.publicCreateDaily || source.create >= LIMITS.sourceCreateHour) return false;
+      budget.create++; source.create++;
+    }
+    this.store.savePublicBudget?.(budget); return true;
+  }
+  publicCommandAllowance(client) {
+    if (client.mode !== 'public') return true;
+    const day = new Date(this.now()).toISOString().slice(0, 10);
+    if (this.publicBudget.day !== day) this.publicBudget = { day, bootstrap: 0, create: 0, sources: {} };
+    const budget = this.publicBudget;
+    if (budget.commands === undefined) budget.commands = 0;
+    if (!Number.isSafeInteger(budget.commands) || budget.commands < 0 || budget.commands >= LIMITS.publicCommandsDaily) {
+      this.send(client, { type: 'error', code: 'service-free-limit', message: 'The free public service command allowance is exhausted for today. Return after 00:00 UTC or use Nearby mode.' }); return false;
+    }
+    if (!budget.roomCommands) budget.roomCommands = {};
+    for (const id of Object.keys(budget.roomCommands)) if (!this.rooms.has(id)) delete budget.roomCommands[id];
+    if (client.roomId) {
+      const hour = Math.floor(this.now() / 3600000);
+      let usage = budget.roomCommands[client.roomId];
+      if (!usage || usage.hour !== hour) usage = { hour, commands: 0 };
+      if (!Number.isSafeInteger(usage.commands) || usage.commands < 0 || usage.commands >= LIMITS.publicRoomCommandsHourly) {
+        this.send(client, { type: 'error', code: 'service-free-limit', message: 'This room reached its public command allowance for this hour. Wait for the next hour or use Nearby mode.' }); return false;
+      }
+      usage.commands++; budget.roomCommands[client.roomId] = usage;
+    }
+    budget.commands++; this.store.savePublicBudget(budget); return true;
+  }
   saveRequests(owner) {
     const requests = [...this.requests.values()].filter(request => request.targetId === owner.id);
     if (requests.length) owner.controlRequests = requests;
@@ -167,7 +277,7 @@ export class Coordinator {
       const room = [...this.rooms.values()].find(item => item.ownerDeviceId === device.id && this.peer(item.hostId)?.admissionReady === true);
       return { id: device.id, name: device.name, online, hosting: Boolean(online && room), roomId: online && room ? room.id : null };
     });
-    for (const client of this.sockets.values()) if (client.deviceId) this.send(client, { type: 'presence', devices });
+    for (const client of this.sockets.values()) if (client.deviceId && client.mode !== 'public') this.send(client, { type: 'presence', devices });
   }
   close(client, message, code = 1008) {
     this.error(client, message); this.disconnect(client.connectionId); client.transport.close(code, message.slice(0, 100));
@@ -175,17 +285,38 @@ export class Coordinator {
   async receive(connectionId, raw) {
     this.reap();
     const client = this.sockets.get(connectionId); if (!client) return;
-    if (typeof raw !== 'string' || encoder.encode(raw).byteLength > LIMITS.messageBytes) {
+    const wireBytes = typeof raw === 'string' ? encoder.encode(raw).byteLength : Infinity;
+    if (wireBytes > WEBSOCKET_RELAY_LIMITS.maxMessageBytes) {
       this.close(client, 'Only bounded JSON messages are supported.', 1009); return;
     }
-    if (this.now() - client.rateStart > 5000) { client.rateStart = this.now(); client.rateCount = 0; }
-    if (++client.rateCount > 150) { this.close(client, 'Too many messages.'); return; }
-    client.lastSeen = this.now(); this.save(client);
+    if (!Number.isFinite(client.inputRateStart) || this.now() - client.inputRateStart >= 5000) { client.inputRateStart = this.now(); client.inputRateCount = 0; }
+    if (!Number.isSafeInteger(client.inputRateCount) || client.inputRateCount < 0 ||
+        ++client.inputRateCount > WEBSOCKET_RELAY_LIMITS.senderPacketsPer5s + 150) { this.close(client, 'Too many messages.'); return; }
+    this.save(client);
     let message;
-    try { message = JSON.parse(raw); } catch { this.error(client, 'Invalid JSON.'); return; }
-    if (!message || Array.isArray(message) || typeof message !== 'object' || typeof message.type !== 'string') {
-      this.error(client, 'Invalid message.'); return;
+    try { message = JSON.parse(raw); } catch {
+      if (wireBytes > LIMITS.messageBytes) this.close(client, 'Invalid or oversized encrypted media message.', 1009);
+      else this.error(client, 'Invalid JSON.'); return;
     }
+    if (!message || Array.isArray(message) || typeof message !== 'object' || typeof message.type !== 'string') {
+      if (wireBytes > LIMITS.messageBytes) this.close(client, 'Invalid or oversized encrypted media message.', 1009);
+      else this.error(client, 'Invalid message.'); return;
+    }
+    const encryptedRelay = message.type === 'signal' && Object.hasOwn(message.data || {}, 'relay');
+    if ((wireBytes > LIMITS.messageBytes || encryptedRelay) && !validRelaySignal(message)) {
+      this.close(client, 'Invalid or oversized encrypted media message.', 1009); return;
+    }
+    if (encryptedRelay) {
+      if (!Number.isFinite(client.mediaRateStart) || this.now() - client.mediaRateStart >= 5000) {
+        client.mediaRateStart = this.now(); client.mediaRateCount = 0;
+      }
+      if (!Number.isSafeInteger(client.mediaRateCount) || client.mediaRateCount < 0 ||
+          ++client.mediaRateCount > WEBSOCKET_RELAY_LIMITS.senderPacketsPer5s) { this.close(client, 'Too many encrypted media messages.'); return; }
+    } else {
+      if (this.now() - client.rateStart >= 5000) { client.rateStart = this.now(); client.rateCount = 0; }
+      if (++client.rateCount > 150) { this.close(client, 'Too many messages.'); return; }
+    }
+    client.lastSeen = this.now(); this.save(client);
     if (!client.deviceId) {
       if (this.now() >= client.authDeadline) { this.close(client, 'Device authentication timed out.'); return; }
       if (client.authenticating) { this.close(client, 'Authentication is already in progress.'); return; }
@@ -195,12 +326,16 @@ export class Coordinator {
       return;
     }
     if (message.type === 'ping') { this.send(client, { type: 'pong', time: this.now() }); return; }
+    // Exact encrypted media uses its own byte/packet budget, never two writes.
+    // Cleanup remains possible after quota exhaustion and is socket-bound.
+    if (!encryptedRelay && !['leave', 'forget'].includes(message.type) && !this.publicCommandAllowance(client)) return;
     if (['create-room', 'join', 'join-device', 'leave', 'forget'].includes(message.type)) {
       client.roomRevision = (client.roomRevision || 0) + 1; this.save(client);
     }
     if (message.type === 'forget') {
       const deviceId = client.deviceId;
-      this.disconnect(client.connectionId); this.devices.delete(deviceId); this.store.deleteDevice(deviceId);
+      this.disconnect(client.connectionId);
+      if (client.mode !== 'public') { this.devices.delete(deviceId); this.store.deleteDevice(deviceId); }
       this.send(client, { type: 'forgotten', deviceId }); this.broadcastPresence();
       client.transport.close(1000, 'Device forgotten.'); return;
     }
@@ -213,6 +348,19 @@ export class Coordinator {
       const config = await this.ice(room);
       if (this.rooms.get(client.roomId) === room && client.accepted && client.admissionReady === true) this.send(client, { type: 'ice-config', ...config });
       return;
+    }
+    if (['burn-invite', 'rotate-invite', 'block'].includes(message.type)) {
+      if (client.id !== room.hostId || room.access !== 'invite') { this.error(client, 'Only the host can change this invitation.'); return; }
+      if (message.type === 'rotate-invite') { await this.rotateInvite(client, room); return; }
+      if (message.type === 'block') {
+        const target = this.peer(message.peerId);
+        if (!target || target.roomId !== room.id || target.id === room.hostId) { this.error(client, 'Participant not found.'); return; }
+        room.blocked = [...new Set([...(room.blocked || []), target.deviceId])].slice(-32);
+        const targetId = target.id;
+        this.send(target, { type: 'rejected', reason: 'The host blocked this connection and disabled the invitation.' });
+        this.leave(target); this.send(client, { type: 'peer-blocked', peerId: targetId });
+      }
+      this.burnInvite(room); return;
     }
     if (message.type === 'approve' || message.type === 'reject' || message.type === 'kick') {
       if (client.id !== room.hostId) { this.error(client, 'Only the host can manage room admission.'); return; }
@@ -240,6 +388,15 @@ export class Coordinator {
       const target = this.peer(message.to);
       if (!target || target.roomId !== room.id || !target.accepted || target.admissionReady !== true || target.id === client.id) { this.error(client, 'Approved recipient not found.'); return; }
       if (!message.data || Array.isArray(message.data) || typeof message.data !== 'object') { this.error(client, 'Invalid signaling data.'); return; }
+      if (encryptedRelay) {
+        const peerId = client.id, revision = client.roomRevision;
+        const config = await this.websocketMedia(room); this.reap();
+        if (!this.current(client) || client.id !== peerId || client.roomRevision !== revision || client.roomId !== room.id ||
+            this.rooms.get(room.id) !== room || client.admissionReady !== true || !client.accepted || !this.current(target) ||
+            target.roomId !== room.id || target.admissionReady !== true || !target.accepted) return;
+        if (!config.websocketRelayEnabled) { this.send(client, { type: 'error', code: 'websocket-relay-limit', message: 'Encrypted media fallback is unavailable for this room. Create a new room or use a direct connection.' }); return; }
+        if (!this.mediaAllowance(client, target, room, wireBytes)) return;
+      }
       this.send(target, { type: 'signal', from: client.id, data: message.data }); return;
     }
     if (message.type === 'control-request') {
@@ -289,7 +446,13 @@ export class Coordinator {
     const name = cleanName(message.name);
     if (!name) { this.close(client, 'A device name is required.'); return; }
     let device;
-    if (message.type === 'pair') {
+    if (message.type === 'bootstrap') {
+      if (this.env.PUBLIC_ROOMS !== 'true' || [...this.sockets.values()].filter(peer => peer.mode === 'public').length >= LIMITS.publicClients ||
+          !this.publicAllowance(client, 'bootstrap')) { this.close(client, 'Public connection limit reached. Try again later.'); return; }
+      client.deviceId = `public-${crypto.randomUUID()}`; client.mode = 'public'; client.name = name;
+      client.sessionDeadline = this.now() + LIMITS.publicSessionMs; delete client.authDeadline; this.save(client);
+      this.send(client, { type: 'registered', deviceId: client.deviceId, mode: 'public' }); return;
+    } else if (message.type === 'pair') {
       if (!validSecret(this.env.PAIRING_KEY) || !validSecret(message.pairingKey) ||
           !equal(await digest(message.pairingKey), await digest(this.env.PAIRING_KEY))) {
         this.close(client, 'Device pairing was refused.'); return;
@@ -321,18 +484,37 @@ export class Coordinator {
     this.send(client, { type: 'registered', deviceId: device.id }); this.broadcastPresence();
   }
   async createRoom(client, message) {
+    if (this.rooms.size >= LIMITS.rooms) { this.error(client, 'The coordinator room limit was reached. Try again later.'); return; }
     if (client.roomId || [...this.rooms.values()].some(room => room.ownerDeviceId === client.deviceId)) {
       this.error(client, 'Leave your current room before hosting another.'); return;
+    }
+    const publicRoom = client.mode === 'public';
+    if (publicRoom && ([...this.rooms.values()].filter(room => room.access === 'invite').length >= LIMITS.publicRooms || !this.publicAllowance(client, 'create'))) {
+      this.error(client, 'Public room limit reached. Try again later.'); return;
     }
     const revision = client.roomRevision;
     const roomKey = secret(), hostToken = secret();
     const room = { id: crypto.randomUUID(), name: cleanName(message.name) || `${client.name}'s room`,
       ownerDeviceId: client.deviceId, roomKeyHash: await digest(roomKey), hostTokenHash: await digest(hostToken),
-      hostId: null, createdAt: this.now(), startDeadline: this.now() + LIMITS.roomStartMs };
+      hostId: null, createdAt: this.now(), startDeadline: this.now() + LIMITS.roomStartMs,
+      ...(publicRoom ? { access: 'invite', inviteRevision: 0, blocked: [], expiresAt: Math.min(client.sessionDeadline, this.now() + LIMITS.publicSessionMs) } : {}) };
     if (!this.current(client) || client.roomRevision !== revision || client.roomId ||
-        [...this.rooms.values()].some(item => item.ownerDeviceId === client.deviceId)) return;
+        [...this.rooms.values()].some(item => item.ownerDeviceId === client.deviceId) ||
+        this.rooms.size >= LIMITS.rooms || (publicRoom && [...this.rooms.values()].filter(item => item.access === 'invite').length >= LIMITS.publicRooms)) return;
     this.rooms.set(room.id, room); this.store.saveRoom(room);
-    this.send(client, { type: 'room-created', roomId: room.id, roomKey, hostToken, name: room.name });
+    this.send(client, { type: 'room-created', roomId: room.id, roomKey, hostToken, name: room.name,
+      ...(publicRoom ? { access: 'invite', inviteEnabled: true, expiresAt: room.expiresAt } : {}) });
+  }
+  burnInvite(room) {
+    room.inviteRevision = (room.inviteRevision || 0) + 1; room.roomKeyHash = null; this.store.saveRoom(room);
+    this.broadcastRoom(room, { type: 'invite-disabled', roomId: room.id, inviteEnabled: false });
+  }
+  async rotateInvite(client, room) {
+    this.burnInvite(room); const revision = room.inviteRevision; const key = secret(); const hash = await digest(key);
+    if (!this.current(client) || client.id !== room.hostId || this.rooms.get(room.id) !== room || room.inviteRevision !== revision) return;
+    room.roomKeyHash = hash; this.store.saveRoom(room);
+    this.send(client, { type: 'invite-updated', roomId: room.id, roomKey: key, inviteEnabled: true });
+    this.broadcastRoom(room, { type: 'invite-status', roomId: room.id, inviteEnabled: true }, client.id);
   }
   async join(client, message) {
     if (client.roomId) { this.error(client, 'Leave your current room first.'); return; }
@@ -340,6 +522,8 @@ export class Coordinator {
     const viaDevice = message.type === 'join-device';
     const room = viaDevice ? [...this.rooms.values()].find(item => item.ownerDeviceId === message.deviceId && item.hostId) : this.rooms.get(message.roomId);
     const wantsHost = Object.hasOwn(message, 'hostToken');
+    if (client.mode === 'public' && (viaDevice || room?.access !== 'invite')) { this.error(client, 'Use a public room invitation code.'); return; }
+    const inviteRevision = room?.inviteRevision, keyHash = room?.roomKeyHash;
     if (!room || (viaDevice && wantsHost) || (!viaDevice && (!validSecret(message.roomKey) ||
       !equal(await digest(message.roomKey), room.roomKeyHash)))) { this.error(client, 'Invalid invitation or room unavailable.'); return; }
     if (wantsHost && (client.deviceId !== room.ownerDeviceId || !validSecret(message.hostToken) ||
@@ -347,6 +531,9 @@ export class Coordinator {
       this.error(client, 'Only the authenticated room owner can host.'); return;
     }
     if (!this.current(client) || client.roomRevision !== revision || client.roomId || this.rooms.get(room.id) !== room) return;
+    if (room.access === 'invite' && (room.inviteRevision !== inviteRevision || room.roomKeyHash !== keyHash || !room.roomKeyHash || room.blocked?.includes(client.deviceId))) {
+      this.error(client, 'This invitation was disabled or this connection was blocked. Ask the host for a new code.'); return;
+    }
     if (!wantsHost && (!room.hostId || this.peer(room.hostId)?.admissionReady !== true)) { this.error(client, 'The room is waiting for its host.'); return; }
     if (!wantsHost && (this.accepted(room).length >= LIMITS.participants || this.pending(room).length >= LIMITS.pending)) {
       this.error(client, 'The room is full.'); return;
@@ -355,6 +542,10 @@ export class Coordinator {
     if (wantsHost) {
       room.hostId = client.id; this.store.saveRoom(room); this.save(client);
       await this.welcome(client, room); this.broadcastPresence();
+    } else if (room.access === 'invite') {
+      client.accepted = true; client.admissionDeadline = this.now() + LIMITS.admissionMs;
+      client.inviteRevision = inviteRevision; this.save(client);
+      await this.welcome(client, room, this.peer(room.hostId));
     } else {
       client.admissionDeadline = this.now() + LIMITS.admissionMs; this.save(client);
       this.send(client, { type: 'pending', selfId: client.id, room: roomInfo(room), message: 'Waiting for the host to approve.' });
@@ -364,17 +555,23 @@ export class Coordinator {
   async welcome(client, room, owner = null) {
     const peerId = client.id, revision = client.roomRevision;
     const config = await this.ice(room);
+    const media = await this.websocketMedia(room);
     this.reap();
     if (!this.current(client) || client.id !== peerId || client.roomRevision !== revision ||
         client.roomId !== room.id || this.rooms.get(room.id) !== room || !client.accepted ||
         (owner && (!this.current(owner) || owner.id !== room.hostId || owner.roomId !== room.id || owner.admissionReady !== true))) return false;
+    if (room.access === 'invite' && client.id !== room.hostId &&
+        (client.inviteRevision !== room.inviteRevision || !room.roomKeyHash || room.blocked?.includes(client.deviceId))) {
+      this.send(client, { type: 'rejected', reason: 'The invitation changed before connection completed. Ask the host for a new code.' }); this.leave(client); return false;
+    }
     if (!this.send(client, { type: 'welcome', selfId: client.id, hostId: room.hostId, room: roomInfo(room),
-      peers: this.ready(room).filter(peer => peer.id !== client.id).map(peerInfo), ...config })) return false;
+      peers: this.ready(room).filter(peer => peer.id !== client.id).map(peerInfo), ...config, ...media })) return false;
+    client.websocketRelayEnabled = media.websocketRelayEnabled === true;
     client.admissionReady = true; delete client.admissionDeadline; this.save(client);
     if (client.id === room.hostId) { delete room.startDeadline; this.store.saveRoom(room); }
     if (owner) {
       this.broadcastRoom(room, { type: 'peer-joined', peer: peerInfo(client) }, client.id);
-      this.send(owner, { type: 'join-approved', peerId: client.id });
+      if (room.access !== 'invite') this.send(owner, { type: 'join-approved', peerId: client.id });
     }
     return true;
   }
@@ -387,7 +584,7 @@ export class Coordinator {
   }
   clearMembership(client) {
     client.roomRevision = (client.roomRevision || 0) + 1;
-    for (const field of ['id', 'roomId', 'role', 'accepted', 'admissionReady', 'admissionDeadline', 'grant', 'controlRequests']) delete client[field]; this.save(client);
+    for (const field of ['id', 'roomId', 'role', 'accepted', 'admissionReady', 'admissionDeadline', 'inviteRevision', 'grant', 'controlRequests', 'websocketRelayEnabled', 'mediaLease']) delete client[field]; this.save(client);
   }
   leave(client) {
     const room = this.rooms.get(client.roomId);
@@ -409,7 +606,95 @@ export class Coordinator {
     for (const client of [...this.sockets.values()]) if (client.roomId === room.id) {
       this.send(client, { type: 'room-ended', reason }); this.clearMembership(client);
     }
-    this.rooms.delete(room.id); this.iceCache.delete(room.id); this.store.deleteRoom(room.id); this.broadcastPresence();
+    this.rooms.delete(room.id); this.iceCache.delete(room.id); this.mediaKeys.delete(room.id); this.store.deleteRoom(room.id); this.broadcastPresence();
+  }
+  async websocketMedia(room) {
+    const disabled = { websocketRelayEnabled: false };
+    if (this.env.WEBSOCKET_RELAY !== 'true' || !this.mediaBudgetValid || this.rooms.get(room.id) !== room) return disabled;
+    const waiting = this.mediaKeyPending.get(room.id); if (waiting) return waiting;
+    const promise = this.loadMediaKey(room); this.mediaKeyPending.set(room.id, promise);
+    try { return await promise; }
+    finally { if (this.mediaKeyPending.get(room.id) === promise) this.mediaKeyPending.delete(room.id); }
+  }
+  async loadMediaKey(room) {
+    const disabled = { websocketRelayEnabled: false }, provider = 'auralink-websocket-key-v1';
+    let value = this.mediaKeys.get(room.id);
+    try {
+      if (!value && room.websocketKeyCache) {
+        const cache = room.websocketKeyCache;
+        if (cache.version !== 1 || cache.provider !== provider || !Number.isFinite(cache.expiresAt) ||
+            cache.expiresAt <= this.now() || cache.expiresAt > this.now() + LIMITS.publicSessionMs) return disabled;
+        const iv = decodeBytes(cache.iv, 12), cipher = decodeBytes(cache.cipher, 1024);
+        if (iv.length !== 12) return disabled;
+        const clear = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: encoder.encode(`${room.id}:${provider}`) }, await this.cacheKey(), cipher);
+        value = JSON.parse(new TextDecoder().decode(clear));
+        if (!keysAre(value, ['key', 'relayExpiresAt']) || !/^[A-Za-z0-9_-]{43}$/.test(value.key || '') ||
+            encodeBytes(decodeBytes(value.key, 32)) !== value.key || value.relayExpiresAt !== cache.expiresAt) return disabled;
+      } else if (!value) {
+        value = { key: secret(), relayExpiresAt: Math.min(room.expiresAt || Infinity, this.now() + LIMITS.publicSessionMs) };
+        const encrypted = await this.encryptIceCache(room, provider, value);
+        if (this.rooms.get(room.id) !== room || value.relayExpiresAt <= this.now()) return disabled;
+        room.websocketKeyCache = encrypted; this.store.saveRoom(room);
+      }
+      if (this.rooms.get(room.id) !== room || value.relayExpiresAt <= this.now()) return disabled;
+      this.mediaKeys.set(room.id, value);
+      return { websocketRelayEnabled: true, relayKey: value.key, websocketRelayLimits: { ...WEBSOCKET_RELAY_LIMITS } };
+    } catch { return disabled; }
+  }
+  mediaAllowance(client, target, room, bytes) {
+    const denied = message => { this.send(client, { type: 'error', code: 'websocket-relay-limit', message }); return false; };
+    if (this.env.WEBSOCKET_RELAY !== 'true' || !this.mediaBudgetValid || client.websocketRelayEnabled !== true ||
+        target.websocketRelayEnabled !== true || !room.websocketKeyCache || room.websocketKeyCache.expiresAt <= this.now()) {
+      return denied('Encrypted media fallback is unavailable for this room. Create a new room or use a direct connection.');
+    }
+    const budget = this.mediaBudget, day = new Date(this.now()).toISOString().slice(0, 10);
+    if (budget.day !== day) { budget.day = day; budget.bytes = 0; budget.messages = 0; }
+    for (const id of Object.keys(budget.rooms)) if (!this.rooms.has(id)) delete budget.rooms[id];
+    const usage = budget.rooms[room.id] || { bytes: 0, startAt: this.now() };
+    if (this.now() - usage.startAt >= WEBSOCKET_RELAY_LIMITS.roomSeconds * 1000) {
+      return denied('This room reached its encrypted-media byte or 30-minute limit. Create a new room or use a direct connection.');
+    }
+    if (!Number.isFinite(client.mediaBurstStart) || this.now() - client.mediaBurstStart >= 5000) { client.mediaBurstStart = this.now(); client.mediaBurstBytes = 0; }
+    if (!Number.isSafeInteger(client.mediaBurstBytes) || client.mediaBurstBytes < 0 || client.mediaBurstBytes + bytes > WEBSOCKET_RELAY_LIMITS.senderBytesPer5s) {
+      return denied('Encrypted-media sending is temporarily too fast. Reduce the screen quality and retry.');
+    }
+    let lease = this.validMediaLease(client, room) ? client.mediaLease : null;
+    if (!lease || lease.bytesRemaining < bytes || lease.messagesRemaining < 1) {
+      const byteCredits = lease?.bytesRemaining || 0, packetCredits = lease?.messagesRemaining || 0;
+      const reservedBytes = byteCredits >= bytes ? 0 : Math.min(WEBSOCKET_RELAY_LIMITS.reservationBytes - byteCredits,
+        WEBSOCKET_RELAY_LIMITS.dailyBytes - budget.bytes, WEBSOCKET_RELAY_LIMITS.roomBytes - usage.bytes);
+      const reservedMessages = packetCredits >= 1 ? 0 : Math.min(WEBSOCKET_RELAY_LIMITS.reservationMessages - packetCredits,
+        WEBSOCKET_RELAY_LIMITS.dailyMessages - budget.messages);
+      if (reservedBytes + byteCredits < bytes || reservedMessages + packetCredits < 1) {
+        if (budget.bytes + bytes - byteCredits > WEBSOCKET_RELAY_LIMITS.dailyBytes || reservedMessages + packetCredits < 1) {
+          return denied('The free service encrypted-media allowance is exhausted for today. Try a direct connection or return after 00:00 UTC.');
+        }
+        return denied('This room reached its encrypted-media byte or 30-minute limit. Create a new room or use a direct connection.');
+      }
+      // Reserve before exposing credits in the durable socket attachment. A
+      // failure between these steps wastes credits; it cannot refund or reuse
+      // them. SQLite counts reservations, not exact media delivered. Refill
+      // bytes/packets independently while retaining only this socket's valid
+      // residual; small audio/input packets do not waste fresh byte chunks.
+      budget.bytes += reservedBytes; budget.messages += reservedMessages; usage.bytes += reservedBytes; budget.rooms[room.id] = usage;
+      this.store.saveMediaBudget(budget);
+      lease = { roomId: room.id, connectionId: client.connectionId, peerId: client.id, day, expiresAt: room.websocketKeyCache.expiresAt,
+        bytesRemaining: byteCredits + reservedBytes, messagesRemaining: packetCredits + reservedMessages };
+    }
+    lease.bytesRemaining -= bytes; lease.messagesRemaining--;
+    client.mediaLease = lease; client.mediaBurstBytes += bytes; this.save(client); return true;
+  }
+  validMediaLease(client, room) {
+    const lease = client.mediaLease;
+    return Boolean(room && this.mediaBudgetValid && this.mediaBudget.day === new Date(this.now()).toISOString().slice(0, 10) &&
+      this.mediaBudget.rooms[room.id] && keysAre(lease, ['roomId', 'connectionId', 'peerId', 'day', 'expiresAt', 'bytesRemaining', 'messagesRemaining']) &&
+      lease.roomId === room.id && client.roomId === room.id && lease.connectionId === client.connectionId && lease.peerId === client.id &&
+      lease.day === new Date(this.now()).toISOString().slice(0, 10) &&
+      Number.isFinite(lease.expiresAt) && lease.expiresAt === room.websocketKeyCache?.expiresAt && lease.expiresAt > this.now() &&
+      Number.isSafeInteger(lease.bytesRemaining) && lease.bytesRemaining >= 0 && lease.bytesRemaining <= WEBSOCKET_RELAY_LIMITS.reservationBytes &&
+      Number.isSafeInteger(lease.messagesRemaining) && lease.messagesRemaining >= 0 && lease.messagesRemaining <= WEBSOCKET_RELAY_LIMITS.reservationMessages &&
+      this.mediaBudget.bytes >= lease.bytesRemaining && this.mediaBudget.messages >= lease.messagesRemaining &&
+      this.mediaBudget.rooms[room.id].bytes >= lease.bytesRemaining);
   }
   disconnect(connectionId) {
     const client = this.sockets.get(connectionId); if (!client) return;
@@ -422,7 +707,8 @@ export class Coordinator {
   reap() {
     const now = this.now();
     for (const client of [...this.sockets.values()]) {
-      if ((!client.deviceId && now >= client.authDeadline) || now - client.lastSeen >= LIMITS.idleMs) {
+      if ((!client.deviceId && now >= client.authDeadline) || now - client.lastSeen >= LIMITS.idleMs ||
+          (client.sessionDeadline && now >= client.sessionDeadline)) {
         this.close(client, 'Connection timed out.', 1000); continue;
       }
       if (client.admissionDeadline && now >= client.admissionDeadline) {
@@ -431,6 +717,7 @@ export class Coordinator {
     }
     for (const room of [...this.rooms.values()]) {
       if (room.startDeadline && now >= room.startDeadline) this.endRoom(room, 'The host did not start the room.');
+      else if (room.expiresAt && now >= room.expiresAt) this.endRoom(room, 'The room time limit was reached. Create a new room to continue.');
       else if (room.relayDeadline && now >= room.relayDeadline) this.endRoom(room, 'The free relay session time limit was reached.');
     }
     for (const [key, request] of [...this.requests]) if (now >= request.expiresAt) this.deleteRequest(key);
@@ -438,8 +725,8 @@ export class Coordinator {
   }
   nextDeadline() {
     const deadlines = [...this.sockets.values()].flatMap(client => [client.authDeadline,
-      client.lastSeen + LIMITS.idleMs, client.admissionDeadline]).concat([...this.rooms.values()]
-      .flatMap(room => [room.startDeadline, room.relayDeadline]), [...this.grants.values()].map(grant => grant.expiresAt),
+      client.lastSeen + LIMITS.idleMs, client.admissionDeadline, client.sessionDeadline]).concat([...this.rooms.values()]
+      .flatMap(room => [room.startDeadline, room.relayDeadline, room.expiresAt]), [...this.grants.values()].map(grant => grant.expiresAt),
       [...this.requests.values()].map(request => request.expiresAt));
     return deadlines.filter(Number.isFinite).reduce((minimum, deadline) => Math.min(minimum, deadline), Infinity);
   }

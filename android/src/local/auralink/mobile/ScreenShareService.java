@@ -108,7 +108,6 @@ public final class ScreenShareService extends Service {
         maxEdge = intent.getIntExtra("maxEdge", 1280) == 1920 ? 1920 : 1280;
         foregroundTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
         if (Build.VERSION.SDK_INT >= 30 && intent.getBooleanExtra("microphone", false) && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) foregroundTypes |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
-        if (Build.VERSION.SDK_INT >= 30 && intent.getBooleanExtra("camera", false) && checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) foregroundTypes |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
         try {
             // Foreground status must precede getMediaProjection on Android 14+.
             startForeground(NOTIFICATION, notification(), foregroundTypes);

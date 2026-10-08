@@ -2,6 +2,13 @@ const {contextBridge, ipcRenderer} = require('electron');
 const invoke = (name, args) => ipcRenderer.invoke(`auralink:${name}`, args);
 contextBridge.exposeInMainWorld('auralink', {
   platform: process.platform,
+  getPendingInvitation: () => invoke('pending-invitation'),
+  onInvitation: listener => {
+    if (typeof listener !== 'function') return;
+    const handler = (_event, code) => listener(code);
+    ipcRenderer.on('auralink:invitation', handler);
+    return () => ipcRenderer.removeListener('auralink:invitation', handler);
+  },
   hostRoom: args => invoke('host', args),
   stopRoom: () => invoke('stop'),
   trustInvite: invite => invoke('trust-invite', invite),
@@ -27,7 +34,7 @@ contextBridge.exposeInMainWorld('auralink', {
   copyText: value => invoke('copy', value),
   onEmergencyStop: listener => {
     if (typeof listener !== 'function') return;
-    const handler = () => listener();
+    const handler = (_event, reason) => listener(reason);
     ipcRenderer.on('auralink:emergency-stop', handler);
     return () => ipcRenderer.removeListener('auralink:emergency-stop', handler);
   }

@@ -11,6 +11,8 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AuralinkCoordinator"] }],
   "vars": {
+    "PUBLIC_ROOMS": "true",
+    "WEBSOCKET_RELAY": "true",
     "RELAY_ENABLED": "false",
     "RELAY_DAILY_ISSUANCE_LIMIT": "4",
     "RELAY_MONTHLY_ISSUANCE_LIMIT": "60",

@@ -1,23 +1,25 @@
-# Auralink private internet coordinator
+# Auralink internet coordinator
 
-This small service connects **paired, trusted devices across networks**. It supplies an online-device directory, room invitations, host admission and WebRTC signaling. Calls, screen video and remote-input data use encrypted WebRTC connections between participants; media is not uploaded to this Worker.
+Auralink 0.4 adds invitation rooms: the host opens a room, copies its code, and guests enter automatically with that code. No account, private pairing key or service-address entry is needed for the app's default public mode. Four people can join a room. Remote control still needs a separate permission from the actual screen owner.
 
-It is a private beta, limited to 32 paired devices and four approved people in each room. Installing Auralink alone does not enroll somebody in your directory. A device needs your private pairing key once, then uses its own server-issued device token. There is no public user search or automatic access to anyone's screen.
+This Worker supplies signaling and bounded, client-encrypted media forwarding when direct WebRTC cannot connect through the participants' routers. It also retains the optional private paired-device directory from 0.3. Nearby rooms remain independent of this service. The service uses Cloudflare infrastructure; it is not fully decentralized or unlimited.
 
-## How a connection works
+## Connection flow
 
-1. The owner deploys this service to their **Cloudflare Workers Free account**. Cloudflare supplies a public `https://…workers.dev` address and a normal TLS certificate. No purchased domain is required.
-2. Each trusted person enters that service address and the private pairing key in Auralink's Internet setup. The key is sent in a TLS-protected WebSocket frame, never in a URL. The service stores only a SHA-256 hash of each device token.
-3. Paired devices see each other's names, online status and whether a room is available. Starting an internet room generates a new invitation key and a separate host capability, bound to the authenticated owner device.
-4. A guest selects an available device or pastes an invitation. The owner sees an admission request. Until the owner approves, that guest receives no room signaling.
-5. WebRTC attempts a direct connection using STUN. If an optional free relay has been configured and enabled, TURN provides a fallback for restrictive routers and mobile networks.
-6. Remote control requires a second, independent permission from the actual screen owner. Leaving, disconnecting, closing the room or revoking permission invalidates that grant. The directory connection can remain online after a room ends.
+1. An ephemeral public WebSocket authenticates with `bootstrap`. It receives a socket-bound identity, without a persistent account or device token. It cannot see the private device directory.
+2. The host creates an invitation room and joins using a separate server-issued host capability. A guest with the high-entropy invitation enters automatically, up to the four-person limit. Public identities and rooms expire within one hour; reconnecting creates a new identity and requires joining again.
+3. Direct encrypted WebRTC carries screen sharing, microphone audio and remote input when it can connect. STUN helps discover addresses but cannot bypass every restrictive network. The current desktop flow has no camera call.
+4. If enabled, the client can forward encrypted compressed screen frames and mono PCM audio through the same verified WSS coordinator. Desktop WebCodecs uses H.264 or VP8 with an adaptive target up to 30 fps and a selectable resolution ceiling up to 1440p. Engines without a common codec use an explicitly labeled JPEG compatibility mode limited to 4 fps and a 1280-pixel long edge. This is an application fallback, not TURN. Actual quality depends on hardware, scene complexity, throughput and the free allowances below.
+5. A host can kick a participant, disable the invitation, generate a new invitation, or block a connection. Blocking also disables the old invitation. An anonymous person with a new identity and a newly shared code can return; this is not a permanent account ban.
+6. Screen control requires independent owner consent. A verified control lease lasts at most 15 minutes. Leaving, host disconnect, room change, socket replacement or revocation clears permission. Healthy hibernation preserves only the original, correctly bound unexpired lease.
 
-Direct-only mode can work internationally without port forwarding, but some network combinations need TURN. It is not a guarantee that every pair of networks will connect, and this service uses Cloudflare infrastructure rather than being fully decentralized.
+An invitation is a capability: anyone who possesses it may enter the room. Share it only with intended participants and disable it after they join when appropriate. It does not authorize remote input. There is no public room listing or user search.
+
+Invitation codes use `A1.<room UUID>.<43-character base64url key>`. Invitation links keep the room/key in the URL fragment, which is not sent to the HTTP server. The coordinator's root page parses the fragment locally and offers `auralink://join#code=…` plus a copy-code fallback. It does not join web calls, contact analytics, load external scripts or access a microphone. Custom private coordinators still use the app's Advanced setup rather than the default-service code shortcut.
 
 ## Free deployment
 
-Use Node.js 22 or newer on Windows 11, macOS or Linux. From the project directory:
+Use Node.js 22 or newer. From the project directory:
 
 ```powershell
 cd internet-service
@@ -28,78 +30,94 @@ npm run check
 npx wrangler login
 ```
 
-`wrangler login` opens Cloudflare's supported OAuth login. Cookies are not needed. Remain on the **Workers Free plan**; do not enable a paid plan to deploy this project. The SQLite Durable Object migration in `wrangler.jsonc` is compatible with the free plan.
+OAuth login opens Cloudflare's official page; browser cookies are unnecessary. Stay on **Workers Free**. This configuration uses a SQLite Durable Object and a supplied `https://…workers.dev` address, so a purchased domain is unnecessary.
 
-Generate a strong private pairing key locally:
+Generate a server secret and upload it through Wrangler's prompt:
 
 ```powershell
 node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))"
 npx wrangler secret put PAIRING_KEY
+```
+
+Keep this secret out of GitHub, screenshots, invitations and installers. It protects private pairing, keyed source-rate identifiers and encrypted key caches. Normal public-room guests never enter it. For your own public invitation deployment, set `PUBLIC_ROOMS` to `"true"` in `wrangler.jsonc`. Enable `WEBSOCKET_RELAY` only after reviewing the limits below. Keep `RELAY_ENABLED` false to contact no TURN provider. Then run:
+
+```powershell
 npm run deploy
 ```
 
-Paste the generated key when the secret command asks. Save it in your password manager and share it only with people you want in your private directory. Keep it out of screenshots, GitHub, invitations and installer assets. Wrangler prints the public service address after deployment. Enter that address in Auralink on every device. A deployed, configured service returns this identity-free health response:
+Wrangler prints the public origin. The default app uses the project's deployed coordinator; an alternate origin belongs in Advanced setup. Local development uses `.dev.vars` copied from `.dev.vars.example` and `npm run dev`. Local credentials, dependencies and runtime state are ignored by Git.
+
+`GET /internet/health` returns HTTP 200 with:
 
 ```json
 {"service":"auralink-internet","protocol":1,"status":"ok"}
 ```
 
-at `GET /internet/health`. WebSockets use `GET /internet/ws`; query strings are refused. The service uses normal platform TLS, so it does not use the LAN room's self-signed certificate pin.
+WebSockets use `/internet/ws` without credentials or query strings. Internet TLS uses normal certificate-chain/hostname validation, separately from Nearby self-signed certificate pins.
 
-For local development, copy `.dev.vars.example` to `.dev.vars`, replace the pairing-key placeholder, and run `npm run dev`. The default local address is `http://localhost:8787`. Keep local development credentials separate from deployment credentials. `.dev.vars`, runtime data and dependencies are ignored by Git.
+## Finite free-beta limits
 
-## Relay and the zero-cost boundary
+Cloudflare Free has finite quotas; exhausted operations fail rather than creating Free-plan overage charges. Account usage by other applications and hostile traffic can still make this beta unavailable earlier than its application limits. Remain on the Free plan: these guards do not create a spending cap for a paid account. See [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) and [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/).
 
-**Relay is disabled by default.** The shipped configuration contacts no TURN credential provider and returns only public STUN configuration. Cloudflare Free quotas are finite: the service becomes unavailable when the applicable free limits are exhausted. Free tiers are useful for a small beta, not unlimited worldwide video conferencing. Check the current [Cloudflare Durable Objects free limits](https://developers.cloudflare.com/durable-objects/platform/pricing/) before deployment.
-
-Optional Metered relay setup uses a **credential-scoped API key for an already-created, expiring TURN credential**. The account-wide secret key is never requested or exposed by this implementation. Before enabling relay, verify your Metered account's free allowance and what happens when it is exhausted. Do not enable billing or accept paid overages for this project.
-
-1. In your Metered dashboard, create an expiring credential and wait for propagation before testing. Confirm whether expiring credentials and credential retrieval are available on your account's free plan. This service does not upgrade your account or create paid credentials.
-2. Set `METERED_APP_DOMAIN`, `METERED_API_KEY` and `METERED_CREDENTIAL_EXPIRES_AT` with `npx wrangler secret put NAME`, one command per secret. The domain must be your app's `…metered.live` hostname, without a scheme or path. The expiry must be the **actual provider-enforced credential expiry**, in ISO UTC form, no more than 24 hours ahead. Setting an expiry here does not make a static provider credential expire.
-3. Keep `RELAY_ENABLED` false until your free-plan and quota behavior are verified. When ready, set it to `"true"` in `wrangler.jsonc`, then redeploy.
-
-The default app limits are **four provider credential fetch attempts per UTC day**, **60 per UTC month**, and a **10-minute room limit when TURN is offered**. Approved room participants share the room's fetched ICE configuration. Attempts are counted before fetching, including provider failures. Limits persist in SQLite. The whole room ends at its saved relay deadline, even across a restart and even if a participant's selected WebRTC route happens to be direct. The server cannot reliably prove which route every client is using, so offering relay activates this conservative room limit. You can reduce these limits in `wrangler.jsonc`; the implementation caps session duration at 30 minutes.
-
-These are **issuance and application-session limits, not a byte meter or a provider billing cap**. A copied TURN username/password could consume the provider allowance until its actual expiry. The provider's enforced free quota, disabled overages and credential expiration are required for a strict spending boundary. High-resolution streams can use several GB per hour. When the provider fails, a credential expires or an app allowance runs out, Auralink falls back to direct-only configuration; it never selects a paid provider automatically.
-
-See Metered's [credential retrieval API](https://www.metered.ca/docs/turn-rest-api/get-credential/) and [expiring credential guidance](https://www.metered.ca/docs/turnserver-guides/expiring-turn-credentials/). Server-side responses include only the WebRTC ICE servers, username and temporary password needed by approved participants. Provider API keys are never returned to the client. Provider URLs and error details are not logged.
-
-## Security and lifecycle
-
-- A maximum of eight unregistered sockets can wait for authentication, and 64 total sockets can connect. Unauthenticated sockets expire after ten seconds. Overlapping authentication attempts on one socket are refused. Application messages are text JSON, bounded to 64 KiB and 150 messages per five seconds per socket; automatic heartbeat replies do not execute application code.
-- A registered device has one live socket. A second valid login replaces the old connection and ends its participation. **Forget this device** removes the server registration and invalidates its token; rejoining requires pairing again.
-- Room IDs do not authorize admission. Invitation keys and host tokens are persisted as hashes, and a copied host capability cannot impersonate a different device. Pending guests cannot signal, grant control or admit themselves.
-- Peer IDs, roles and signal senders are derived from authenticated membership. Cross-room signals and stale control requests are refused. Native screen-sharing and input permissions remain the screen owner's responsibility.
-- SQLite stores device names, token hashes, room capability hashes and relay issuance counters. Optional room ICE configuration is encrypted with AES-GCM under a key derived from the server pairing secret, bound to its room/provider/expiry, and discarded when expired or invalid. Hibernation reuses that cache without another provider fetch or extending the original room deadline. WebSocket attachments restore approved membership and pending control requests through Cloudflare hibernation. Control consent has an absolute 15-minute lease bound to both authenticated device IDs, peer IDs, socket connection IDs and the room. Healthy hibernation preserves a verified, unexpired lease. An expired lease, replaced socket, changed device or changed room explicitly revokes control; the owner must consent again. A missing host ends the room. Unverified grant state never silently resumes.
-- Clients send exact `{type:"ping"}` messages every 30 seconds; Cloudflare replies automatically while the object hibernates. Alarms read those automatic-response timestamps to refresh the idle lease. Idle sockets expire after two minutes. Durable Object alarms enforce authentication, pending admission, idle and relay deadlines while allowing hibernation between events. There are no permanent JavaScript timers or polling loops keeping the object awake.
-- Worker observability is disabled in this configuration, and application code does not log invitation contents, signaling, device tokens or provider keys. Hosting providers still handle network metadata according to their own policies.
-
-## Protocol
-
-The first socket message is either `{type:"pair",pairingKey,name}` or `{type:"register",deviceId,deviceToken,name}`. A successful pairing emits `paired` with the new credentials, then `registered`. Both authentication paths send the private `presence` directory. Store the device token locally; never put it in an invitation.
-
-| Client message | Result |
+| Application guard | Limit |
 | --- | --- |
-| `create-room` with optional room `name` | `room-created` with `roomId`, `roomKey`, `hostToken`, `name` |
-| `join` with `roomId`, `roomKey`, optional owner `hostToken` | Owner `welcome`, or guest `pending` and owner `join-request` |
-| `join-device` with paired owner `deviceId` | Same pending guest approval |
-| `approve`, `reject`, `kick` with `peerId` | Owner-only admission actions |
-| `signal` with `to`, `data` | Relayed only to an approved peer in the same room; sender rewritten |
-| `control-request` with `to` | Owner receives request with server-issued `requestId` |
-| `control-response` with `to`, `requestId`, `accepted`, owner `sessionId` | Independent owner grant or denial |
-| `grant-control` with `peerId`, own `targetId`, owner `sessionId` | Explicit grant issued by the actual screen owner |
-| `control-revoke` with optional controller `to` | Owner revocation |
-| `ice-request` | Approved participant receives `ice-config` |
-| `leave` | Ends room participation; sends `room-left`; directory remains connected |
-| `forget` | Deletes own registration, sends `forgotten`, closes socket |
-| `ping` | `pong` and idle lease refresh |
+| Public identities simultaneously / rooms simultaneously | 48 / 16 |
+| All sockets / waiting unauthenticated sockets | 64 / 8 |
+| Public room participants / identity and room lifetime | 4 / at most 1 hour |
+| Public bootstraps / new rooms per UTC day | 1,024 / 256 |
+| Source bootstraps per minute / per UTC day | 8 / 64 |
+| Source new rooms per hour | 8 |
+| Public normal commands per UTC day / per room per hour | 20,000 / 2,000 |
+| Reserved encrypted media per UTC day, across all rooms | 300,000 packets and 1 GiB wire bytes |
+| Reserved media per room | 512 MiB wire bytes and 30 minutes from its first packet |
+| Forwarded media per sender | 600 packets and 6 MiB wire bytes per five-second window |
+| Durable per-socket reservation ceiling | 2 MiB byte credits and 256 packet credits |
+| Normal JSON / validated ciphertext signal wire size | 64 KiB / 256 KiB |
 
-`welcome` includes `{selfId,hostId,room,peers,iceServers,relayEnabled,relaySecondsLimit}`. ICE configuration is ready before welcome, so the client can construct its WebRTC connections safely. `presence.devices` contains only `{id,name,online,hosting,roomId}`, including retained offline registrations. Names are untrusted display text and must be rendered with `textContent`.
+Each forwarded ciphertext packet counts separately, including video fragments and copies sent to different recipients. For the two-desktop test, two 3 Mbps screen feeds use approximately 8 Mbps of base64url wire traffic before audio and metadata; a 512 MiB room therefore supports roughly nine minutes at that rate. Two 4.5 Mbps feeds use about 12 Mbps wire traffic and consume that room allowance in roughly six minutes. Static screens and lower quality can use less. These are illustrative bandwidth calculations, not promised durations. The 30-minute timer is an upper bound; byte or packet exhaustion can occur earlier. Direct WebRTC does not consume these forwarding allowances.
 
-## Verification
+Daily global counters reset at 00:00 UTC. A room's byte/time counters and a socket's burst counters survive hibernation and do not reset at midnight. Normal public commands and media use separate budgets. Heartbeats and local leave/forget cleanup do not consume the normal-command budget. Quota errors identify the exhausted allowance; direct WebRTC remains available after fallback exhaustion.
 
-`npm test` runs policy/security tests covering invalid pairing/token, hash-only persistence, copied host-token impersonation, approval, sender identity, four-person capacity, independent control consent, revoke/disconnect, stale cross-room requests, device forget, simultaneous device-cap enforcement, payload/rate limits, optional relay limits, verified hibernation restoration and refusal of expired/replayed control bindings. Alarms revoke expired control even when both devices remain online, without ending the call.
+SQLite counters record **reserved allowances**, not exact bytes successfully delivered. Before forwarding, one atomic row UPSERT charges new byte and/or packet credits; the sender's latest durable WebSocket attachment stores the depleted residual bound to its day, room, peer and connection. Refills top up only the depleted dimension, so small audio/control packets do not reserve another full byte chunk. No packet performs a SQLite budget write while its lease has sufficient credits. Credits are never refunded: a crash between SQL and attachment persistence can waste allowance, while a healthy hibernation resumes the latest depleted attachment. Closing or changing rooms can waste at most 2 MiB and 256 packet credits per socket; midnight drops any unused old-day credits.
 
-`npm run test:runtime` exercises the actual local workerd/Miniflare runtime with SQLite storage, WebSocket upgrades, authentication, admission, signaling, control consent/revoke, host disconnect, offline presence and forgetting. `npm run check` performs a Wrangler deployment dry run without publishing anything.
+Independent refills make the 300,000-packet ceiling meaningful while keeping media budget reservations below roughly 1,800 SQLite UPSERTs per day at the configured byte, packet and room caps. Stable room updates use UPSERT rather than deleting/replacing indexed records. The separate 20,000 normal-command allowance leaves room for host invitation updates, bootstrap, room cleanup and alarm writes. These are conservative application guards, not an absolute account quota guarantee: private paired clients are trusted owner-controlled clients and have no daily public-command allowance; hostile connection attempts, alarms, index bookkeeping or unrelated account activity may exhaust free platform quotas earlier. Monitor the account during real-device tests before broad distribution.
 
-These tests do not prove international media connectivity on your physical Windows PC, iQOO phone and MacBook. After deployment, test from separate networks, then test a verified free TURN relay and an owner-approved control session. Keep the account free and measure provider usage before inviting more people.
+## Encryption and permissions
+
+Relay signals contain only `{version,epoch,counter,nonce,ciphertext}` inside `data.relay`. Ciphertext is base64url with 16–180,000 decoded bytes; epoch and nonce are exactly 12 bytes. The sender is derived from ready, admitted socket membership. Recipient checks, strict fields and rechecked membership after asynchronous key loading prevent pending, departed or cross-room forwarding. Large plaintext, arbitrary IPC messages and unapproved relay senders are refused by the Worker and native bridges.
+
+Clients encrypt fallback payloads using AES-GCM and pair/epoch-specific keys derived from a room key; they enforce replay checks. The Worker forwards ciphertext and does not decode, record or log video/audio. It generates and distributes the room key over TLS, then stores only an AES-GCM-encrypted cache bound to the room and expiry. Because the coordinator distributes that key, this design is **not a zero-knowledge service**: a compromised key distributor could know the key. Hosting providers handle network metadata according to their policies.
+
+Worker observability is disabled. SQLite stores capability/token hashes, encrypted temporary key/configuration caches, limited private device metadata, HMAC source identifiers and quota counters. No raw source IP is persisted or logged. Public bootstrap identities are ephemeral; private device tokens are hash-only persisted. Socket attachments contain bounded identity, admission, rate and consent state, never media or plaintext relay keys.
+
+Clients send exact `{type:"ping"}` messages every 30 seconds. Cloudflare's [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/) replies automatically; alarms refresh idle leases from those response timestamps. Unauthenticated sockets expire after ten seconds; idle sockets after two minutes. An interrupted welcome fails closed. Missing hosts end rooms; pending guests receive neither a media key nor signaling. Verified control leases bind owner/controller device, peer, socket and room IDs plus their original deadline.
+
+## Advanced private group and optional TURN
+
+Advanced pairing retains a private directory of at most 32 trusted devices. `pair` sends the owner's pairing key in a WSS frame; `register` uses the issued device token. Private guests require host admission even with an invitation or an online-device shortcut. `forget` deletes that registration and invalidates its token. Public clients never receive this directory, and public identities cannot join private rooms.
+
+Optional TURN remains disabled. It requires an already-created, provider-expiring credential, a credential-scoped Metered API key and verified free-account quota behavior. Set `METERED_APP_DOMAIN`, `METERED_API_KEY` and `METERED_CREDENTIAL_EXPIRES_AT` with Wrangler secrets only after verifying their availability and expiry on the actual plan. An app expiry setting cannot make static provider credentials expire. Do not enable paid billing or overages for this project.
+
+The optional TURN guard allows four fetch attempts per UTC day, 60 per month, and ten minutes per room once TURN is offered. Failed fetches count. ICE caches are encrypted and reuse the original deadline through hibernation. The whole TURN-enabled room ends at its deadline, including when an individual selected route is direct. These issuance/session guards cannot guarantee provider byte usage or billing: copied credentials remain usable until their actual provider-enforced expiry. See [credential retrieval](https://www.metered.ca/docs/turn-rest-api/get-credential/) and [expiring credentials](https://www.metered.ca/docs/turnserver-guides/expiring-turn-credentials/).
+
+## Protocol and verification
+
+| Message | Result |
+| --- | --- |
+| `bootstrap` with `name` | Ephemeral `registered` with `mode:"public"`; no directory/token |
+| `pair` / `register` | Private credentials/registration and private `presence` |
+| `create-room`, then owner `join` with host capability | `room-created`, then admitted owner `welcome` |
+| Guest `join` with invitation | Public automatic welcome; private pending/host approval |
+| `approve`, `reject`, `kick` | Host-only private admission or participant removal |
+| `burn-invite`, `rotate-invite`, `block` | Public host moderation; rotation key goes only to host |
+| `signal` with `to`, `data` | Same-room ready-peer forwarding with server-derived `from` |
+| `control-request` / `control-response` / `control-revoke` | Independent owner consent and revocation |
+| `leave` / `forget` | Immediate room cleanup / own identity removal |
+
+Welcome includes ICE before peer creation and, when enabled, `websocketRelayEnabled`, `relayKey` and `websocketRelayLimits`. `websocket-relay-limit` and `service-free-limit` errors give static actionable quota messages. Untrusted names must use `textContent`.
+
+Policy tests cover public/private isolation, automatic invitation admission, moderation, asynchronous cancellation, owner spoofing, capacity, independent control, stale grants, strict encrypted envelopes, persistent quotas and cache tampering. Actual local workerd tests exercise TLS-independent WebSocket upgrades, SQLite persistence, healthy hibernation, consent, forwarding, sender identity, burst refusal and disconnect cleanup. The media test reads the actual persisted SQLite counters after runtime shutdown.
+
+After deployment, `npm run test:deployed` creates and cleans up one disposable public room using production native HTTPS/WSS clients. It verifies automatic entry, actual AES-GCM encrypted packets in both directions, outsider refusal, independent consent/revoke, invitation rotation, blocking and host-leave cleanup. Its JSON report contains no invitation, key, device credential or raw packet. This explicit live test consumes a small amount of the free allowance; it is not part of ordinary unit tests and does not deploy anything.
+
+These checks do not establish physical cross-network playback on the user's Windows PC and MacBook. Test the two desktops on separate networks, verify actual decoded screen frames and audible microphone audio in both directions, and test native capture/control/revoke separately. A forced-fallback browser test exercises the fallback engine but is distinct from two physical devices. Android remains outside the current desktop release's real-device acceptance gate.

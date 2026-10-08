@@ -18,7 +18,7 @@ export class RelayBudget {
   }
 }
 export class RoomRTC extends EventTarget {
-  constructor({ selfId, signal, iceServers = [], iceTransportPolicy = 'all', relaySecondsLimit = 0, relayBytesLimit = 0 }) {
+  constructor({ selfId, signal, iceServers = [], iceTransportPolicy = 'all', relaySecondsLimit = 0, relayBytesLimit = 0, websocketRelayEnabled = false, relayKey, relayLimits = {} }) {
     super();
     this.selfId = selfId;
     this.signal = signal;
@@ -27,6 +27,14 @@ export class RoomRTC extends EventTarget {
     this.localTracks = new Map();
     this.previousStats = new Map();
     this.closed = false;
+    this.websocketRelayEnabled = websocketRelayEnabled === true && typeof relayKey === 'string' && /^[A-Za-z0-9_-]{43}$/.test(relayKey);
+    this.relayLimits = relayLimits; this.relayMedia = null;
+    this.relayReady = this.websocketRelayEnabled ? import('./relay-media.js').then(({ RelayMedia }) => {
+      if (!this.closed) this.relayMedia = new RelayMedia(this, relayKey);
+      return this.relayMedia;
+    }).catch(() => { if (!this.closed) this.emit('error', { error: new Error('Secure relay support could not load. Reinstall the current app.') }); return null; }) : Promise.resolve(null);
+    this.networkOnline = () => { for (const entry of this.peers.values()) if (entry.pc.connectionState !== 'connected') this.recoverPeer(entry, 'network-change'); };
+    globalThis.addEventListener?.('online', this.networkOnline);
     this.iceTransportPolicy = iceTransportPolicy === 'relay' ? 'relay' : 'all';
     this.relayBudget = new RelayBudget({ seconds: relaySecondsLimit, bytes: relayBytesLimit });
     this.budgetTimer = (relaySecondsLimit > 0 || relayBytesLimit > 0) ? setInterval(() => { if (!this.closed) void this.stats(); }, 1000) : null;
@@ -41,13 +49,16 @@ export class RoomRTC extends EventTarget {
       info: peer, pc, senders: new Map(), remoteKinds: {}, remoteMids: {}, remoteState: {},
       remoteTracks: new Map(), inactiveRemoteTracks: new Map(), polite: this.selfId.localeCompare(peer.id) > 0,
       makingOffer: false, ignoreOffer: false, settingAnswer: false, queue: Promise.resolve(), mediaQueue: Promise.resolve(), channel: null,
+      recoveryAttempts: 0, recoveryTimer: null, relayActive: false,
     };
     this.peers.set(peer.id, entry);
     pc.onicecandidate = ({ candidate }) => { if (candidate) this.send(peer.id, { candidate: candidate.toJSON() }); };
-    pc.onconnectionstatechange = () => this.emit('connection', { peerId: peer.id, state: pc.connectionState });
-    pc.oniceconnectionstatechange = () => this.emit('connection', { peerId: peer.id, state: pc.connectionState, iceState: pc.iceConnectionState });
+    pc.onconnectionstatechange = () => this.connectionChanged(entry);
+    pc.oniceconnectionstatechange = () => this.connectionChanged(entry);
     pc.ontrack = ({ track, streams, transceiver }) => {
-      const kind = entry.remoteKinds[track.id] || entry.remoteMids[transceiver.mid] || (track.kind === 'audio' ? 'audio' : 'camera');
+      if (this.closed || entry.relayActive || this.peers.get(peer.id) !== entry) return;
+      const kind = entry.remoteKinds[track.id] || entry.remoteMids[transceiver.mid] || (track.kind === 'audio' ? 'audio' : 'screen');
+      if (!['audio', 'screen'].includes(kind)) { track.stop(); return; }
       const stream = streams[0] || new MediaStream([track]);
       if (entry.remoteState[kind] === false) entry.inactiveRemoteTracks.set(kind, { track, stream });
       else {
@@ -69,11 +80,11 @@ export class RoomRTC extends EventTarget {
       // keep the perfect-negotiation offer flag set after SDP has been sent.
       void this.setVideoLimits();
     };
-    // One deterministic offerer establishes three permanent media slots. The
+    // One deterministic offerer establishes two permanent media slots. The
     // answerer reuses those offered transceivers instead of creating duplicate
     // m-lines. Toggling/restarting capture replaces a source without SDP glare.
     if (!entry.polite) {
-      for (const kind of ['audio', 'camera', 'screen']) {
+      for (const kind of ['audio', 'screen']) {
         const transceiver = pc.addTransceiver(kind === 'audio' ? 'audio' : 'video', { direction: 'sendrecv' });
         entry.senders.set(kind, transceiver.sender);
       }
@@ -81,6 +92,55 @@ export class RoomRTC extends EventTarget {
       this.setupChannel(peer.id, pc.createDataChannel('auralink-input', { ordered: true }));
     }
     this.emit('connection', { peerId: peer.id, state: 'new' });
+    this.scheduleRecovery(entry, 12000);
+  }
+
+  connectionChanged(entry) {
+    if (this.closed || this.peers.get(entry.info.id) !== entry || entry.relayActive) return;
+    const { pc } = entry;
+    this.emit('connection', { peerId: entry.info.id, state: pc.connectionState, iceState: pc.iceConnectionState });
+    if (pc.connectionState === 'connected') { clearTimeout(entry.recoveryTimer); entry.recoveryTimer = null; entry.recoveryAttempts = 0; }
+    else if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') this.scheduleRecovery(entry, 300);
+    else if (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected') this.scheduleRecovery(entry, 3000);
+  }
+
+  scheduleRecovery(entry, milliseconds) {
+    if (entry.recoveryTimer || entry.relayActive || this.closed) return;
+    entry.recoveryTimer = setTimeout(() => { entry.recoveryTimer = null; this.recoverPeer(entry, 'connection-timeout'); }, milliseconds);
+  }
+
+  async recoverPeer(entry, reason) {
+    if (this.closed || entry.relayActive || this.peers.get(entry.info.id) !== entry || entry.pc.connectionState === 'connected') return;
+    clearTimeout(entry.recoveryTimer); entry.recoveryTimer = null;
+    if (this.websocketRelayEnabled) { await this.activateRelay(entry); return; }
+    if (entry.recoveryAttempts >= 3) { this.emit('connection', { peerId: entry.info.id, state: 'failed', reason: 'This network needs a relay connection. Rejoin or use a different network.' }); return; }
+    entry.recoveryAttempts++;
+    try { entry.pc.restartIce(); } catch { /* The peer may have closed during recovery. */ }
+    this.emit('connection', { peerId: entry.info.id, state: 'connecting', recovering: true, reason });
+    this.scheduleRecovery(entry, 8000 * entry.recoveryAttempts);
+  }
+
+  async activateRelay(entry) {
+    if (!entry || this.closed || !this.websocketRelayEnabled || entry.relayActive || this.peers.get(entry.info.id) !== entry) return;
+    const media = await this.relayReady;
+    if (!media || this.closed || !this.websocketRelayEnabled || this.peers.get(entry.info.id) !== entry) return;
+    entry.relayActive = true; clearTimeout(entry.recoveryTimer); entry.recoveryTimer = null;
+    // A fallback has one route. Closing the failed RTC path prevents duplicate
+    // audio or later transport callbacks from replacing the relayed tracks.
+    entry.channel?.close(); entry.channel = null;
+    for (const kind of [...entry.remoteTracks.keys()]) this.removeRemoteTrack(entry.info.id, kind);
+    entry.inactiveRemoteTracks.clear(); entry.pc.close(); media.activate(entry.info.id);
+  }
+
+  resumePlayback() { return this.relayMedia ? this.relayMedia.resumePlayback() : this.relayReady.then(media => media?.resumePlayback()); }
+
+  stopWebsocketRelay(reason = 'The secure relay allowance has been reached. Try later or use Nearby.') {
+    this.websocketRelayEnabled = false; this.relayMedia?.close();
+    for (const entry of this.peers.values()) if (entry.relayActive) {
+      entry.relayActive = false; this.emit('channel', { peerId: entry.info.id, open: false });
+      this.emit('connection', { peerId: entry.info.id, state: 'failed', reason });
+    }
+    this.emit('error', { error: new Error(reason) });
   }
 
   setupChannel(peerId, channel) {
@@ -115,6 +175,17 @@ export class RoomRTC extends EventTarget {
   receive(peerId, data) {
     const entry = this.peers.get(peerId);
     if (!entry || !data || this.closed) return;
+    if (data.relay) {
+      if (Object.keys(data).length !== 1 || !this.websocketRelayEnabled) return;
+      void this.relayReady.then(async media => {
+        if (!media || this.closed || !this.websocketRelayEnabled || this.peers.get(peerId) !== entry) return;
+        // Authentication happens before a packet can activate this transport.
+        // RelayMedia validates/decrypts and then activates after a valid hello.
+        media.receive(peerId, data.relay);
+      });
+      return;
+    }
+    if (entry.relayActive) return;
     entry.queue = entry.queue.then(async () => {
       if (this.closed || this.peers.get(peerId) !== entry) return;
       if (data.mediaState) this.applyMediaState(peerId, data.mediaState);
@@ -135,10 +206,10 @@ export class RoomRTC extends EventTarget {
           if (!entry.senders?.size && entry.pc.getTransceivers) {
             for (const transceiver of pc.getTransceivers()) {
               const kind = entry.remoteMids[transceiver.mid];
-              if (!['audio', 'camera', 'screen'].includes(kind) || entry.senders.has(kind)) continue;
+              if (!['audio', 'screen'].includes(kind) || entry.senders.has(kind)) continue;
               transceiver.direction = 'sendrecv'; entry.senders.set(kind, transceiver.sender);
             }
-            if (entry.senders.size !== 3) throw new Error('Use matching Auralink versions for this media connection.');
+            if (entry.senders.size !== 2) throw new Error('Use matching Auralink versions for this media connection.');
             await this.syncSenders(entry);
             if (this.closed || this.peers.get(peerId) !== entry) return;
           }
@@ -158,8 +229,8 @@ export class RoomRTC extends EventTarget {
   applyMediaState(peerId, state) {
     const entry = this.peers.get(peerId);
     if (!entry) return;
-    for (const kind of ['audio', 'camera', 'screen']) if (typeof state[kind] === 'boolean') entry.remoteState[kind] = state[kind];
-    for (const kind of ['audio', 'camera', 'screen']) {
+    for (const kind of ['audio', 'screen']) if (typeof state[kind] === 'boolean') entry.remoteState[kind] = state[kind];
+    for (const kind of ['audio', 'screen']) {
       if (state[kind] === false) {
         const item = entry.remoteTracks.get(kind);
         if (item) { entry.inactiveRemoteTracks.set(kind, item); entry.remoteTracks.delete(kind); this.emit('track-removed', { peerId, kind }); }
@@ -185,11 +256,12 @@ export class RoomRTC extends EventTarget {
   }
 
   mediaState() {
-    return Object.fromEntries(['audio', 'camera', 'screen'].map((kind) => [kind, Boolean(this.localTracks.get(kind)?.track.enabled)]));
+    return Object.fromEntries(['audio', 'screen'].map((kind) => [kind, Boolean(this.localTracks.get(kind)?.track.enabled)]));
   }
 
   async setTrack(kind, track, stream) {
     if (this.closed) { track?.stop(); return; }
+    if (!['audio', 'screen'].includes(kind)) { track?.stop(); throw new Error('Choose microphone audio or screen sharing.'); }
     const old = this.localTracks.get(kind);
     if (old?.track === track) return;
     if (track) this.localTracks.set(kind, { track, stream }); else this.localTracks.delete(kind);
@@ -199,16 +271,17 @@ export class RoomRTC extends EventTarget {
       this.send(entry.info.id, { mediaState: this.mediaState() });
     }
     await Promise.all(replacements);
+    this.relayMedia?.state();
     if (track?.kind === 'video') await this.setVideoLimits();
   }
 
   syncSenders(entry) {
     entry.mediaQueue = (entry.mediaQueue || Promise.resolve()).catch(() => {}).then(async () => {
-      if (this.closed || this.peers.get(entry.info.id) !== entry) return;
+      if (this.closed || entry.relayActive || this.peers.get(entry.info.id) !== entry) return;
       for (const [kind, sender] of entry.senders) {
         const desired = this.localTracks.get(kind)?.track || null;
         if (sender.track !== desired) await sender.replaceTrack(desired);
-        if (this.closed || this.peers.get(entry.info.id) !== entry) return;
+        if (this.closed || entry.relayActive || this.peers.get(entry.info.id) !== entry) return;
       }
     });
     return entry.mediaQueue;
@@ -219,15 +292,15 @@ export class RoomRTC extends EventTarget {
     const caps = { auto: 3500000, '720': 2200000, '1080': 4500000, '1440': 7000000 };
     for (const entry of this.peers.values()) {
       for (const [kind, sender] of entry.senders) {
-        if (kind !== 'screen' && kind !== 'camera') continue;
+        if (kind !== 'screen') continue;
         if (!sender.track) continue;
         try {
           const params = sender.getParameters();
           if (!params.encodings?.length) params.encodings = [{}];
           const otherPeers = Math.max(1, this.peers.size);
-          params.encodings[0].maxBitrate = Math.round((kind === 'screen' ? caps[quality] : 3000000) / (otherPeers > 2 ? 1.4 : 1));
+          params.encodings[0].maxBitrate = Math.round(caps[quality] / (otherPeers > 2 ? 1.4 : 1));
           params.encodings[0].maxFramerate = 30;
-          params.degradationPreference = kind === 'screen' ? 'maintain-resolution' : 'balanced';
+          params.degradationPreference = 'maintain-resolution';
           await sender.setParameters(params);
         } catch { /* Some WebRTC builds do not support all sender parameters. */ }
       }
@@ -235,6 +308,7 @@ export class RoomRTC extends EventTarget {
   }
 
   sendData(peerId, data) {
+    if (this.peers.get(peerId)?.relayActive) return this.relayMedia?.send(peerId, { type: 'data', data }) || false;
     const channel = this.peers.get(peerId)?.channel;
     if (channel?.readyState !== 'open' || channel.bufferedAmount > 65536) return false;
     try { channel.send(JSON.stringify(data)); return true; } catch { return false; }
@@ -243,6 +317,7 @@ export class RoomRTC extends EventTarget {
   removePeer(peerId) {
     const entry = this.peers.get(peerId);
     if (!entry) return;
+    clearTimeout(entry.recoveryTimer); this.relayMedia?.removePeer(peerId);
     entry.channel?.close(); entry.pc.close(); this.peers.delete(peerId);
     this.previousStats.delete(peerId);
     this.relayBudget.peers.delete(peerId);
@@ -261,6 +336,19 @@ export class RoomRTC extends EventTarget {
     const results = [];
     for (const [peerId, entry] of this.peers) {
       try {
+        if (entry.relayActive) {
+          const peer = this.relayMedia?.peers.get(peerId); if (!peer) continue;
+          const now = performance.now(); const prev = this.previousStats.get(peerId); const seconds = prev ? (now - prev.now) / 1000 : 0;
+          results.push({ peerId, name: entry.info.name, state: 'connected', route: 'Secure relay', protocol: 'TLS / WebSocket',
+            incoming: peer.width ? `${peer.width} × ${peer.height}` : null, incomingCodec: peer.width ? peer.codec || 'JPEG · compatibility' : null,
+            outgoing: this.relayMedia.sources.get('screen')?.width ? `${this.relayMedia.sources.get('screen').width} × ${this.relayMedia.sources.get('screen').height}` : null,
+            outgoingCodec: this.relayMedia.sources.get('screen')?.codec?.startsWith('avc1') ? 'H.264' : this.relayMedia.sources.get('screen')?.codec === 'vp8' ? 'VP8' : null,
+            fps: seconds > 0 ? Math.round((peer.frames - (prev.frames || 0)) / seconds) : null,
+            downloadMbps: seconds > 0 ? Math.max(0, (peer.received - prev.received) * 8 / seconds / 1e6) : null,
+            uploadMbps: seconds > 0 ? Math.max(0, (peer.sent - prev.sent) * 8 / seconds / 1e6) : null,
+            receivedAudioPackets: peer.audioPackets, audioCodec: 'PCM mono', roundTripMs: null, packetLoss: null });
+          this.previousStats.set(peerId, { now, received: peer.received, sent: peer.sent, frames: peer.frames }); continue;
+        }
         const report = await entry.pc.getStats();
         if (this.closed || this.peers.get(peerId) !== entry) continue;
         let pair = null; let transport = null; let receivedVideo = null; let sentVideo = null; let receivedAudio = null; let sentAudio = null; let audioSource = null;
@@ -321,6 +409,7 @@ export class RoomRTC extends EventTarget {
 
   close() {
     this.closed = true;
+    globalThis.removeEventListener?.('online', this.networkOnline); this.relayMedia?.close();
     clearInterval(this.budgetTimer); this.budgetTimer = null;
     for (const peerId of [...this.peers.keys()]) this.removePeer(peerId);
     for (const { track } of this.localTracks.values()) track.stop();

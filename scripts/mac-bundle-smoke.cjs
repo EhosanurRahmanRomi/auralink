@@ -1,7 +1,7 @@
 'use strict';
 
 // Run against the actual distributable DMG on an Apple Silicon Mac. This check
-// never asks for microphone/camera/capture/Accessibility permission or injects
+// never asks for microphone/capture/Accessibility permission or injects
 // input. Hardware calls and attended input still require real-device testing.
 const { _electron } = require('playwright');
 const { spawnSync } = require('node:child_process');
@@ -55,23 +55,43 @@ async function main() {
     const metadata=JSON.parse(command('plutil',['-convert','json','-o','-',path.join(appBundle,'Contents','Info.plist')]));
     assert.equal(metadata.CFBundleIdentifier,'local.auralink.desktop');
     assert.equal(metadata.CFBundleShortVersionString,pkg.version);
-    for(const usage of ['NSMicrophoneUsageDescription','NSCameraUsageDescription','NSScreenCaptureUsageDescription','NSLocalNetworkUsageDescription']) assert.ok(metadata[usage]?.length>10,`${usage} must explain the local action`);
+    for(const usage of ['NSMicrophoneUsageDescription','NSScreenCaptureUsageDescription','NSLocalNetworkUsageDescription']) assert.ok(metadata[usage]?.length>10,`${usage} must explain the local action`);
+    assert.equal(metadata.NSCameraUsageDescription, undefined, 'Screen-only app must not declare camera capture');
+    assert.ok(metadata.CFBundleURLTypes?.some(item => item.CFBundleURLSchemes?.includes('auralink')), 'Installed room links must register the auralink scheme');
     command('lipo',[binary,'-verify_arch','arm64']);command('lipo',[helper,'-verify_arch','arm64']);
     command('codesign',['--verify','--deep','--strict',appBundle]);
     const selfTest=JSON.parse(command(helper,['--self-test']));
     assert.equal(selfTest.passed,true);assert.equal(selfTest.inputPosted,false);
+    assert.ok(selfTest.clickTrackingChecks>=25);assert.ok(selfTest.quartzClickFieldChecks>=22);
     const permissions=JSON.parse(command(helper,['--check-permissions']));
     assert.equal(permissions.inputPosted,false);
     const archive=path.join(resources,'app.asar');
     const sourceFiles=['src/main.cjs','src/preload.cjs','src/core/broker.cjs','src/core/invite.cjs','src/native/control.cjs','src/native/macos-input.swift',
       'src/renderer/index.html','src/renderer/styles.css','src/renderer/app.js','src/renderer/rtc.js','src/renderer/android-bridge.js',
-      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs'];
-    for(const file of sourceFiles) assert.equal(hash(asar.extractFile(archive,file)),hash(fs.readFileSync(path.join(project,file))),`${file} must match the tested source`);
+      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs','src/core/app-invitation.cjs','src/renderer/relay-media.js','src/renderer/audio-worklet.js'];
+    const sourceParity=sourceFiles.map(file=>{const packagedSha256=hash(asar.extractFile(archive,file)),sourceSha256=hash(fs.readFileSync(path.join(project,file)));assert.equal(packagedSha256,sourceSha256,`${file} must match the tested source`);return {path:file,packagedSha256,sourceSha256,matches:true};});
     const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
-    application=await _electron.launch({executablePath:binary,args:['--smoke-test',`--user-data-dir=${profile}`],env,timeout:60000});
+    const coldCode=`A1.${crypto.randomUUID()}.${crypto.randomBytes(32).toString('base64url')}`;
+    application=await _electron.launch({executablePath:binary,args:['--smoke-test',`--user-data-dir=${profile}`,`auralink://join#code=${coldCode}`],env,timeout:60000});
     const page=await application.firstWindow();
     const errors=[];page.on('pageerror',error=>errors.push(error.message));
     await page.waitForSelector('#host-button');
+    await page.waitForFunction(code=>document.getElementById('quick-join-invite').value===code,coldCode);
+    assert.equal(await page.evaluate(()=>window.auralink.getPendingInvitation()),null,'Cold invitation is consumed once by the renderer');
+    if(await page.locator('#cancel-room-start').isVisible()) await page.locator('#cancel-room-start').click();
+    await page.waitForFunction(()=>!document.getElementById('host-button').disabled);
+    const originalPage=page.url();
+    const warmCode=`A1.${crypto.randomUUID()}.${crypto.randomBytes(32).toString('base64url')}`;
+    // Exercise the packaged main-process open-url event and the real isolated
+    // preload. Stop this deliberately nonexistent QA invitation before any
+    // admission request; this does not prove global LaunchServices routing.
+    await page.evaluate(()=>document.getElementById('quick-join-form').addEventListener('submit',event=>{event.preventDefault();event.stopImmediatePropagation();},{capture:true,once:true}));
+    await application.evaluate(({app},code)=>app.emit('open-url',{preventDefault(){}},`auralink://join#code=${code}`),warmCode);
+    await page.waitForFunction(code=>document.getElementById('quick-join-invite').value===code,warmCode);
+    assert.equal(page.url(),originalPage);
+    assert.equal(await page.evaluate(()=>window.auralink.getPendingInvitation()),warmCode);
+    assert.equal(await page.evaluate(()=>window.auralink.getPendingInvitation()),null);
+    await page.locator('#quick-join-invite').fill('');
     const info=await page.evaluate(()=>window.auralink.getInfo());
     assert.equal(info.platform,'darwin');assert.equal(info.version,pkg.version);assert.equal(info.nativeControl,true);assert.equal(info.testing,true);
     await page.screenshot({path:path.join(evidence,'mac-lobby.png')});
@@ -82,9 +102,9 @@ async function main() {
     assert.deepEqual(errors,[]);
     const results={passed:true,version:pkg.version,architecture:'arm64',dmg:path.basename(dmg),sha256:hash(fs.readFileSync(dmg)),
       checks:['DMG integrity and mounted application','arm64 app and unpacked input helper','bundle usage descriptions','deep strict code signature verification',
-        'packaged source hashes match','safe native helper self-test','actual packaged Electron renderer launch','pinned local HTTPS room starts and stops'],
-      permissions:info.permissions,helperSelfTest:selfTest,signing:'ad-hoc testing build; no Developer ID or notarization',
-      physicalDeviceTesting:'Not performed by this check. Camera, microphone, screen capture and attended input require Mac owner permission and real-device testing.'};
+        'packaged source hashes match','safe native helper self-test','actual packaged Electron renderer launch','cold argument and warm open-url invitation delivery without navigation','pinned local HTTPS room starts and stops'],
+      permissions:info.permissions,helperSelfTest:selfTest,sourceParity,signing:'ad-hoc testing build; no Developer ID or notarization',
+      physicalDeviceTesting:'Not performed by this check. Microphone, screen capture, browser-to-LaunchServices room links and attended input require Mac owner permission and real-device testing.'};
     fs.writeFileSync(path.join(evidence,'mac-bundle-smoke.json'),JSON.stringify(results,null,2));
     console.log('Mac DMG verified: actual arm64 bundle, renderer, native helper, source and local TLS room. No hardware permission or remote input was requested.');
   } finally {

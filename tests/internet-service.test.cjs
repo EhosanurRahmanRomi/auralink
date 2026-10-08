@@ -5,7 +5,7 @@ const modulePromise = import('../internet-service/src/coordinator.mjs');
 const PAIRING_KEY = 'private-test-pairing-key-abcdefghijklmnopqrstuvwxyz';
 
 class Store {
-  constructor() { this.devices = new Map(); this.rooms = new Map(); this.budget = { daily: 0, monthly: 0 }; }
+  constructor() { this.devices = new Map(); this.rooms = new Map(); this.budget = { daily: 0, monthly: 0 }; this.publicBudget = null; }
   loadDevices() { return [...this.devices.values()].map(value => structuredClone(value)); }
   saveDevice(value) { this.devices.set(value.id, structuredClone(value)); }
   deleteDevice(id) { this.devices.delete(id); }
@@ -14,6 +14,10 @@ class Store {
   deleteRoom(id) { this.rooms.delete(id); }
   loadBudget() { return structuredClone(this.budget); }
   saveBudget(value) { this.budget = structuredClone(value); }
+  loadPublicBudget() { return structuredClone(this.publicBudget); }
+  savePublicBudget(value) { this.publicBudget = structuredClone(value); }
+  loadMediaBudget() { return structuredClone(this.mediaBudget || null); }
+  saveMediaBudget(value) { this.mediaBudget = structuredClone(value); this.mediaWrites = (this.mediaWrites || 0) + 1; }
 }
 function transport() {
   return { messages: [], attachment: null, closed: false,
@@ -27,7 +31,7 @@ async function setup(options = {}) {
   let time = Date.parse('2026-10-07T14:00:00Z');
   const store = new Store();
   const engine = new Coordinator({ store, now: () => time, env: { PAIRING_KEY, ...options.env }, fetcher: options.fetcher });
-  const connect = () => { const ws = transport(); ws.id = engine.attach(ws); return ws; };
+  const connect = (source = 'a'.repeat(64)) => { const ws = transport(); ws.id = engine.attach(ws, source); return ws; };
   const send = (ws, message) => engine.receive(ws.id, JSON.stringify(message));
   const pair = async name => { const ws = connect(); await send(ws, { type: 'pair', pairingKey: PAIRING_KEY, name }); ws.credentials = ws.take('paired'); assert.ok(ws.take('registered')); return ws; };
   const host = async (name = 'Host') => {
@@ -41,8 +45,324 @@ async function setup(options = {}) {
     if (approve) { await send(owner, { type: 'approve', peerId: ws.pending.selfId }); ws.welcome = ws.take('welcome'); assert.ok(ws.welcome); }
     return ws;
   };
-  return { engine, store, connect, send, pair, host, guest, LIMITS, now: () => time, advance: ms => { time += ms; } };
+  const bootstrap = async (name, source) => { const ws = connect(source); await send(ws, { type: 'bootstrap', name }); ws.registered = ws.take('registered'); assert.equal(ws.registered?.mode, 'public'); return ws; };
+  const publicHost = async (source) => {
+    const ws = await bootstrap('Public owner', source); await send(ws, { type: 'create-room', name: 'Invitation room' });
+    ws.room = ws.take('room-created'); assert.equal(ws.room.access, 'invite');
+    await send(ws, { ...ws.room, type: 'join' }); ws.welcome = ws.take('welcome'); assert.ok(ws.welcome); return ws;
+  };
+  const publicGuest = async (owner, name = 'Guest', source) => {
+    const ws = await bootstrap(name, source); await send(ws, { type: 'join', roomId: owner.room.roomId, roomKey: owner.room.roomKey });
+    ws.welcome = ws.take('welcome'); assert.ok(ws.welcome); return ws;
+  };
+  return { engine, store, connect, send, pair, host, guest, bootstrap, publicHost, publicGuest, LIMITS, now: () => time, advance: ms => { time += ms; } };
 }
+function relaySignal(to, bytes = 70000, counter = 1) {
+  return { type: 'signal', to, data: { relay: { version: 1, epoch: 'a'.repeat(16), nonce: 'b'.repeat(16),
+    counter, ciphertext: Buffer.alloc(bytes, 91).toString('base64url') } } };
+}
+
+test('encrypted media forwarding uses strict envelopes and ready same-room membership, with no raw persistence', async () => {
+  const { WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
+  const s = await setup({ env: { WEBSOCKET_RELAY: 'true' } }); const owner = await s.host();
+  assert.equal(owner.welcome.websocketRelayEnabled, true); assert.match(owner.welcome.relayKey, /^[A-Za-z0-9_-]{43}$/);
+  const guest = await s.guest(owner, 'Guest', false);
+  assert.equal(guest.pending.relayKey, undefined);
+  const message = relaySignal(owner.welcome.selfId); await s.send(guest, message);
+  assert.match(guest.take('error').message, /approval/); assert.equal(owner.take('signal'), null); assert.equal(s.store.mediaBudget, undefined);
+  await s.send(owner, { type: 'approve', peerId: guest.pending.selfId }); guest.welcome = guest.take('welcome');
+  assert.equal(guest.welcome.relayKey, owner.welcome.relayKey);
+  await s.send(guest, message); const forwarded = owner.take('signal');
+  assert.deepEqual(Object.keys(forwarded).sort(), ['data', 'from', 'type']); assert.equal(forwarded.from, guest.welcome.selfId);
+  assert.deepEqual(forwarded.data, message.data); assert.equal(s.store.mediaBudget.messages, limits.reservationMessages);
+  assert.equal(s.store.mediaBudget.bytes, limits.reservationBytes);
+  assert.equal(guest.attachment.mediaLease.bytesRemaining, limits.reservationBytes - Buffer.byteLength(JSON.stringify(message)));
+  assert.equal(guest.attachment.mediaLease.messagesRemaining, limits.reservationMessages - 1);
+  const persisted = JSON.stringify({ rooms: [...s.store.rooms.values()], budget: s.store.mediaBudget, attachments: [owner.attachment, guest.attachment] });
+  assert.equal(persisted.includes(owner.welcome.relayKey), false); assert.equal(persisted.includes(message.data.relay.ciphertext), false);
+  const other = await s.host('Other host'); await s.send(guest, relaySignal(other.welcome.selfId));
+  assert.match(guest.take('error').message, /not found|room/i); assert.equal(other.take('signal'), null); assert.equal(s.store.mediaBudget.messages, limits.reservationMessages);
+  await s.send(owner, { type: 'kick', peerId: guest.welcome.selfId }); await s.send(guest, message);
+  assert.equal(owner.take('signal'), null); assert.equal(s.store.mediaBudget.messages, limits.reservationMessages); assert.equal(guest.attachment.mediaLease, undefined);
+});
+
+test('encrypted media byte, packet, burst and room-time limits survive hibernation; UTC resets only global daily counters', async () => {
+  const { Coordinator, WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
+  const env = { PAIRING_KEY, WEBSOCKET_RELAY: 'true' };
+  const s = await setup({ env }); const owner = await s.host(); const guest = await s.guest(owner, 'Guest');
+  const message = relaySignal(owner.welcome.selfId, 180000), size = Buffer.byteLength(JSON.stringify(message));
+  for (let i = 0; i < Math.floor(limits.senderBytesPer5s / size); i++) await s.send(guest, message);
+  const before = s.store.mediaBudget.messages;
+  let resumed = new Coordinator({ store: s.store, env, now: s.now, restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
+  owner.messages = []; guest.messages = []; await resumed.receive(guest.id, JSON.stringify(message));
+  assert.equal(owner.take('signal'), null); assert.match(guest.take('error').message, /too fast/); assert.equal(s.store.mediaBudget.messages, before);
+  s.advance(5000); await resumed.receive(guest.id, JSON.stringify(message)); assert.ok(owner.take('signal'));
+  // Already reserved credits remain spendable at the global ceiling. Force a
+  // fresh reservation to exercise refusal without falsely refunding a lease.
+  delete resumed.sockets.get(guest.id).mediaLease; resumed.save(resumed.sockets.get(guest.id));
+  resumed.mediaBudget.messages = limits.dailyMessages; resumed.store.saveMediaBudget(resumed.mediaBudget);
+  await resumed.receive(guest.id, JSON.stringify(message)); assert.equal(guest.take('error').code, 'websocket-relay-limit'); assert.equal(owner.take('signal'), null);
+  resumed = new Coordinator({ store: s.store, env, now: s.now, restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
+  await resumed.receive(guest.id, JSON.stringify(message)); assert.match(guest.take('error').message, /today/);
+  resumed.mediaBudget.messages = 0; resumed.mediaBudget.bytes = limits.dailyBytes; await resumed.receive(guest.id, JSON.stringify(message)); assert.match(guest.take('error').message, /today/);
+  resumed.mediaBudget.bytes = 0; resumed.mediaBudget.rooms[owner.room.roomId].bytes = limits.roomBytes;
+  // Simulate midnight global rollover without extending this room's persisted byte limit.
+  resumed.mediaBudget.day = '2026-10-06'; await resumed.receive(guest.id, JSON.stringify(message)); assert.match(guest.take('error').message, /room.*byte/i);
+  assert.equal(resumed.mediaBudget.messages, 0); resumed.mediaBudget.rooms[owner.room.roomId].bytes = 0;
+  for (let i = 0; i < 60; i++) { s.advance(30000); resumed.touch(owner.id, s.now()); resumed.touch(guest.id, s.now()); }
+  await resumed.receive(guest.id, JSON.stringify(message)); assert.match(guest.take('error').message, /30-minute/);
+  assert.equal(resumed.rooms.size, 1); assert.equal(owner.take('room-ended'), null); // Direct calls remain available.
+});
+
+test('media reservations batch SQL writes and hibernation retains depleted socket credits', async () => {
+  const { Coordinator, WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
+  const env = { PAIRING_KEY, WEBSOCKET_RELAY: 'true' }, s = await setup({ env });
+  const owner = await s.host(), guest = await s.guest(owner, 'Guest');
+  for (let i = 1; i <= 200; i++) await s.send(guest, relaySignal(owner.welcome.selfId, 16, i));
+  assert.equal(s.store.mediaWrites, 1); assert.equal(s.store.mediaBudget.messages, limits.reservationMessages);
+  assert.equal(guest.attachment.mediaLease.messagesRemaining, 56);
+  const before = structuredClone(guest.attachment.mediaLease);
+  const resumed = new Coordinator({ store: s.store, env, now: s.now,
+    restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
+  assert.deepEqual(resumed.sockets.get(guest.id).mediaLease, before);
+  for (let i = 201; i <= 256; i++) await resumed.receive(guest.id, JSON.stringify(relaySignal(owner.welcome.selfId, 16, i)));
+  assert.equal(s.store.mediaWrites, 1); assert.equal(guest.attachment.mediaLease.messagesRemaining, 0);
+  await resumed.receive(guest.id, JSON.stringify(relaySignal(owner.welcome.selfId, 16, 257)));
+  assert.equal(s.store.mediaWrites, 2); assert.equal(s.store.mediaBudget.messages, limits.reservationMessages * 2);
+  assert.equal(s.store.mediaBudget.bytes, limits.reservationBytes);
+  assert.equal(owner.messages.filter(message => message.type === 'signal').length, 257);
+});
+
+test('already charged residual remains usable at reservation ceilings without new SQL writes', async () => {
+  const { WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
+  const s = await setup({ env: { WEBSOCKET_RELAY: 'true' } }), owner = await s.host(), guest = await s.guest(owner, 'Guest');
+  await s.send(guest, relaySignal(owner.welcome.selfId, 16)); assert.ok(owner.take('signal'));
+  s.engine.mediaBudget.bytes = limits.dailyBytes; s.engine.mediaBudget.messages = limits.dailyMessages;
+  s.engine.mediaBudget.rooms[owner.room.roomId].bytes = limits.roomBytes;
+  s.store.saveMediaBudget(s.engine.mediaBudget); const writes = s.store.mediaWrites;
+  await s.send(guest, relaySignal(owner.welcome.selfId, 16, 2)); assert.ok(owner.take('signal')); assert.equal(s.store.mediaWrites, writes);
+  delete s.engine.sockets.get(guest.id).mediaLease;
+  await s.send(guest, relaySignal(owner.welcome.selfId, 16, 3)); assert.equal(guest.take('error').code, 'websocket-relay-limit');
+  assert.equal(owner.take('signal'), null); assert.equal(s.store.mediaWrites, writes);
+});
+
+test('crash between durable SQL reservation and attachment save only wastes credits and forwards nothing', async () => {
+  const { Coordinator, WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
+  for (const failure of ['SQL-after-write', 'attachment-before-save']) {
+    const env = { PAIRING_KEY, WEBSOCKET_RELAY: 'true' }, s = await setup({ env });
+    const owner = await s.host(), guest = await s.guest(owner, 'Guest');
+    const oldAttachment = structuredClone(guest.attachment), message = relaySignal(owner.welcome.selfId, 16);
+    if (failure === 'SQL-after-write') {
+      const original = s.store.saveMediaBudget.bind(s.store);
+      s.store.saveMediaBudget = value => { original(value); throw new Error('Injected crash after durable reservation.'); };
+    } else {
+      const original = guest.save.bind(guest);
+      guest.save = value => { if (value.mediaLease) throw new Error('Injected crash before attachment persistence.'); original(value); };
+    }
+    await assert.rejects(s.send(guest, message), /Injected crash/);
+    assert.equal(owner.take('signal'), null); assert.equal(s.store.mediaBudget.bytes, limits.reservationBytes);
+    // Reconstruct using the durable pre-crash attachment, never in-memory lease.
+    s.store.saveMediaBudget = Store.prototype.saveMediaBudget.bind(s.store); guest.save = transport().save;
+    const resumed = new Coordinator({ store: s.store, env, now: s.now,
+      restored: [{ transport: owner, attachment: structuredClone(owner.attachment) }, { transport: guest, attachment: oldAttachment }] });
+    await resumed.receive(guest.id, JSON.stringify(message)); assert.ok(owner.take('signal'));
+    assert.equal(s.store.mediaBudget.bytes, limits.reservationBytes * 2);
+    assert.equal(s.store.mediaBudget.messages, limits.reservationMessages * 2);
+  }
+});
+
+test('copied, oversized, expired or foreign-day media leases cannot restore uncharged credits', async () => {
+  const { Coordinator, WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
+  for (const failure of ['connectionId', 'peerId', 'roomId', 'day', 'expiry', 'bytes', 'messages', 'extra']) {
+    const env = { PAIRING_KEY, WEBSOCKET_RELAY: 'true' }, s = await setup({ env });
+    const owner = await s.host(), guest = await s.guest(owner, 'Guest');
+    await s.send(guest, relaySignal(owner.welcome.selfId, 16)); owner.take('signal');
+    const attachment = structuredClone(guest.attachment), lease = attachment.mediaLease;
+    if (['connectionId', 'peerId', 'roomId'].includes(failure)) lease[failure] = crypto.randomUUID();
+    if (failure === 'day') lease.day = '2026-10-06';
+    if (failure === 'expiry') lease.expiresAt += 1;
+    if (failure === 'bytes') lease.bytesRemaining = limits.reservationBytes + 1;
+    if (failure === 'messages') lease.messagesRemaining = limits.reservationMessages + 1;
+    if (failure === 'extra') lease.other = true;
+    const resumed = new Coordinator({ store: s.store, env, now: s.now,
+      restored: [{ transport: owner, attachment: structuredClone(owner.attachment) }, { transport: guest, attachment }] });
+    assert.equal(resumed.sockets.get(guest.id).mediaLease, undefined, failure);
+    await resumed.receive(guest.id, JSON.stringify(relaySignal(owner.welcome.selfId, 16, 2))); assert.ok(owner.take('signal'), failure);
+    assert.equal(s.store.mediaBudget.bytes, limits.reservationBytes * 2, failure);
+  }
+});
+
+test('encrypted room key is shared through healthy hibernation and refuses tampering, key rotation or copied-room replay', async () => {
+  const { Coordinator } = await modulePromise;
+  for (const mutation of ['none', 'cipher', 'pairing-key', 'room-copy']) {
+    const env = { PAIRING_KEY, WEBSOCKET_RELAY: 'true' }; const s = await setup({ env });
+    const owner = await s.host(); const guest = await s.guest(owner, 'Guest');
+    await s.send(guest, relaySignal(owner.welcome.selfId)); owner.take('signal');
+    if (mutation === 'cipher') s.store.rooms.get(owner.room.roomId).websocketKeyCache.cipher = 'a'.repeat(100);
+    if (mutation === 'pairing-key') env.PAIRING_KEY = 'new-server-pairing-key-abcdefghijklmnopqrstuvwxyz';
+    if (mutation === 'room-copy') {
+      const old = s.store.rooms.get(owner.room.roomId), changed = crypto.randomUUID(); s.store.rooms.clear(); old.id = changed; s.store.rooms.set(changed, old);
+      owner.attachment.roomId = changed; guest.attachment.roomId = changed;
+    }
+    const resumed = new Coordinator({ store: s.store, env, now: s.now, restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
+    const room = [...resumed.rooms.values()][0]; const config = await resumed.websocketMedia(room);
+    assert.equal(config.websocketRelayEnabled, mutation === 'none', mutation);
+    if (mutation === 'none') assert.equal(config.relayKey, owner.welcome.relayKey);
+    await resumed.receive(guest.id, JSON.stringify(relaySignal(owner.welcome.selfId)));
+    if (mutation === 'none') assert.ok(owner.take('signal')); else { assert.equal(owner.take('signal'), null); assert.equal(guest.take('error').code, 'websocket-relay-limit'); }
+  }
+});
+
+test('malformed relay or oversized plaintext cannot use the increased transport bound', async () => {
+  const { validRelaySignal } = await modulePromise; const s = await setup({ env: { WEBSOCKET_RELAY: 'true' } }); const owner = await s.host();
+  const variants = [message => { message.from = 'spoofed'; }, message => { message.data.sdp = 'plaintext'; },
+    message => { message.data.relay.codec = 'plaintext'; }, message => { message.data.relay.counter = Number.MAX_SAFE_INTEGER + 1; },
+    message => { message.data.relay.epoch = 'x'; }, message => { message.data.relay.nonce = 'x'; },
+    message => { message.data.relay.ciphertext = Buffer.alloc(180001).toString('base64url'); },
+    message => { message.data.relay.ciphertext = 'a'.repeat(23); }, message => { message.data.relay.ciphertext = 'x'.repeat(21); }];
+  for (const change of variants) { const message = relaySignal(owner.welcome.selfId); change(message); assert.equal(validRelaySignal(message), false); }
+  for (const message of [relaySignal(owner.welcome.selfId), { type: 'signal', to: owner.welcome.selfId, data: { plaintext: 'x'.repeat(70000) } }]) {
+    const outsider = s.connect(); if (message.data.relay) message.data.extra = 'no'; await s.send(outsider, message); assert.equal(outsider.closed.code, 1009);
+  }
+  const disabled = await setup(); const offOwner = await disabled.host(); const offGuest = await disabled.guest(offOwner, 'Guest');
+  await disabled.send(offGuest, relaySignal(offOwner.welcome.selfId, 16)); assert.equal(offGuest.take('error').code, 'websocket-relay-limit'); assert.equal(offOwner.take('signal'), null);
+});
+
+test('media key decryption completing after leave cannot forward into a replacement room', async () => {
+  const s = await setup({ env: { WEBSOCKET_RELAY: 'true' } }); const owner = await s.host(); const guest = await s.guest(owner, 'Guest');
+  let finish, started; const ready = new Promise(resolve => { started = resolve; });
+  const original = s.engine.websocketMedia.bind(s.engine);
+  s.engine.websocketMedia = async room => { started(); await new Promise(resolve => { finish = resolve; }); return original(room); };
+  const forward = s.send(guest, relaySignal(owner.welcome.selfId)); await ready;
+  await s.send(guest, { type: 'leave' }); finish(); await forward;
+  assert.equal(owner.take('signal'), null); assert.equal(s.store.mediaBudget, undefined); assert.equal(guest.attachment.roomId, undefined);
+});
+
+test('public normal-command quota is persistent and excludes cleanup, heartbeats and separately metered media', async () => {
+  const { Coordinator } = await modulePromise, env = { PAIRING_KEY, PUBLIC_ROOMS: 'true', WEBSOCKET_RELAY: 'true' };
+  const s = await setup({ env }); const owner = await s.publicHost(); const guest = await s.publicGuest(owner);
+  const before = s.store.publicBudget.commands; await s.send(guest, { type: 'ping' }); assert.equal(s.store.publicBudget.commands, before);
+  await s.send(guest, relaySignal(owner.welcome.selfId)); assert.ok(owner.take('signal')); assert.equal(s.store.publicBudget.commands, before);
+  s.engine.publicBudget.commands = s.LIMITS.publicCommandsDaily; s.store.savePublicBudget(s.engine.publicBudget);
+  const resumed = new Coordinator({ store: s.store, env, now: s.now, restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
+  await resumed.receive(guest.id, JSON.stringify({ type: 'signal', to: owner.welcome.selfId, data: { sdp: 'budgeted' } }));
+  assert.equal(owner.take('signal'), null); assert.equal(guest.take('error').code, 'service-free-limit');
+  await resumed.receive(guest.id, '{"type":"leave"}'); assert.ok(guest.take('room-left'));
+  resumed.publicBudget.commands = 0; resumed.publicBudget.roomCommands = { [owner.room.roomId]: { hour: Math.floor(s.now() / 3600000), commands: s.LIMITS.publicRoomCommandsHourly } };
+  await resumed.receive(owner.id, '{"type":"ice-request"}'); assert.equal(owner.take('error').code, 'service-free-limit');
+  await resumed.receive(owner.id, '{"type":"forget"}'); assert.ok(owner.take('forgotten'));
+});
+
+test('public bootstrap is opt-in, ephemeral and cannot read or impersonate the private directory', async () => {
+  const disabled = await setup(); const blocked = disabled.connect(); await disabled.send(blocked, { type: 'bootstrap', name: 'Public guest' });
+  assert.ok(blocked.closed); assert.equal(blocked.take('registered'), null);
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const privateOwner = await s.pair('Private owner');
+  const guest = await s.bootstrap('Public guest'); assert.equal(s.store.devices.size, 1);
+  assert.equal(guest.take('paired'), null); assert.equal(guest.take('presence'), null);
+  await s.send(privateOwner, { type: 'ping' }); s.engine.broadcastPresence(); assert.equal(guest.take('presence'), null);
+  const lastPresence = privateOwner.messages.filter(message => message.type === 'presence').at(-1);
+  assert.deepEqual(lastPresence.devices.map(device => device.id), [privateOwner.credentials.deviceId]);
+  await s.send(guest, { type: 'join-device', deviceId: privateOwner.credentials.deviceId }); assert.match(guest.take('error').message, /public room invitation/);
+  await s.send(guest, { type: 'register', ...privateOwner.credentials, name: 'Impostor' });
+  assert.equal(guest.attachment.deviceId, guest.registered.deviceId); assert.equal(guest.take('registered'), null);
+  await s.send(guest, { type: 'forget' }); assert.ok(guest.take('forgotten')); assert.equal(s.store.devices.size, 1);
+});
+
+test('a public invitation automatically admits guests but never grants remote control or host authority', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost();
+  assert.match(owner.room.roomKey, /^[A-Za-z0-9_-]{43}$/); assert.match(owner.room.hostToken, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(s.store.devices.size, 0); assert.equal(JSON.stringify([...s.store.rooms.values()]).includes(owner.room.roomKey), false);
+  const guest = await s.publicGuest(owner); assert.equal(guest.take('pending'), null); assert.equal(owner.take('join-request'), null);
+  assert.equal(guest.welcome.room.access, 'invite'); assert.equal(guest.welcome.room.inviteEnabled, true);
+  assert.equal(owner.take('peer-joined').peer.id, guest.welcome.selfId); assert.equal(s.engine.grants.size, 0);
+  await s.send(guest, { type: 'signal', from: 'forged-host', to: owner.welcome.selfId, data: { fixture: true } });
+  assert.equal(owner.take('signal').from, guest.welcome.selfId);
+  await s.send(guest, { type: 'grant-control', targetId: owner.welcome.selfId, peerId: owner.welcome.selfId, sessionId: 'fixture-consent-session-12345' });
+  assert.match(guest.take('error').message, /screen owner/); assert.equal(s.engine.grants.size, 0);
+  await s.send(guest, { type: 'control-request', to: owner.welcome.selfId }); const request = owner.take('control-request');
+  await s.send(owner, { type: 'control-response', to: guest.welcome.selfId, requestId: request.requestId, accepted: true, sessionId: 'separate-owner-consent-session' });
+  assert.equal(guest.take('control-response').accepted, true); assert.equal(s.engine.grants.size, 1);
+  const impostor = await s.bootstrap('Owner impostor'); await s.send(impostor, { ...owner.room, type: 'join' });
+  assert.match(impostor.take('error').message, /authenticated room owner/); assert.equal(impostor.take('welcome'), null);
+});
+
+test('invite burn, rotation and block revoke leaked old capabilities without affecting admitted calls', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost(); const guest = await s.publicGuest(owner);
+  await s.send(guest, { type: 'burn-invite' }); assert.match(guest.take('error').message, /Only the host/);
+  await s.send(owner, { type: 'burn-invite' }); assert.ok(owner.take('invite-disabled')); assert.ok(guest.take('invite-disabled'));
+  assert.equal(s.engine.rooms.size, 1); assert.equal(s.engine.ready([...s.engine.rooms.values()][0]).length, 2);
+  const outsider = await s.bootstrap('Outsider'); await s.send(outsider, { type: 'join', roomId: owner.room.roomId, roomKey: owner.room.roomKey });
+  assert.match(outsider.take('error').message, /Invalid invitation/); assert.equal(outsider.take('welcome'), null);
+  await s.send(owner, { type: 'rotate-invite' }); const updated = owner.take('invite-updated');
+  assert.notEqual(updated.roomKey, owner.room.roomKey); assert.equal(guest.take('invite-updated'), null); assert.ok(guest.take('invite-status'));
+  await s.send(outsider, { type: 'join', roomId: updated.roomId, roomKey: updated.roomKey }); assert.ok(outsider.take('welcome'));
+  await s.send(owner, { type: 'block', peerId: guest.welcome.selfId }); assert.ok(guest.take('rejected')); assert.ok(owner.take('peer-blocked'));
+  assert.ok(owner.take('invite-disabled')); assert.equal(guest.attachment.roomId, undefined);
+  await s.send(owner, { type: 'rotate-invite' }); const next = owner.take('invite-updated');
+  await s.send(guest, { type: 'join', roomId: next.roomId, roomKey: next.roomKey }); assert.match(guest.take('error').message, /blocked/);
+  const fresh = await s.bootstrap('Fresh connection', 'b'.repeat(64));
+  await s.send(fresh, { type: 'join', roomId: next.roomId, roomKey: updated.roomKey }); assert.match(fresh.take('error').message, /Invalid invitation/);
+  // Anonymous people are not permanently identifiable. The host controls which new code is shared.
+  await s.send(fresh, { type: 'join', roomId: next.roomId, roomKey: next.roomKey }); assert.ok(fresh.take('welcome'));
+});
+
+test('public auto-admission reserves slots and a concurrent invitation burn cancels delayed welcomes', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost();
+  const guests = []; for (let i = 0; i < 4; i++) guests.push(await s.bootstrap(`Guest ${i}`));
+  const resolvers = []; s.engine.ice = () => new Promise(resolve => resolvers.push(resolve));
+  const admissions = guests.slice(0, 3).map(guest => s.send(guest, { type: 'join', roomId: owner.room.roomId, roomKey: owner.room.roomKey }));
+  // Hashing yields. Let each reservation pass validation before testing the cap.
+  while (resolvers.length < 3) await new Promise(resolve => setImmediate(resolve));
+  await s.send(guests[3], { type: 'join', roomId: owner.room.roomId, roomKey: owner.room.roomKey }); assert.match(guests[3].take('error').message, /full/);
+  await s.send(owner, { type: 'burn-invite' });
+  for (const resolve of resolvers) resolve({ iceServers: [], relayEnabled: false, relaySecondsLimit: 0 }); await Promise.all(admissions);
+  for (const guest of guests.slice(0, 3)) { assert.equal(guest.take('welcome'), null); assert.ok(guest.take('rejected')); }
+  assert.equal(s.engine.ready([...s.engine.rooms.values()][0]).length, 1); assert.equal(owner.take('peer-joined'), null);
+});
+
+test('invite rotation during asynchronous validation cannot accept the old hashed room capability', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost(); const guest = await s.bootstrap('Guest');
+  const joining = s.send(guest, { type: 'join', roomId: owner.room.roomId, roomKey: owner.room.roomKey });
+  await s.send(owner, { type: 'rotate-invite' }); await joining;
+  assert.equal(guest.take('welcome'), null); assert.equal(guest.attachment.roomId, undefined); assert.ok(guest.take('error'));
+});
+
+test('public lifetime, revocation and source budgets survive hibernation without private identity records', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost(); const guest = await s.publicGuest(owner);
+  const { Coordinator } = await modulePromise;
+  const resumed = new Coordinator({ store: s.store, env: { PAIRING_KEY, PUBLIC_ROOMS: 'true' }, now: s.now,
+    restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
+  assert.equal(resumed.ready([...resumed.rooms.values()][0]).length, 2); assert.equal(resumed.devices.size, 0);
+  assert.equal(resumed.publicBudget.bootstrap, 2); assert.equal(resumed.publicBudget.create, 1);
+  for (let i = 0; i < 120; i++) { s.advance(30000); resumed.touch(owner.id, s.now()); resumed.touch(guest.id, s.now()); resumed.reap(); }
+  assert.equal(resumed.rooms.size, 0); assert.equal(resumed.sockets.size, 0); assert.ok(owner.closed); assert.ok(guest.closed);
+});
+
+test('source bootstrap and room creation caps cannot be reset by socket replacement or hibernation', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } });
+  for (let i = 0; i < s.LIMITS.sourceBootstrapMinute; i++) { const peer = await s.bootstrap(`Guest ${i}`); s.engine.disconnect(peer.id); }
+  const { Coordinator } = await modulePromise;
+  const resumed = new Coordinator({ store: s.store, env: { PAIRING_KEY, PUBLIC_ROOMS: 'true' }, now: s.now });
+  const refused = transport(); refused.id = resumed.attach(refused, 'a'.repeat(64));
+  await resumed.receive(refused.id, JSON.stringify({ type: 'bootstrap', name: 'Too many' })); assert.ok(refused.closed); assert.equal(refused.take('registered'), null);
+  s.advance(60000); const owner = await s.bootstrap('Owner');
+  for (let i = 0; i < s.LIMITS.sourceCreateHour; i++) {
+    await s.send(owner, { type: 'create-room' }); assert.ok(owner.take('room-created')); await s.send(owner, { type: 'leave' });
+  }
+  await s.send(owner, { type: 'create-room' }); assert.match(owner.take('error').message, /limit/); assert.equal(owner.take('room-created'), null);
+});
+
+test('source identifiers are keyed HMACs and public restore refuses lost or forged identity leases', async () => {
+  const { sourceHash, Coordinator } = await modulePromise; const first = await sourceHash('203.0.113.1', PAIRING_KEY);
+  assert.match(first, /^[a-f0-9]{64}$/); assert.notEqual(first, await sourceHash('203.0.113.1', 'another-private-pairing-key-abcdefghijklmnopqrstuvwxyz'));
+  assert.notEqual(first, await sourceHash('203.0.113.2', PAIRING_KEY));
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost(first);
+  const persisted = JSON.stringify(s.store.publicBudget); assert.equal(persisted.includes('203.0.113'), false); assert.equal(persisted.includes(PAIRING_KEY), false);
+  const altered = structuredClone(owner.attachment); altered.deviceId = 'forged-public';
+  const resumed = new Coordinator({ store: s.store, env: { PAIRING_KEY, PUBLIC_ROOMS: 'true' }, now: s.now,
+    restored: [{ transport: owner, attachment: altered }] });
+  assert.ok(owner.closed); assert.equal(resumed.rooms.size, 0); assert.equal(resumed.sockets.size, 0);
+});
 
 test('unknown sockets get no private directory; incorrect pairing and token are rejected', async () => {
   const s = await setup(); const stranger = s.connect();

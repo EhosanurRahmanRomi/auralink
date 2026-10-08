@@ -55,13 +55,14 @@ async function joinUI(page, invite, name, host, approve = true) {
   await page.locator('#join-submit').click();
   const request = await host.take('join-request'); assert.equal(request.name, name);
   await page.waitForFunction(() => document.getElementById('connection-pill').textContent.includes('Awaiting host approval'));
-  assert.equal(await page.locator('#camera-button').isDisabled(), true);
+  assert.equal(await page.locator('#share-button').isDisabled(), true);
   assert.equal(await page.locator('#mic-button').isDisabled(), true);
   assert.deepEqual(await page.evaluate(() => window.qaCaptureCalls), [], 'No media capture should be requested before host approval');
   host.send({ type: approve ? 'approve' : 'reject', peerId: request.peerId });
   if (approve) {
-    await page.waitForFunction(() => !document.getElementById('camera-button').disabled);
-    assert.equal(await page.locator('#camera-button').getAttribute('aria-label'), 'Turn camera on');
+    await page.waitForFunction(() => !document.getElementById('share-button').disabled);
+    assert.equal(await page.locator('#share-button').getAttribute('aria-label'), 'Share screen');
+    assert.equal(await page.locator('#camera-button').count(), 0);
     assert.equal(await page.locator('#mic-button').getAttribute('aria-label'), 'Turn microphone on');
     assert.equal(await page.locator('#request-control').isDisabled(), true);
     assert.deepEqual(await page.evaluate(() => window.qaCaptureCalls), [], 'Admission must not automatically capture media');
@@ -100,7 +101,7 @@ async function mobileCallActionsProof(page) {
     await page.setViewportSize(viewport);
     const layout = await page.evaluate(() => {
       const box = element => { const { top, right, bottom, left, width, height } = element.getBoundingClientRect(); return { top, right, bottom, left, width, height }; };
-      const buttons = ['mic-button', 'camera-button', 'share-button', 'request-control', 'end-button'].map(id => {
+      const buttons = ['mic-button', 'share-button', 'request-control', 'end-button'].map(id => {
         const element = document.getElementById(id); const bounds = box(element);
         return { id, ...bounds, centreUnobstructed: element.contains(document.elementFromPoint((bounds.left + bounds.right) / 2, (bounds.top + bounds.bottom) / 2)) };
       });
@@ -139,16 +140,23 @@ async function main() {
     const invite = `${broker.url}/#key=${broker.roomKey}&fp=${fingerprint(pems.cert)}`;
     browser = await chromium.launch({ executablePath: browserPath, headless: true,
       args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', '--disable-features=WebRtcHideLocalIpsWithMdns'] });
-    const desktopContext = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 850 }, permissions: ['camera', 'microphone'] });
-    const mobileContext = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true, permissions: ['camera', 'microphone'],
+    const desktopContext = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 850 }, permissions: ['microphone'] });
+    const mobileContext = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true, permissions: ['microphone'],
       userAgent: 'Mozilla/5.0 (Linux; Android 15; QA viewport) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36' });
     contexts.push(desktopContext, mobileContext);
     for (const context of contexts) await context.addInitScript(() => {
       window.qaCaptureCalls = [];
+      if (!navigator.mediaDevices) return;
+      navigator.mediaDevices.getDisplayMedia = async () => {
+        const canvas = document.createElement('canvas'); canvas.width = 960; canvas.height = 540; const draw = canvas.getContext('2d'); let frame = 0;
+        const paint = () => { draw.fillStyle = frame++ % 2 ? '#264d69' : '#286e60'; draw.fillRect(0, 0, 960, 540); draw.fillStyle = '#e5fffa'; draw.font = '35px sans-serif'; draw.fillText('Synthetic shared screen ' + frame, 40, 100); };
+        paint(); const timer = setInterval(paint, 60); const stream = canvas.captureStream(15); stream.getVideoTracks()[0].addEventListener('ended', () => clearInterval(timer)); return stream;
+      };
       for (const method of ['getUserMedia', 'getDisplayMedia']) {
         const original = navigator.mediaDevices?.[method];
         if (!original) continue;
         navigator.mediaDevices[method] = function (...args) {
+          if (method === 'getUserMedia' && args[0]?.video) throw new Error('Camera capture is outside the screen/audio product');
           window.qaCaptureCalls.push(method); return original.apply(this, args);
         };
       }
@@ -162,12 +170,12 @@ async function main() {
     phase = 'desktop UI admission'; await joinUI(desktop, invite, 'Desktop UI QA', host);
     phase = 'mobile UI admission'; await joinUI(mobile, invite, 'Mobile UI QA', host);
     phase = 'mobile call actions above navigation'; const mobileCallActions = await mobileCallActionsProof(mobile);
-    phase = 'fake camera activation';
-    await desktop.locator('#camera-button').click(); await mobile.locator('#camera-button').click();
-    await desktop.waitForFunction(() => document.getElementById('camera-button').getAttribute('aria-label') === 'Turn camera off');
-    await mobile.waitForFunction(() => document.getElementById('camera-button').getAttribute('aria-label') === 'Turn camera off');
-    assert.deepEqual(await desktop.evaluate(() => window.qaCaptureCalls), ['getUserMedia']);
-    assert.deepEqual(await mobile.evaluate(() => window.qaCaptureCalls), ['getUserMedia']);
+    phase = 'explicit synthetic screen activation';
+    await desktop.locator('#share-button').click(); await mobile.locator('#share-button').click();
+    await desktop.waitForFunction(() => document.getElementById('share-button').getAttribute('aria-label') === 'Stop sharing screen');
+    await mobile.waitForFunction(() => document.getElementById('share-button').getAttribute('aria-label') === 'Stop sharing screen');
+    assert.deepEqual(await desktop.evaluate(() => window.qaCaptureCalls), ['getDisplayMedia']);
+    assert.deepEqual(await mobile.evaluate(() => window.qaCaptureCalls), ['getDisplayMedia']);
     phase = 'desktop received video'; const desktopReceived = await receiverProof(desktop, 'Mobile UI QA');
     phase = 'mobile received video'; const received = [desktopReceived, await receiverProof(mobile, 'Desktop UI QA')];
     phase = 'fullscreen control';
@@ -179,11 +187,10 @@ async function main() {
     phase = 'media equipment preferences';
     await desktop.locator('[data-view="settings"]').click();
     await desktop.locator('#refresh-devices').click();
-    await desktop.waitForFunction(() => document.getElementById('refresh-devices').getAttribute('aria-busy') === 'false' && document.getElementById('camera-device').options.length > 1 && document.getElementById('microphone-device').options.length > 1);
-    const mediaDevice = await desktop.locator('#camera-device').evaluate(select => select.options[1].value);
+    await desktop.waitForFunction(() => document.getElementById('refresh-devices').getAttribute('aria-busy') === 'false' && document.getElementById('microphone-device').options.length > 1);
     const microphoneDevice = await desktop.locator('#microphone-device').evaluate(select => select.options[1].value);
     // Hold enumeration while the owner edits equipment. A late refresh must
-    // preserve both choices instead of restoring the last saved defaults.
+    // preserve the microphone choice instead of restoring the last saved defaults.
     await desktop.evaluate(() => {
       const enumerate = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
       window.qaDeviceRefreshes = [];
@@ -195,14 +202,11 @@ async function main() {
     });
     await desktop.locator('#refresh-devices').click();
     await desktop.waitForFunction(() => qaDeviceRefreshes.length > 0);
-    await desktop.locator('#camera-device').selectOption(mediaDevice);
     await desktop.locator('#microphone-device').selectOption(microphoneDevice);
     await desktop.evaluate(() => { qaRestoreEnumeration(); qaDeviceRefreshes.splice(0).forEach(resolve => resolve()); });
     await desktop.waitForFunction(() => document.getElementById('refresh-devices').getAttribute('aria-busy') === 'false');
-    assert.equal(await desktop.locator('#camera-device').inputValue(), mediaDevice, 'Late enumeration must preserve the pending camera choice');
     assert.equal(await desktop.locator('#microphone-device').inputValue(), microphoneDevice, 'Late enumeration must preserve the pending microphone choice');
     await desktop.locator('#save-settings').click();
-    assert.equal(await desktop.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).camera), mediaDevice);
     assert.equal(await desktop.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).microphone), microphoneDevice);
     await desktop.locator('[data-view="rooms"]').click();
     assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Mobile room overflows horizontally');
@@ -223,12 +227,12 @@ async function main() {
     await joinUI(mobile, invite, 'Rejected UI QA', host, false);
     assert.deepEqual(errors, []);
     const result = { passed: true,
-      environment: 'Windows installed Edge; local HTTPS broker with authenticated WebSocket host fixture; one desktop and one 412x915 mobile viewport; fake browser cameras only',
-      limitations: ['Fixture host has no media engine', 'Mobile viewport is not a physical Android test', 'No native input, physical camera/microphone, internet path or guaranteed video resolution tested'],
-      verified: ['invitation prefill and fragment clearance', 'host approval gates UI media controls', 'camera and microphone remain off on admission',
-        'no capture API requested before approval or automatically on admission; explicit camera click invokes capture',
-        'both UI clients decode fake camera frames', 'DOM displays live received resolution and direct UDP route', 'four-person limit and fifth request refusal',
-        'received codec displayed from actual stats', 'fullscreen enter/exit', 'fake camera and microphone equipment enumeration and camera preference saved locally',
+      environment: 'Windows installed Edge; local HTTPS broker with authenticated WebSocket host fixture; one desktop and one 412x915 mobile viewport; synthetic screen frames only',
+      limitations: ['Fixture host has no media engine', 'Mobile viewport is not a physical Android test', 'No native input, physical microphone, internet path or guaranteed video resolution tested'],
+      verified: ['invitation prefill and fragment clearance', 'host approval gates UI media controls', 'screen and microphone remain off on admission',
+        'no capture API requested before approval or automatically on admission; explicit screen share click invokes display capture',
+        'both UI clients decode synthetic screen frames', 'DOM displays live received resolution and direct UDP route', 'four-person limit and fifth request refusal',
+        'received codec displayed from actual stats', 'fullscreen enter/exit', 'microphone equipment enumeration and preference saved locally',
         'host rejection returns UI to lobby', '412x915 mobile layout has no horizontal overflow', 'phone microphone/share/leave actions visible above navigation without scrolling at three viewport sizes', 'no browser JavaScript errors'], received, mobileCallActions, errors };
     await fs.promises.writeFile(path.join(outputDir, 'ui-browser.json'), JSON.stringify(result, null, 2));
     console.log(JSON.stringify(result, null, 2));
@@ -236,7 +240,7 @@ async function main() {
     const diagnostics = [];
     for (const page of [desktopPage, mobilePage].filter(Boolean)) {
       try { diagnostics.push(await page.evaluate(() => ({ status: document.getElementById('connection-pill')?.textContent,
-        camera: document.getElementById('camera-button')?.getAttribute('aria-label'),
+        screen: document.getElementById('share-button')?.getAttribute('aria-label'),
         microphone: document.getElementById('mic-button')?.getAttribute('aria-label'),
         toast: document.getElementById('toast-region')?.textContent, sessionHidden: document.getElementById('session')?.hidden }))); } catch {}
     }

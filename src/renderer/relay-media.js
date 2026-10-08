@@ -1,0 +1,602 @@
+/* Bounded TCP fallback when direct WebRTC cannot connect. WebCodecs compresses
+ * desktop screen frames; JPEG remains an explicit compatibility fallback.
+ * The coordinator supplies the room key; it is not a trustless key exchange.
+ */
+const text = new TextEncoder();
+export const MAX_RELAY_PLAIN_BYTES = 179984;
+const validId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+const FRAME_FRAGMENT_BYTES = 160000, MAX_ENCODED_FRAME_BYTES = 768000;
+const MAX_VIDEO_PIXELS = 2560 * 1440;
+const CODECS = ['avc1.420033', 'vp8'];
+const base64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function canonicalBase64(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value) || value.length % 4 === 1) return false;
+  const remainder = value.length % 4, last = base64Alphabet.indexOf(value.at(-1));
+  return remainder !== 2 && remainder !== 3 || (remainder === 2 ? (last & 15) === 0 : (last & 3) === 0);
+}
+function base64(bytes) {
+  let result = ''; for (let offset = 0; offset < bytes.length; offset += 8192) result += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+  return btoa(result).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function unbase64(value) {
+  const raw = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, char => char.charCodeAt(0));
+}
+export function validRelayEnvelope(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'ciphertext,counter,epoch,nonce,version') return false;
+  if (value.version !== 1 || !Number.isSafeInteger(value.counter) || value.counter < 1 ||
+      !/^[A-Za-z0-9_-]{16}$/.test(value.epoch) || !/^[A-Za-z0-9_-]{16}$/.test(value.nonce) ||
+      typeof value.ciphertext !== 'string' || value.ciphertext.length < 22 || value.ciphertext.length > 240000 || !canonicalBase64(value.ciphertext)) return false;
+  const bytes = Math.floor(value.ciphertext.length * 3 / 4); return bytes >= 16 && bytes <= 180000;
+}
+function nonce(epoch, counter) {
+  const result = new Uint8Array(12); result.set(unbase64(epoch).subarray(0, 4));
+  new DataView(result.buffer).setBigUint64(4, BigInt(counter)); return result;
+}
+function context(from, to, epoch, counter) { return text.encode(JSON.stringify(['auralink-relay-v1', from, to, epoch, counter])); }
+export class RelayCipher {
+  constructor(roomKey, selfId, peerId) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(roomKey) || !canonicalBase64(roomKey) || !validId(selfId) || !validId(peerId) || selfId === peerId) throw new Error('Invalid relay membership.');
+    this.selfId = selfId; this.peerId = peerId; this.closed = false; this.counter = 0;
+    this.epoch = base64(crypto.getRandomValues(new Uint8Array(12)));
+    this.secret = crypto.subtle.importKey('raw', unbase64(roomKey), 'HKDF', false, ['deriveKey']);
+    this.receiveEpoch = null; this.receiveCounter = 0; this.retiredEpochs = new Set(); this.keys = new Map();
+  }
+  key(from, to, epoch) {
+    const id = `${from}/${to}/${epoch}`;
+    if (!this.keys.has(id)) {
+      this.keys.set(id, this.secret.then(secret => crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256',
+        salt: text.encode('auralink-relay-v1'), info: text.encode(id) }, secret, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])));
+    }
+    return this.keys.get(id);
+  }
+  async seal(bytes) {
+    if (this.closed || !(bytes instanceof Uint8Array) || bytes.length > MAX_RELAY_PLAIN_BYTES || this.counter >= Number.MAX_SAFE_INTEGER) return null;
+    const counter = ++this.counter; const iv = nonce(this.epoch, counter);
+    const key = await this.key(this.selfId, this.peerId, this.epoch);
+    const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: context(this.selfId, this.peerId, this.epoch, counter) }, key, bytes);
+    if (this.closed) return null;
+    return { version: 1, epoch: this.epoch, counter, nonce: base64(iv), ciphertext: base64(new Uint8Array(ciphertext)) };
+  }
+  async open(envelope) {
+    if (this.closed || !validRelayEnvelope(envelope) || this.retiredEpochs.has(envelope.epoch) ||
+        (this.receiveEpoch === envelope.epoch && envelope.counter <= this.receiveCounter) || base64(nonce(envelope.epoch, envelope.counter)) !== envelope.nonce) return null;
+    // Bound key derivations before authentication, including adversarial epochs.
+    if (this.keys.size >= 12 && !this.keys.has(`${this.peerId}/${this.selfId}/${envelope.epoch}`)) return null;
+    let bytes;
+    try {
+      const key = await this.key(this.peerId, this.selfId, envelope.epoch);
+      bytes = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unbase64(envelope.nonce),
+        additionalData: context(this.peerId, this.selfId, envelope.epoch, envelope.counter) }, key, unbase64(envelope.ciphertext));
+    } catch { return null; }
+    if (this.closed || (this.receiveEpoch === envelope.epoch && envelope.counter <= this.receiveCounter)) return null;
+    if (this.receiveEpoch && this.receiveEpoch !== envelope.epoch) {
+      if (this.retiredEpochs.size >= 8) return null;
+      this.retiredEpochs.add(this.receiveEpoch);
+    }
+    this.receiveEpoch = envelope.epoch; this.receiveCounter = envelope.counter;
+    return new Uint8Array(bytes);
+  }
+  close() { this.closed = true; this.keys.clear(); this.secret = null; }
+}
+function pack(header, payload = new Uint8Array()) {
+  const metadata = text.encode(JSON.stringify(header)); if (metadata.length > 2048) throw new Error('Relay metadata is too large.');
+  const result = new Uint8Array(2 + metadata.length + payload.length); new DataView(result.buffer).setUint16(0, metadata.length);
+  result.set(metadata, 2); result.set(payload, 2 + metadata.length); return result;
+}
+function unpack(bytes) {
+  if (bytes.length < 2 || bytes.length > MAX_RELAY_PLAIN_BYTES) return null;
+  const length = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(0);
+  if (length > 2048 || length + 2 > bytes.length) return null;
+  try { return { header: JSON.parse(new TextDecoder().decode(bytes.subarray(2, length + 2))), payload: bytes.slice(length + 2) }; } catch { return null; }
+}
+function h264Dimensions(nal) {
+  // We negotiate baseline AVC only. Read the SPS dimensions before handing an
+  // admitted peer's bitstream to a decoder that can allocate native surfaces.
+  if (nal.length < 5 || nal.length > 512) return null;
+  const rbsp = []; let zeros = 0;
+  for (const byte of nal.subarray(1)) { if (zeros >= 2 && byte === 3) { zeros = 0; continue; } rbsp.push(byte); zeros = byte === 0 ? zeros + 1 : 0; }
+  let bit = 0;
+  const read = count => { if (count > 31 || bit + count > rbsp.length * 8) throw new Error(); let value = 0;
+    while (count--) { value = value * 2 + ((rbsp[bit >> 3] >> (7 - (bit & 7))) & 1); bit++; } return value; };
+  const ue = () => { let leading = 0; while (read(1) === 0) if (++leading > 20) throw new Error(); return 2 ** leading - 1 + read(leading); };
+  try {
+    if (read(8) !== 66) return null; read(8); read(8); ue(); ue();
+    const order = ue(); if (order === 0) ue();
+    else if (order === 1) { read(1); ue(); ue(); const cycle = ue(); if (cycle > 16) return null; for (let i = 0; i < cycle; i++) ue(); }
+    else if (order !== 2) return null;
+    ue(); read(1); const widthMB = ue() + 1, heightMap = ue() + 1; const frameOnly = read(1); if (!frameOnly) read(1); read(1);
+    let left = 0, right = 0, top = 0, bottom = 0; if (read(1)) { left = ue(); right = ue(); top = ue(); bottom = ue(); }
+    return { width: widthMB * 16 - 2 * (left + right), height: heightMap * 16 * (2 - frameOnly) - 2 * (2 - frameOnly) * (top + bottom) };
+  } catch { return null; }
+}
+export function validEncodedVideo(codec, bytes, width, height, keyFrame) {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 3 || bytes.length > MAX_ENCODED_FRAME_BYTES) return false;
+  if (codec === 'vp8') {
+    const key = (bytes[0] & 1) === 0; if (key !== keyFrame) return false;
+    return !key || (bytes.length >= 10 && bytes[3] === 0x9d && bytes[4] === 1 && bytes[5] === 0x2a &&
+      ((bytes[6] | bytes[7] << 8) & 16383) === width && ((bytes[8] | bytes[9] << 8) & 16383) === height);
+  }
+  if (!codec.startsWith('avc1')) return false;
+  let start = -1, sawNAL = false, sawSPS = false;
+  const check = end => {
+    if (start < 0 || start >= end) return true; sawNAL = true;
+    if ((bytes[start] & 31) !== 7) return true;
+    sawSPS = true; const size = h264Dimensions(bytes.subarray(start, end));
+    return size?.width === width && size?.height === height;
+  };
+  for (let index = 0; index < bytes.length - 2; index++) {
+    if (bytes[index] === 0 && bytes[index + 1] === 0 && (bytes[index + 2] === 1 || (bytes[index + 2] === 0 && bytes[index + 3] === 1))) {
+      if (!check(index)) return false; const prefix = bytes[index + 2] === 1 ? 3 : 4; start = index + prefix; index += prefix - 1;
+    }
+  }
+  return check(bytes.length) && sawNAL && (!keyFrame || sawSPS);
+}
+function validJPEGDimensions(bytes, width, height) {
+  if (bytes.length < 14 || bytes[0] !== 255 || bytes[1] !== 216) return false;
+  let offset = 2, found = false;
+  while (offset < bytes.length - 1) {
+    if (bytes[offset++] !== 255) return false;
+    while (bytes[offset] === 255) offset++;
+    const marker = bytes[offset++]; if (marker === 218 || marker === 217) return found;
+    if (marker === 1 || marker >= 208 && marker <= 216) continue;
+    if (offset + 2 > bytes.length) return false;
+    const length = bytes[offset] * 256 + bytes[offset + 1]; if (length < 2 || offset + length > bytes.length) return false;
+    if (marker === 192 || marker === 194) {
+      if (length < 8 || bytes[offset + 3] * 256 + bytes[offset + 4] !== height || bytes[offset + 5] * 256 + bytes[offset + 6] !== width) return false;
+      found = true;
+    } else if (marker >= 192 && marker <= 207 && ![196, 200, 204].includes(marker)) return false;
+    offset += length;
+  }
+  return false;
+}
+export class RelayMedia {
+  constructor(rtc, key) {
+    this.rtc = rtc; this.key = key; this.peers = new Map(); this.sources = new Map(); this.closed = false;
+    this.audioContexts = new Set(); this.audioModules = new WeakMap();
+    this.hardwarePreferences = new Map();
+    this.capabilities = this.codecCapabilities();
+  }
+  async codecCapabilities() {
+    if (typeof VideoEncoder !== 'function' || typeof VideoDecoder !== 'function' || typeof VideoFrame !== 'function') return [];
+    const supported = [];
+    for (const codec of CODECS) {
+      try {
+        const decoder = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true });
+        if (!decoder.supported) continue;
+        for (const hardwareAcceleration of ['prefer-hardware', 'no-preference']) {
+          let encoder; try { encoder = await VideoEncoder.isConfigSupported({ codec, width: 1920, height: 1080, bitrate: 3500000,
+            framerate: 30, latencyMode: 'realtime', bitrateMode: 'variable', hardwareAcceleration,
+            ...(codec.startsWith('avc1') ? { avc: { format: 'annexb' } } : {}) }); } catch { continue; }
+          if (encoder.supported) { this.hardwarePreferences.set(codec, hardwareAcceleration); supported.push(codec); break; }
+        }
+      } catch { /* Try the next codec; support is engine specific. */ }
+    }
+    return supported;
+  }
+  addPeer(id) {
+    if (!this.peers.has(id)) this.peers.set(id, { cipher: new RelayCipher(this.key, this.rtc.selfId, id), active: false,
+      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, needsKey: true, videoCodecs: null });
+    return this.peers.get(id);
+  }
+  activate(id) {
+    const peer = this.addPeer(id); if (peer.active || this.closed) return;
+    peer.active = true; peer.startedAt = performance.now();
+    void this.capabilities.then(videoCodecs => {
+      if (this.closed || this.peers.get(id) !== peer || !peer.active) return;
+      this.send(id, { type: 'hello', videoCodecs });
+      const source = this.sources.get('screen'); if (source) source.forceKey = true;
+    });
+    this.send(id, { type: 'state', mediaState: this.rtc.mediaState() });
+    for (const kind of this.rtc.localTracks.keys()) void this.syncSource(kind);
+    this.rtc.emit('connection', { peerId: id, state: 'connected', route: 'Secure relay' });
+    this.rtc.emit('channel', { peerId: id, open: true });
+  }
+  send(id, header, bytes) {
+    const peer = this.peers.get(id);
+    if (this.closed || !peer?.active || peer.pending >= 3 || this.rtc.closed || !this.rtc.peers.has(id)) return false;
+    let packet; try { packet = pack(header, bytes); } catch { return false; }
+    if (packet.length > MAX_RELAY_PLAIN_BYTES) return false;
+    peer.pending++;
+    peer.sendQueue = peer.sendQueue.catch(() => {}).then(async () => {
+      if (this.closed || !peer.active || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
+      const envelope = await peer.cipher.seal(packet);
+      if (envelope && !this.closed && peer.active && this.peers.get(id) === peer && this.rtc.peers.has(id)) {
+        const result = this.rtc.signal(id, { relay: envelope });
+        if (result !== false) peer.sent += packet.length;
+      }
+    }).catch(() => { if (!this.closed) this.rtc.emit('error', { peerId: id, error: new Error('The secure relay could not send media. Rejoin the room to retry.') }); })
+      .finally(() => { peer.pending--; });
+    return true;
+  }
+  sendVideo(id, header, bytes) {
+    const peer = this.peers.get(id);
+    if (this.closed || !peer?.active || !this.rtc.peers.has(id) || peer.pendingVideo >= 2 || !(bytes instanceof Uint8Array) || bytes.length < 1 || bytes.length > MAX_ENCODED_FRAME_BYTES ||
+        (peer.needsKey && header.chunkType !== 'key')) return false;
+    const count = Math.ceil(bytes.length / FRAME_FRAGMENT_BYTES);
+    const packets = Array.from({ length: count }, (_, index) => pack({ ...header, index, count, total: bytes.length }, bytes.subarray(index * FRAME_FRAGMENT_BYTES, (index + 1) * FRAME_FRAGMENT_BYTES)));
+    peer.pendingVideo++;
+    if (header.chunkType === 'key') peer.needsKey = false;
+    peer.sendQueue = peer.sendQueue.catch(() => {}).then(async () => {
+      for (const packet of packets) {
+        if (this.closed || !peer.active || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
+        const envelope = await peer.cipher.seal(packet);
+        if (!envelope || this.closed || !peer.active || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
+        if (this.rtc.signal(id, { relay: envelope }) === false) { peer.needsKey = true; this.requestSourceKey(); return; }
+        peer.sent += packet.length;
+      }
+    }).catch(() => { peer.needsKey = true; this.requestSourceKey(); }).finally(() => { peer.pendingVideo--; });
+    return true;
+  }
+  requestSourceKey() { const source = this.sources.get('screen'); if (source) source.forceKey = true; }
+  retireStream(peer, stream) {
+    if (!stream) return; if (!peer.retiredStreams) peer.retiredStreams = new Set();
+    peer.retiredStreams.add(stream); if (peer.retiredStreams.size > 16) peer.retiredStreams.delete(peer.retiredStreams.values().next().value);
+  }
+  requestPeerKey(id, peer) {
+    if (performance.now() - (peer.lastKeyRequest || -1000) < 500) return;
+    peer.lastKeyRequest = performance.now(); this.send(id, { type: 'keyframe' });
+  }
+  receive(id, envelope) {
+    if (this.closed || !this.rtc.peers.has(id) || !validRelayEnvelope(envelope)) return;
+    const peer = this.addPeer(id);
+    if ((peer.receiving || 0) >= 12) { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+    peer.receiving = (peer.receiving || 0) + 1;
+    peer.receiveQueue = peer.receiveQueue.catch(() => {}).then(async () => {
+      const bytes = await peer.cipher.open(envelope);
+      if (!bytes || this.closed || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
+      const item = unpack(bytes); if (!item) return;
+      const { header, payload } = item;
+      if (!['hello', 'state', 'video', 'video-chunk', 'keyframe', 'codec-reject', 'audio', 'data'].includes(header?.type)) return;
+      peer.received += bytes.length;
+      if (!peer.active) await this.rtc.activateRelay(this.rtc.peers.get(id));
+      if (!peer.active || this.closed || this.peers.get(id) !== peer) return;
+      if (header.type === 'hello') {
+        peer.videoCodecs = Array.isArray(header.videoCodecs) ? header.videoCodecs.filter(codec => CODECS.includes(codec)) : [];
+        this.requestSourceKey();
+      } else if (header.type === 'keyframe') this.requestSourceKey();
+      else if (header.type === 'codec-reject' && CODECS.includes(header.codec)) { peer.videoCodecs = (peer.videoCodecs || []).filter(codec => codec !== header.codec); this.requestSourceKey(); }
+      else if (header.type === 'state') {
+        if (!header.mediaState || typeof header.mediaState !== 'object') return;
+        this.rtc.applyMediaState(id, header.mediaState);
+        for (const kind of ['audio', 'screen']) if (header.mediaState[kind] === false) this.removeOutput(id, kind);
+      } else if (header.type === 'video') await this.video(id, peer, header, payload);
+      else if (header.type === 'video-chunk') await this.videoChunk(id, peer, header, payload);
+      else if (header.type === 'audio') await this.audio(id, peer, header, payload);
+      else if (header.type === 'data' && payload.length === 0 && JSON.stringify(header.data).length <= 4096) this.rtc.emit('data', { peerId: id, data: header.data });
+    }).catch(() => { /* A malformed or interrupted media frame is discarded. */ }).finally(() => { peer.receiving--; });
+  }
+  async resumePlayback() { await Promise.all([...this.audioContexts].map(context => context.resume().catch(() => {}))); }
+  playbackState() {
+    if (!this.closed) this.rtc.emit('playback-blocked', { blocked: [...this.audioContexts].some(context => context.state === 'suspended' || context.state === 'interrupted') });
+  }
+  watchAudioContext(context) {
+    this.audioContexts.add(context); context.onstatechange = () => this.playbackState(); this.playbackState();
+  }
+  async audioModule(context) {
+    if (!this.audioModules.has(context)) this.audioModules.set(context, context.audioWorklet.addModule(new URL('./audio-worklet.js', import.meta.url)));
+    return this.audioModules.get(context);
+  }
+  output(id, kind, track, stream, resources) {
+    const peer = this.peers.get(id); if (!peer || this.closed || !this.rtc.peers.has(id)) { track.stop(); return; }
+    this.removeOutput(id, kind, true);
+    peer.outputs.set(kind, { track, stream, ...resources });
+    const entry = this.rtc.peers.get(id); entry.remoteTracks.set(kind, { track, stream }); entry.inactiveRemoteTracks.delete(kind);
+    this.rtc.emit('track', { peerId: id, kind, track, stream });
+  }
+  async video(id, peer, header, payload) {
+    if (header.kind !== 'screen' || payload.length < 4 || payload.length > 110000 ||
+        !Number.isInteger(header.width) || !Number.isInteger(header.height) || header.width < 1 || header.height < 1 || header.width > 1920 || header.height > 1920 || header.width * header.height > 2200000 ||
+        (header.stream !== undefined && (!/^[A-Za-z0-9_-]{16}$/.test(header.stream) || peer.retiredStreams?.has(header.stream)))) return;
+    if (this.rtc.peers.get(id)?.remoteState[header.kind] === false) return;
+    if (!validJPEGDimensions(payload, header.width, header.height)) return;
+    const bitmap = await createImageBitmap(new Blob([payload], { type: 'image/jpeg' }));
+    try {
+      if (this.closed || this.peers.get(id) !== peer || !peer.active || this.rtc.peers.get(id)?.remoteState.screen === false || bitmap.width !== header.width || bitmap.height !== header.height) return;
+      if (peer.decoder) { try { peer.decoder.close(); } catch {} this.retireStream(peer, peer.decoderStream); peer.decoder = null; peer.decoderNeedsKey = true; }
+      let output = peer.outputs.get(header.kind);
+      if (!output) {
+        const canvas = document.createElement('canvas'); canvas.width = header.width; canvas.height = header.height;
+        let track, writer;
+        if (typeof MediaStreamTrackGenerator === 'function') { track = new MediaStreamTrackGenerator({ kind: 'video' }); writer = track.writable.getWriter(); }
+        else track = canvas.captureStream(0).getVideoTracks()[0];
+        this.output(id, header.kind, track, new MediaStream([track]), { canvas, writer, count: 0 }); output = peer.outputs.get(header.kind);
+      }
+      if (!output) return;
+      if (peer.jpegStream !== header.stream) { this.retireStream(peer, peer.jpegStream); peer.jpegStream = header.stream; }
+      output.canvas.width = header.width; output.canvas.height = header.height; output.canvas.getContext('2d').drawImage(bitmap, 0, 0);
+      if (output.writer) {
+        const frame = new VideoFrame(bitmap, { timestamp: Math.round(performance.now() * 1000) });
+        try { await output.writer.write(frame); } finally { frame.close(); }
+      } else output.track.requestFrame?.();
+      if (this.closed || this.peers.get(id) !== peer || peer.outputs.get(header.kind) !== output || this.rtc.peers.get(id)?.remoteState.screen === false) return;
+      output.count++; peer.frames++; peer.width = header.width; peer.height = header.height; peer.codec = 'JPEG · compatibility';
+    } finally { bitmap.close(); }
+  }
+  async videoChunk(id, peer, header, payload) {
+    const integer = (value, low, high) => Number.isSafeInteger(value) && value >= low && value <= high;
+    if (header.kind !== 'screen' || !CODECS.includes(header.codec) || !/^[A-Za-z0-9_-]{16}$/.test(header.stream) ||
+        peer.retiredStreams?.has(header.stream) ||
+        !integer(header.sequence, 1, Number.MAX_SAFE_INTEGER) || !integer(header.index, 0, 4) || !integer(header.count, 1, 5) || header.index >= header.count ||
+        !integer(header.total, 1, MAX_ENCODED_FRAME_BYTES) || header.count !== Math.ceil(header.total / FRAME_FRAGMENT_BYTES) ||
+        payload.length !== Math.min(FRAME_FRAGMENT_BYTES, header.total - header.index * FRAME_FRAGMENT_BYTES) ||
+        !integer(header.width, 2, 2560) || !integer(header.height, 2, 2560) || header.width * header.height > MAX_VIDEO_PIXELS ||
+        !['key', 'delta'].includes(header.chunkType) || !integer(header.timestamp, 0, Number.MAX_SAFE_INTEGER) ||
+        (header.description !== undefined && (typeof header.description !== 'string' || header.description.length > 1400 || !canonicalBase64(header.description))) ||
+        typeof VideoDecoder !== 'function' || this.rtc.peers.get(id)?.remoteState.screen === false) return;
+    const signature = JSON.stringify([header.stream, header.sequence, header.codec, header.width, header.height, header.chunkType, header.timestamp, header.description || '', header.total, header.count]);
+    let assembly = peer.assembly;
+    if (!assembly || assembly.signature !== signature) {
+      if (assembly) { clearTimeout(assembly.timer); peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); }
+      if (header.index !== 0) { peer.assembly = null; peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+      assembly = { signature, header, bytes: new Uint8Array(header.total), next: 0 };
+      assembly.timer = setTimeout(() => { if (peer.assembly === assembly) { peer.assembly = null; peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); } }, 2000);
+      peer.assembly = assembly;
+    }
+    if (header.index !== assembly.next) { clearTimeout(assembly.timer); peer.assembly = null; peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+    assembly.bytes.set(payload, header.index * FRAME_FRAGMENT_BYTES); assembly.next++;
+    if (assembly.next !== header.count) return;
+    clearTimeout(assembly.timer); peer.assembly = null;
+    if (!validEncodedVideo(header.codec, assembly.bytes, header.width, header.height, header.chunkType === 'key')) { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+    const changed = peer.decoderStream !== header.stream || peer.decoderCodec !== header.codec || peer.decoderWidth !== header.width || peer.decoderHeight !== header.height;
+    if (!changed && peer.videoSequence && header.sequence <= peer.videoSequence) return;
+    const gap = !changed && peer.videoSequence && header.sequence !== peer.videoSequence + 1;
+    peer.videoSequence = header.sequence;
+    if (changed || gap || peer.decoderNeedsKey || !peer.decoder || peer.decoder.state === 'closed') {
+      if (header.chunkType !== 'key') { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+      // An admitted sender still cannot churn hardware codec allocations.
+      if (performance.now() - (peer.lastDecoderConfig || -1000) < 250) { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+      peer.lastDecoderConfig = performance.now();
+      try { peer.decoder?.close(); } catch {} peer.decoder = null; peer.decoderNeedsKey = true;
+      const config = { codec: header.codec, codedWidth: header.width, codedHeight: header.height, optimizeForLatency: true,
+        ...(header.description ? { description: unbase64(header.description) } : {}) };
+      let supported; try { supported = await VideoDecoder.isConfigSupported(config); } catch { return; }
+      if (!supported.supported) { this.send(id, { type: 'codec-reject', codec: header.codec }); return; }
+      if (this.closed || this.peers.get(id) !== peer || !peer.active || this.rtc.peers.get(id)?.remoteState.screen === false) return;
+      const decoder = new VideoDecoder({ output: frame => {
+        if (this.closed || this.peers.get(id) !== peer || peer.decoder !== decoder || !peer.active || this.rtc.peers.get(id)?.remoteState.screen === false) { frame.close(); return; }
+        if ((peer.outputPending || 0) >= 2) { frame.close(); return; }
+        peer.outputPending = (peer.outputPending || 0) + 1;
+        peer.outputQueue = (peer.outputQueue || Promise.resolve()).catch(() => {}).then(async () => {
+          if (!this.closed && this.peers.get(id) === peer && peer.decoder === decoder && peer.active && this.rtc.peers.get(id)?.remoteState.screen !== false) await this.decodedVideo(id, peer, frame, header.codec);
+        }).catch(() => {}).finally(() => { frame.close(); peer.outputPending--; });
+      }, error: () => { if (!this.closed && this.peers.get(id) === peer && peer.decoder === decoder) {
+        peer.decoderNeedsKey = true; peer.decodeFailures = (peer.decodeFailures || 0) + 1;
+        if (peer.decodeFailures >= 3) this.send(id, { type: 'codec-reject', codec: header.codec }); else this.requestPeerKey(id, peer);
+      } } });
+      try { decoder.configure(supported.config); } catch { decoder.close(); this.send(id, { type: 'codec-reject', codec: header.codec }); return; }
+      if (peer.decoderStream !== header.stream) this.retireStream(peer, peer.decoderStream);
+      this.retireStream(peer, peer.jpegStream); peer.jpegStream = undefined;
+      peer.decoder = decoder; peer.decoderStream = header.stream; peer.decoderCodec = header.codec; peer.decoderWidth = header.width; peer.decoderHeight = header.height; peer.decoderNeedsKey = false;
+    }
+    if (peer.decoder.decodeQueueSize >= 2) { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+    try { peer.decoder.decode(new EncodedVideoChunk({ type: header.chunkType, timestamp: header.timestamp, data: assembly.bytes })); }
+    catch { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); }
+  }
+  async decodedVideo(id, peer, frame, codec) {
+    const width = frame.displayWidth, height = frame.displayHeight;
+    if (!width || !height || width * height > MAX_VIDEO_PIXELS || width > 2560 || height > 2560) return;
+    let output = peer.outputs.get('screen');
+    if (!output) {
+      const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+      let track, writer;
+      if (typeof MediaStreamTrackGenerator === 'function') { track = new MediaStreamTrackGenerator({ kind: 'video' }); writer = track.writable.getWriter(); }
+      else track = canvas.captureStream(0).getVideoTracks()[0];
+      this.output(id, 'screen', track, new MediaStream([track]), { canvas, writer, count: 0 }); output = peer.outputs.get('screen');
+    }
+    if (!output) return;
+    if (output.writer) await output.writer.write(frame);
+    else { output.canvas.width = width; output.canvas.height = height; output.canvas.getContext('2d').drawImage(frame, 0, 0); output.track.requestFrame?.(); }
+    if (this.closed || this.peers.get(id) !== peer || peer.outputs.get('screen') !== output) return;
+    output.count++; peer.frames++; peer.width = width; peer.height = height; peer.codec = codec.startsWith('avc1') ? 'H.264' : 'VP8'; peer.decodeFailures = 0;
+  }
+  async audio(id, peer, header, payload) {
+    if (![24000, 48000, 44100].includes(header.sampleRate) || payload.length < 2 || payload.length > 24000 || payload.length % 2) return;
+    if (this.rtc.peers.get(id)?.remoteState.audio === false) return;
+    let output = peer.outputs.get('audio');
+    if (!output) {
+      const context = new AudioContext({ sampleRate: header.sampleRate, latencyHint: 'interactive' }); this.watchAudioContext(context);
+      try {
+        await this.audioModule(context);
+        if (this.closed || this.peers.get(id) !== peer || !peer.active || !this.rtc.peers.has(id) || this.rtc.peers.get(id)?.remoteState.audio === false) { this.audioContexts.delete(context); await context.close(); return; }
+        const node = new AudioWorkletNode(context, 'auralink-relay-playback', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+        const destination = context.createMediaStreamDestination(); node.connect(destination);
+        const track = destination.stream.getAudioTracks()[0];
+        this.output(id, 'audio', track, destination.stream, { context, node, sampleRate: header.sampleRate }); output = peer.outputs.get('audio');
+        void context.resume().catch(() => {}); this.playbackState();
+      } catch (error) { this.audioContexts.delete(context); await context.close(); throw error; }
+    }
+    if (!output || output.sampleRate !== header.sampleRate) return;
+    const buffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+    output.node.port.postMessage({ buffer }, [buffer]); peer.audioPackets++;
+  }
+  async syncSource(kind) {
+    const current = this.rtc.localTracks.get(kind); const old = this.sources.get(kind);
+    if (old?.track === current?.track) return;
+    this.stopSource(kind);
+    if (!current || this.closed || ![...this.peers.values()].some(peer => peer.active)) return;
+    const source = { track: current.track, active: true, pending: false, instance: base64(crypto.getRandomValues(new Uint8Array(12))) }; this.sources.set(kind, source);
+    const valid = () => !this.closed && source.active && this.sources.get(kind) === source && this.rtc.localTracks.get(kind)?.track === source.track;
+    if (kind === 'audio') {
+      const context = new AudioContext({ sampleRate: 24000, latencyHint: 'interactive' }); source.context = context; this.watchAudioContext(context);
+      try {
+        await this.audioModule(context); if (!valid()) { await context.close(); return; }
+        source.input = context.createMediaStreamSource(new MediaStream([current.track]));
+        source.node = new AudioWorkletNode(context, 'auralink-relay-capture'); source.input.connect(source.node); source.node.connect(context.destination);
+        source.node.port.onmessage = event => {
+          if (!valid() || !current.track.enabled || !(event.data?.buffer instanceof ArrayBuffer)) return;
+          const bytes = new Uint8Array(event.data.buffer);
+          for (const [id, peer] of this.peers) if (peer.active) this.send(id, { type: 'audio', sampleRate: event.data.sampleRate }, bytes);
+        };
+        void context.resume().catch(() => {}); this.playbackState();
+      } catch (error) {
+        const wasActive = valid(); this.audioContexts.delete(context); void context.close().catch(() => {});
+        if (this.sources.get(kind) === source) this.stopSource(kind);
+        if (wasActive) this.rtc.emit('error', { error: new Error('Secure relay microphone processing is unavailable. Update Android WebView or your app.') });
+      }
+      return;
+    }
+    if (kind !== 'screen') return;
+    source.startedAt = performance.now(); source.forceKey = true; source.sequence = 0; source.targetFPS = 30; source.lastKey = 0; source.lastAdapt = 0;
+    // TrackProcessor consumes generated Android frames even when its Activity
+    // has no compositor paints. Cloning avoids taking ownership of RTC capture.
+    source.clone = current.track.clone();
+    if (typeof MediaStreamTrackProcessor === 'function') {
+      source.reader = new MediaStreamTrackProcessor({ track: source.clone }).readable.getReader();
+      void (async () => {
+        let last = 0, slot = -1;
+        try { while (valid()) { const { done, value } = await source.reader.read(); if (done) break;
+          try { const now = performance.now(), nextSlot = Math.floor(now * source.targetFPS / 1000);
+            if ((source.jpeg ? now - last < 250 : nextSlot <= slot) || source.pending || !source.track.enabled) continue;
+            last = now; slot = nextSlot; await this.encodeVideo(kind, source, value, valid); }
+          finally { value.close(); }
+        } } catch { /* Source stop releases the reader. */ }
+      })();
+    } else if (typeof ImageCapture === 'function') {
+      source.capture = new ImageCapture(source.clone);
+      source.timer = setInterval(async () => { if (!valid() || source.pending || !source.track.enabled) return;
+        source.pending = true; let bitmap;
+        try { bitmap = await source.capture.grabFrame(); await this.encodeVideo(kind, source, bitmap, valid); } catch {} finally { bitmap?.close(); source.pending = false; }
+      }, 33);
+    } else { this.stopSource(kind); this.rtc.emit('error', { error: new Error('Secure relay video is unavailable in this media engine.') }); }
+  }
+  async encodeVideo(kind, source, frame, valid) {
+    if (source.jpeg && performance.now() - (source.lastJPEG || 0) < 250) return;
+    source.pending = true;
+    try {
+      const width = frame.displayWidth || frame.width, height = frame.displayHeight || frame.height;
+      if (!width || !height) return;
+      const codecs = await this.capabilities; if (!valid()) return;
+      const peers = [...this.peers.values()].filter(peer => peer.active);
+      if (peers.some(peer => peer.videoCodecs === null) && performance.now() - source.startedAt < 2000) return;
+      const codec = codecs.find(codec => peers.every(peer => peer.videoCodecs?.includes(codec)));
+      if (codec) {
+        source.jpeg = false;
+        await this.encodeCompressed(source, frame, width, height, codec, valid); return;
+      }
+      source.jpeg = true; source.lastJPEG = performance.now();
+      try { source.encoder?.close(); } catch {} source.encoder = null; source.codec = null;
+      if (!source.compatibilityNotified) {
+        source.compatibilityNotified = true; this.rtc.emit('relay-codec', { codec: 'JPEG', compatibility: true, reason: 'This media engine does not support a common real-time video codec. Screen relay is limited to 4 fps and 1280 pixels.' });
+      }
+      // Preserve presentation detail within a bounded 1280-pixel long edge.
+      let scale = Math.min(1, 1280 / Math.max(width, height)); let blob, canvas;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        canvas = new OffscreenCanvas(Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)));
+        canvas.getContext('2d').drawImage(frame, 0, 0, canvas.width, canvas.height);
+        blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.68 - attempt * 0.1 });
+        if (blob.size <= 65000) break; scale *= 0.75;
+      }
+      if (!valid() || !source.track.enabled || blob.size > 110000) return;
+      source.width = canvas.width; source.height = canvas.height;
+      const bytes = new Uint8Array(await blob.arrayBuffer()); if (!valid()) return;
+      for (const [id, peer] of this.peers) if (peer.active) this.send(id, { type: 'video', kind, stream: source.instance, width: canvas.width, height: canvas.height }, bytes);
+    } finally { source.pending = false; }
+  }
+  async encodeCompressed(source, frame, width, height, codec, valid) {
+    const now = performance.now(), quality = this.rtc.quality || 'auto';
+    const ceiling = { auto: 1920, '720': 1280, '1080': 1920, '1440': 2560 }[quality] || 1920;
+    const totalCap = { auto: 3000000, '720': 1800000, '1080': 3500000, '1440': 4500000 }[quality] || 3000000;
+    const relayRecipients = Math.max(1, [...this.peers.values()].filter(peer => peer.active).length);
+    const cap = Math.round(totalCap / relayRecipients);
+    if (source.cap !== cap) { source.bitrate = Math.min(source.bitrate || cap, cap); source.cap = cap; source.forceKey = true; }
+    const scale = Math.min(1, ceiling / Math.max(width, height), Math.sqrt(MAX_VIDEO_PIXELS / (width * height)));
+    const targetWidth = Math.max(2, Math.floor(width * scale / 2) * 2), targetHeight = Math.max(2, Math.floor(height * scale / 2) * 2);
+    const congested = [...this.peers.values()].some(peer => peer.active && peer.pendingVideo >= 2) || source.encoder?.encodeQueueSize >= 2;
+    if (congested) {
+      if (now - source.lastAdapt > 1000) { source.bitrate = Math.max(700000, Math.round((source.bitrate || cap) * .8)); source.targetFPS = Math.max(12, source.targetFPS - 3); source.lastAdapt = now; }
+      return;
+    }
+    if (now - source.lastAdapt > 3000) { source.bitrate = Math.min(cap, Math.round((source.bitrate || cap) * 1.1)); source.targetFPS = Math.min(30, source.targetFPS + 3); source.lastAdapt = now; }
+    if (source.quality !== quality) { source.bitrate = cap; source.quality = quality; source.forceKey = true; }
+    const changed = !source.encoder || source.encoder.state === 'closed' || source.codec !== codec || source.width !== targetWidth || source.height !== targetHeight;
+    if (changed) {
+      try { source.encoder?.close(); } catch {}
+      source.encoder = null; source.stream = base64(crypto.getRandomValues(new Uint8Array(12))); source.sequence = 0; source.description = undefined;
+      let config = { codec, width: targetWidth, height: targetHeight, bitrate: source.bitrate || cap, framerate: source.targetFPS,
+        latencyMode: 'realtime', bitrateMode: 'variable', ...(codec.startsWith('avc1') ? { avc: { format: 'annexb' } } : {}) };
+      let supported; const preferred = source.failedHardware?.has(codec) ? 'no-preference' : this.hardwarePreferences.get(codec) || 'no-preference';
+      for (const hardwareAcceleration of preferred === 'prefer-hardware' ? ['prefer-hardware', 'no-preference'] : ['no-preference']) {
+        config = { ...config, hardwareAcceleration };
+        try { supported = await VideoEncoder.isConfigSupported(config); } catch { supported = null; }
+        if (supported?.supported) break;
+      }
+      if (!valid()) return;
+      if (!supported?.supported) {
+        const supportedCodecs = await this.capabilities; this.capabilities = Promise.resolve(supportedCodecs.filter(item => item !== codec)); return;
+      }
+      let encoder;
+      try { encoder = new VideoEncoder({ output: (chunk, metadata) => {
+        if (!valid() || source.encoder !== encoder || !source.track.enabled) return;
+        if (metadata?.decoderConfig?.description) source.description = base64(new Uint8Array(metadata.decoderConfig.description));
+        const sequence = ++source.sequence;
+        if (chunk.byteLength > MAX_ENCODED_FRAME_BYTES || (source.description?.length || 0) > 1400) { source.forceKey = true; source.bitrate = Math.max(700000, Math.round(source.bitrate * .7)); return; }
+        const bytes = new Uint8Array(chunk.byteLength); chunk.copyTo(bytes);
+        const header = { type: 'video-chunk', kind: 'screen', stream: source.stream, sequence, codec: source.codec,
+          width: source.width, height: source.height, chunkType: chunk.type, timestamp: chunk.timestamp,
+          ...(chunk.type === 'key' && source.description ? { description: source.description } : {}) };
+        for (const [id, peer] of this.peers) if (peer.active) {
+          if (!this.sendVideo(id, header, bytes)) { peer.needsKey = true; source.forceKey = true; }
+        }
+      }, error: () => { if (valid() && source.encoder === encoder) {
+        this.encoderFailed(source, codec, config.hardwareAcceleration); try { encoder.close(); } catch {}
+      } } }); } catch { this.encoderFailed(source, codec, config.hardwareAcceleration); return; }
+      source.encoder = encoder; source.codec = codec; source.width = targetWidth; source.height = targetHeight;
+      source.config = config; source.forceKey = true;
+      try { encoder.configure(supported.config); } catch { try { encoder.close(); } catch {} this.encoderFailed(source, codec, config.hardwareAcceleration); return; }
+      this.rtc.emit('relay-codec', { codec: codec.startsWith('avc1') ? 'H.264' : 'VP8', width: targetWidth, height: targetHeight, framerate: source.targetFPS, compatibility: false });
+    } else if (Math.abs(source.config.bitrate - source.bitrate) > 250000 || source.config.framerate !== source.targetFPS) {
+      source.config = { ...source.config, bitrate: source.bitrate, framerate: source.targetFPS };
+      try { source.encoder.configure(source.config); source.forceKey = true; }
+      catch { this.encoderFailed(source, codec, source.config.hardwareAcceleration); try { source.encoder.close(); } catch {} return; }
+    }
+    if (!valid() || source.encoder.encodeQueueSize >= 2) return;
+    let encodedFrame;
+    if (frame instanceof VideoFrame && frame.displayWidth === targetWidth && frame.displayHeight === targetHeight) encodedFrame = new VideoFrame(frame, { timestamp: Math.round(now * 1000) });
+    else {
+      if (!source.canvas || source.canvas.width !== targetWidth || source.canvas.height !== targetHeight) source.canvas = new OffscreenCanvas(targetWidth, targetHeight);
+      source.canvas.getContext('2d', { alpha: false }).drawImage(frame, 0, 0, targetWidth, targetHeight);
+      encodedFrame = new VideoFrame(source.canvas, { timestamp: Math.round(now * 1000) });
+    }
+    const keyFrame = source.forceKey || now - source.lastKey > 2000;
+    if (keyFrame) { source.forceKey = false; source.lastKey = now; }
+    try { source.encoder.encode(encodedFrame, { keyFrame }); } catch { source.forceKey = true; }
+    finally { encodedFrame.close(); }
+  }
+  encoderFailed(source, codec, hardwareAcceleration) {
+    source.forceKey = true;
+    if (hardwareAcceleration === 'prefer-hardware') {
+      if (!source.failedHardware) source.failedHardware = new Set(); source.failedHardware.add(codec);
+    } else this.capabilities = this.capabilities.then(codecs => codecs.filter(item => item !== codec));
+  }
+  state() {
+    for (const [id, peer] of this.peers) if (peer.active) this.send(id, { type: 'state', mediaState: this.rtc.mediaState() });
+    for (const kind of ['audio', 'screen']) void this.syncSource(kind);
+  }
+  stopSource(kind) {
+    const source = this.sources.get(kind); if (!source) return;
+    this.sources.delete(kind); source.active = false; clearInterval(source.timer); source.clone?.stop(); void source.reader?.cancel().catch(() => {});
+    try { source.encoder?.close(); } catch {}
+    if (source.node) { source.node.port.postMessage('stop'); source.node.disconnect(); source.node.port.onmessage = null; }
+    source.input?.disconnect(); if (source.context) { this.audioContexts.delete(source.context); void source.context.close().catch(() => {}); this.playbackState(); }
+  }
+  removeOutput(id, kind, preserveDecoder = false) {
+    const peer = this.peers.get(id);
+    if (kind === 'screen' && peer && !preserveDecoder) {
+      this.retireStream(peer, peer.decoderStream); this.retireStream(peer, peer.jpegStream); this.retireStream(peer, peer.assembly?.header.stream);
+      try { peer.decoder?.close(); } catch {} peer.decoder = null; peer.decoderNeedsKey = true;
+      clearTimeout(peer.assembly?.timer); peer.assembly = null;
+    }
+    const output = peer?.outputs.get(kind); if (!output) return;
+    peer.outputs.delete(kind); output.track.stop(); void output.writer?.abort().catch(() => {});
+    if (output.node) { output.node.port.postMessage('stop'); output.node.disconnect(); }
+    if (output.context) { this.audioContexts.delete(output.context); void output.context.close().catch(() => {}); this.playbackState(); }
+    const entry = this.rtc.peers.get(id); if (entry?.remoteTracks.get(kind)?.track === output.track) { entry.remoteTracks.delete(kind); this.rtc.emit('track-removed', { peerId: id, kind }); }
+  }
+  removePeer(id) {
+    const peer = this.peers.get(id); if (!peer) return;
+    peer.active = false; peer.cipher.close(); this.removeOutput(id, 'screen'); for (const kind of [...peer.outputs.keys()]) this.removeOutput(id, kind); this.peers.delete(id);
+    if (![...this.peers.values()].some(item => item.active)) for (const kind of [...this.sources.keys()]) this.stopSource(kind);
+  }
+  close() { this.closed = true; for (const id of [...this.peers.keys()]) this.removePeer(id); for (const kind of [...this.sources.keys()]) this.stopSource(kind); this.key = null; }
+}

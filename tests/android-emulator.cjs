@@ -14,6 +14,7 @@ const selfsigned=require('selfsigned');
 const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
+const {findRoomAction}=require('./android-room-action.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
 const sdk=process.env.ANDROID_SDK_ROOT || path.join(project,'.tools','android-sdk');
@@ -23,6 +24,7 @@ const pkg=require('../package.json');
 const testedVersion=process.env.AURALINK_TEST_APK_VERSION || pkg.version;
 const [testedMajor,testedMinor,testedPatch]=testedVersion.split('.').map(Number);
 const freshSetupRegression=testedMajor>0 || testedMinor>3 || testedMinor===3 && testedPatch>=1;
+const publicLifecycleRegression=testedMajor>0 || testedMinor>=4;
 const output=path.join(project,'test-results');
 const fixtureDir=path.join(project,'.tools','android-runtime-fixture');
 const apk=process.env.AURALINK_TEST_APK ? path.resolve(process.env.AURALINK_TEST_APK) : path.join(project,'release',`Auralink-${pkg.version}-Android.apk`);
@@ -39,6 +41,7 @@ function checkpoint(stage,evidence=true) {
 }
 function safeError(error) {
   return String(error?.message || error).replace(/https?:\/\/[^\s'"<>]+(?:#|%23)key=[^\s'"<>]+/g,'[private test invitation redacted]')
+    .replace(/A1\.[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}/gi,'[test room code redacted]')
     .replace(/((?:roomKey|hostToken|key)\s*[=:]\s*["']?)[A-Za-z0-9_-]{16,}/g,'$1[redacted]');
 }
 async function adb(args,options={}) {
@@ -125,24 +128,12 @@ async function tapStable(predicate,timeout=30000) {
   throw new Error(`Android action did not expose stable visible bounds during ${phase}`);
 }
 async function tapRoomAction(predicate,timeout=30000) {
-  // A WebView accessibility node may extend below the fixed bottom navigation.
-  // Scroll the actual app until the whole action is visible, then recheck its
-  // bounds. Tapping a clipped node's centre can activate navigation instead.
-  const deadline=Date.now()+timeout;let previous;
-  do {
-    const nodes=await hierarchy();
-    const node=nodes.find(predicate);
-    const bounds=node?.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);
-    const navigation=nodes.find(value=>label('Rooms')(value) && value.class==='android.widget.Button')?.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);
-    const bottom=navigation ? +navigation[2]-8 : 1147;
-    if(bounds && visible(node) && +bounds[2]>=136 && +bounds[4]<=bottom) {
-      if(node.bounds===previous){await tap(node);return node;}
-      previous=node.bounds;await delay(300);continue;
-    }
-    previous=undefined;
-    await adb(['shell','input','swipe','670','1050','670','470','450']);await delay(600);
-  }while(Date.now()<deadline);
-  throw new Error(`Android room action did not become fully visible above navigation during ${phase}`);
+  const node=await findNativeRoomAction(predicate,timeout);await tap(node);return node;
+}
+async function findNativeRoomAction(predicate,timeout=30000,observe) {
+  try {
+    return await findRoomAction(predicate,{read:hierarchy,swipe:(x1,y1,x2,y2)=>adb(['shell','input','swipe',...[x1,y1,x2,y2].map(String),'450']),wait:delay,timeout,observe});
+  } catch(error) { throw new Error(`${error.message} during ${phase}`); }
 }
 async function keyboardShown() {
   const state=await adb(['shell','dumpsys','input_method']);
@@ -276,6 +267,79 @@ async function startPhoneAudio(fixture) {
   await screenshot('android-emulator-audio-active.png');
   return {passed:true,phoneToHost:incoming,syntheticHostToPhone:outgoing,mode:'MODE_IN_COMMUNICATION',checks:['Native Android microphone permission approved by the test owner','Live WebView microphone track sends increasing encrypted RTP packets','Synthetic host tone RTP acknowledged by actual Android receiver','Actual Android communication audio mode'],physicalMicrophoneAndSpeakerVerified:false};
 }
+async function callTransportStats(fixture) {
+  return fixture.page.evaluate(async id=>{
+    const entry=rtc.peers.get(id);if(!entry)return null;
+    const rows=[...(await entry.pc.getStats()).values()];
+    return {received:rows.find(row=>row.type==='inbound-rtp' && row.kind==='audio')?.packetsReceived || 0,
+      acknowledged:rows.find(row=>row.type==='remote-inbound-rtp' && row.kind==='audio')?.roundTripTimeMeasurements || 0,
+      connection:entry.pc.connectionState};
+  },fixture.peerId);
+}
+async function callServiceTypes(required,timeout=15000) {
+  const deadline=Date.now()+timeout;
+  do {
+    const service=await adb(['shell','dumpsys','activity','services','local.auralink.mobile']);
+    const section=service.split(/\n\s*\* ServiceRecord/).find(value=>value.includes('CallSessionService'));
+    const match=section?.match(/isForeground=true[^\n]*\btypes=(?:0x)?([a-f0-9]+)/i);
+    const types=match ? parseInt(match[1],16) : 0;
+    if((types&required)===required)return types;
+    await delay(300);
+  }while(Date.now()<deadline);
+  throw new Error('The explicit native room/call foreground service did not become active');
+}
+async function checkCallHomeReturn(fixture,audio) {
+  phase='nonsharing Android call survives Home and return';console.log(phase);
+  const processBefore=(await adb(['shell','pidof','local.auralink.mobile'])).trim();assert.match(processBefore,/^\d+$/);
+  const activityIdentity=async()=>{
+    const state=await adb(['shell','dumpsys','activity','activities']);
+    return state.match(/ActivityRecord\{([a-f0-9]+) u\d+ local\.auralink\.mobile\/\.MainActivity t(\d+)/)?.[0];
+  };
+  const activityBefore=await activityIdentity();assert.ok(activityBefore);
+  const joins=fixture.network.incomingTypes.join || 0, closes=fixture.network.socketCloses.length;
+  await callServiceTypes(0x10|0x80);
+  assert.ok(!(await adb(['shell','dumpsys','media_projection'])).includes('local.auralink.mobile'),'This regression must run without screen projection');
+  await adb(['shell','input','keyevent','3']);
+  const homeComponent=(await adb(['shell','cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.HOME'])).trim().split(/\r?\n/).find(line=>/^[\w.]+\//.test(line));
+  assert.ok(homeComponent);const homePackage=homeComponent.split('/')[0];
+  await findNode(node=>node.package===homePackage);
+  const first=await callTransportStats(fixture);assert.ok(first?.received>0 && first.acknowledged>0);
+  await rtcEvidence(fixture.page,async ({id,first})=>{
+    const entry=rtc.peers.get(id);if(!entry)return false;
+    const rows=[...(await entry.pc.getStats()).values()];
+    const received=rows.find(row=>row.type==='inbound-rtp' && row.kind==='audio')?.packetsReceived || 0;
+    const acknowledged=rows.find(row=>row.type==='remote-inbound-rtp' && row.kind==='audio')?.roundTripTimeMeasurements || 0;
+    return received>first.received && acknowledged>first.acknowledged && entry.pc.connectionState==='connected' ? {received,acknowledged} : false;
+  },{id:fixture.peerId,first},30000);
+  const top=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
+  assert.ok(top?.includes(homePackage),'Home must remain foreground while both-direction audio evidence advances');
+  await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
+  await findNode(label('Turn microphone off'));
+  assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore,'Returning must not restart the native process');
+  assert.equal(await activityIdentity(),activityBefore,'Returning must reuse the existing Activity');
+  assert.equal(fixture.network.incomingTypes.join || 0,joins,'Returning must not rejoin the room');
+  assert.equal(fixture.network.socketCloses.length,closes,'Backgrounding an ongoing call must not close authenticated signaling');
+  assert.equal(await audioMode('MODE_IN_COMMUNICATION'),'MODE_IN_COMMUNICATION');
+  checkpoint('nonSharingCallHomeReturn',{passed:true,callForegroundService:true,microphoneType:true,homeRemainedForeground:true,
+    increasingPhoneRtp:true,newAndroidAudioAcknowledgment:true,sameProcess:true,sameActivity:true,noRoomRejoin:true,noSignalingClose:true,microphoneStillEnabledOnReturn:true});
+  audio.checks.push('Nonsharing Home→return retains process, Activity, room, microphone and increasing bidirectional RTP');
+}
+async function checkProjectionRotation(fixture) {
+  phase='native projection follows real Android orientation';console.log(phase);
+  const joins=fixture.network.incomingTypes.join || 0;
+  await adb(['shell','settings','put','system','accelerometer_rotation','0']);
+  try {
+    await adb(['shell','settings','put','system','user_rotation','1']);
+    await fixture.page.waitForFunction(()=>{const video=document.getElementById('received-screen');return video?.videoWidth>video?.videoHeight && video.currentTime>0 && video.readyState>=2;},undefined,{timeout:30000});
+    const landscape=await fixture.page.locator('#received-screen').evaluate(video=>({width:video.videoWidth,height:video.videoHeight}));
+    await adb(['shell','settings','put','system','user_rotation','0']);
+    await fixture.page.waitForFunction(()=>{const video=document.getElementById('received-screen');return video?.videoHeight>video?.videoWidth && video.currentTime>0 && video.readyState>=2;},undefined,{timeout:30000});
+    const portrait=await fixture.page.locator('#received-screen').evaluate(video=>({width:video.videoWidth,height:video.videoHeight}));
+    assert.equal(fixture.network.incomingTypes.join || 0,joins,'Rotation must not restart room admission');
+    assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/,'Rotation keeps the approved projection active');
+    checkpoint('projectionOrientationRoundTrip',{passed:true,landscape,portrait,admissionUnchanged:true});
+  } finally { await adb(['shell','settings','put','system','user_rotation','0']); }
+}
 
 async function nativeDevice() {
   assert.match(serial,/^emulator-\d+$/,'This test may target emulator serials only');
@@ -408,7 +472,12 @@ async function hostFixture() {
 async function checkFreshInternetSetup(fixture) {
   phase='fresh Android Internet setup guidance';console.log(phase);
   const before={healthRequests:fixture.network.healthRequests,socketUpgrades:fixture.network.socketUpgrades,joins:fixture.network.incomingTypes.join || 0};
-  await tapRoomAction(label('Create a room'));
+  // Android WebView may expose the HTML title as the button's accessible name.
+  // The stable view ID identifies the real action independently of that name.
+  const create=await findNativeRoomAction(node=>node['resource-id']==='host-button',30000,(nodes,node)=>{
+    if(!runtimeDiagnostics.freshSetupInitialActions)runtimeDiagnostics.freshSetupInitialActions=safeHierarchy(nodes.filter(value=>['host-button','join-button'].includes(value['resource-id'])));
+  });
+  assert.equal(create.enabled,'true','Fresh Create a room must be enabled');await tap(create);
   let service;
   try { service=await findNode(node=>node['resource-id']==='internet-service' && node.class==='android.widget.EditText' && node.focused==='true',30000); }
   catch { throw new Error('Native setup visibility check failed: focused service input was not exposed after Create a room. Inspect the local hierarchy and screenshot.'); }
@@ -433,24 +502,58 @@ async function checkFreshInternetSetup(fixture) {
   const networkAfter={healthRequests:fixture.network.healthRequests,socketUpgrades:fixture.network.socketUpgrades,joins:fixture.network.incomingTypes.join || 0};
   assert.deepEqual(networkAfter,before,'Missing setup must not attempt native signaling or room admission');
   await tapStable(node=>label('Rooms')(node) && node.class==='android.widget.Button');
-  for (const [id,direction] of [['host-button','up'],['join-button','down']]) {
-    let action;
-    for(let attempt=0;attempt<6;attempt++) {
-      action=(await hierarchy()).find(node=>node['resource-id']===id && visible(node));
-      if(action)break;
-      await adb(['shell','input','swipe','355',direction==='up'?'470':'1060','355',direction==='up'?'1060':'470','450']);await delay(500);
-    }
-    assert.ok(action,`Native setup visibility check failed: ${id} was not exposed after returning to Rooms`);
+  for (const id of ['host-button','join-button']) {
+    const action=await findNativeRoomAction(node=>node['resource-id']===id);
     assert.equal(action.enabled,'true','Setup guidance must leave both room actions usable after returning to Rooms');
   }
   checkpoint('freshInternetSetupGuidance',{passed:true,ownerAction:'Create a room',serviceInputFocused:true,actionableServiceAndPairingFields:true,persistentSetupHint:true,hostModalClosed:true,noAdmissionAttempt:true,roomActionsRemainUsable:true});
+}
+
+async function checkPublicRoomStart(fixture) {
+  phase='fresh Android public room start';console.log(phase);
+  const before={healthRequests:fixture.network.healthRequests,socketUpgrades:fixture.network.socketUpgrades,joins:fixture.network.incomingTypes.join || 0};
+  const create=await findNativeRoomAction(node=>node['resource-id']==='host-button');
+  assert.equal(create.enabled,'true');await tap(create);
+  const code=await findNode(node=>node['resource-id']==='room-code' && /A1\.[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}/i.test(node.text || node['content-desc'] || ''),60000);
+  assert.ok(code,'Fresh Android must open a public room and expose a share code without a service/pairing form');
+  await findNode(label('Turn microphone on'));
+  assert.ok(!(await hierarchy()).some(node=>node['resource-id']==='camera-button'), 'Screen and audio room has no camera control');
+  const projection=await adb(['shell','dumpsys','media_projection']);
+  assert.ok(!projection.includes('local.auralink.mobile'),'Starting a public room must not silently capture the screen');
+  const types=await callServiceTypes(0x10);
+  assert.equal(types&0xc2,0,'An open room without media may use connectedDevice, but cannot declare active microphone, camera or playback');
+  assert.deepEqual({healthRequests:fixture.network.healthRequests,socketUpgrades:fixture.network.socketUpgrades,joins:fixture.network.incomingTypes.join || 0},before,'Public setup must not use the separate Nearby fixture');
+  checkpoint('freshPublicRoomOpened',{passed:true,systemPkiCoordinator:true,shareCodeShapeVerified:true,microphoneOff:true,noCameraControl:true,screenProjectionAbsent:true,connectedDeviceRoomService:true,noMicrophoneCameraOrPlaybackType:true});
+  const beforeCode=code.text || code['content-desc'];
+  const processBefore=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
+  await adb(['shell','input','keyevent','3']);await delay(5000);
+  await callServiceTypes(0x10);
+  await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
+  const retained=await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===beforeCode);
+  assert.ok(retained,'Returning to an open room must retain the exact room capability rather than opening a replacement');
+  assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
+  await findNode(label('Turn microphone on'));
+  assert.ok(!(await hierarchy()).some(node=>node['resource-id']==='camera-button'));
+  checkpoint('openPublicRoomHomeReturn',{passed:true,existingRoomCodeRetained:true,sameProcess:true,roomServiceRemainsActive:true,microphoneRemainsOff:true,noCameraControl:true});
+  const pendingCode='A1.00000000-0000-4000-8000-000000000004.'+'A'.repeat(43);
+  await adb(['shell','am','start','-a','android.intent.action.VIEW','-d','auralink://join#code='+pendingCode,'-n','local.auralink.mobile/.MainActivity']);
+  await findNativeRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
+  await findNode(node=>/A new invitation is ready\. Leave your current room/.test(node.text || ''));
+  await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===beforeCode);
+  assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore,'App invitation must reuse the current process');
+  await tapRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
+  checkpoint('nativeAppInvitationWhileRoomOpen',{passed:true,actualAndroidViewIntent:true,currentRoomRetained:true,sameProcess:true,newInvitationRequiresLeavingCurrentRoom:true,noCaptureOrControlGranted:true});
+  await tapRoomAction(label('Leave room'));
+  await findNativeRoomAction(node=>node['resource-id']==='join-button' && node.enabled==='true');
+  checkpoint('freshPublicRoomLeftBeforeNearbyRegression');
 }
 
 async function runUI(fixture) {
   phase='production APK lobby';console.log(phase);
   await findNode(node=>node.package==='local.auralink.mobile' && /Rooms|Your space|Settings/.test(node.text),60000);await screenshot('android-emulator-lobby.png');
   checkpoint('productionLobbyRendered');
-  if (freshSetupRegression) await checkFreshInternetSetup(fixture);
+  if (publicLifecycleRegression) await checkPublicRoomStart(fixture);
+  else if (freshSetupRegression) await checkFreshInternetSetup(fixture);
   if(process.argv.includes('--control')) {
     // Start after cold WebView startup instead of racing the Accessibility
     // binding deadline with first-launch provider initialization. Only this
@@ -459,11 +562,7 @@ async function runUI(fixture) {
     await adb(['shell','settings','put','secure','accessibility_enabled','1']);
     await accessibilityBound();checkpoint('actualAccessibilityServiceBound');
   }
-  let join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
-  for(let count=0;!join && count<3;count++) {
-    await adb(['shell','input','swipe','355','1060','355','470','450']);await delay(1000);join=(await hierarchy()).find(node=>label('Enter invitation')(node) && visible(node));
-  }
-  assert.ok(join,'Scroll the production lobby to the invitation action');await tap(join);
+  await tapRoomAction(node=>node['resource-id']==='join-button');
   phase='production invitation dialog';
   await invitationFields();
   await screenshot('android-emulator-invitation-dialog.png');
@@ -487,6 +586,7 @@ async function runUI(fixture) {
   checkpoint('nativePinnedRoomAdmitted');
   const audio=await startPhoneAudio(fixture);
   checkpoint('actualAudioTransport',audio);
+  if(publicLifecycleRegression)await checkCallHomeReturn(fixture,audio);
   phase='Android owner screen permission';console.log(phase);
   await tapRoomAction(label('Share screen'));
   const systemCaptureButton=node=>node.package==='com.android.systemui' && node.class==='android.widget.Button' && /^(Start now|Start recording|Start sharing|Share screen)$/i.test(node.text);
@@ -516,6 +616,7 @@ async function runUI(fixture) {
   assert.ok(foregroundType && (parseInt(foregroundType[1],16)&0x80)!==0,'Active screen sharing with microphone must declare the microphone foreground service type');
   audio.checks.push('Screen projection declares active microphone foreground service type');
   checkpoint('foregroundProjectionAndMicrophoneService');
+  if(publicLifecycleRegression)await checkProjectionRotation(fixture);
   let control=null;
   if(process.argv.includes('--control')) {
     phase='separate attended phone control approval';console.log(phase);

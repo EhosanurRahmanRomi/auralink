@@ -1,5 +1,5 @@
 import { RoomRTC } from './rtc.js';
-import { InternetDirectory, internetOrigin, internetInvitation } from './internet.js';
+import { InternetDirectory, internetOrigin, internetInvitation, DEFAULT_PUBLIC_ORIGIN, roomInvitation, roomCode } from './internet.js';
 import { createDesktopInternetSocket } from './desktop-internet.js';
 
 const icons = {
@@ -7,8 +7,6 @@ const icons = {
   monitor: '<rect x="3" y="3" width="18" height="13" rx="2"/><path d="M8 21h8m-4-5v5"/>',
   settings: '<path d="m9 3-1 3-3 1-2 3 2 3 1 3 3 1 1 3h4l1-3 3-1 2-3-1-3-1-3-3-1-1-3Z"/><circle cx="12" cy="12" r="3"/>',
   shield: '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z"/><path d="m8 12 3 3 5-6"/>',
-  video: '<rect x="3" y="5" width="12" height="14" rx="3"/><path d="m15 9 6-3v12l-6-3"/>',
-  'video-off': '<path d="m3 3 18 18M10 5h2a3 3 0 0 1 3 3v1l6-3v12l-3-1.5M15 15v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V8"/>',
   mic: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8"/>',
   'mic-off': '<path d="m3 3 18 18M9 9v2a3 3 0 0 0 5 2M9 5a3 3 0 0 1 6 0v5M5 10v2a7 7 0 0 0 12 5m2-7v2m-7 7v3m-4 0h8"/>',
   link: '<path d="m10 13 4-4m-6 7-2 2a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m4 2a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-2 2" transform="translate(1 1) scale(.92)"/>',
@@ -42,17 +40,20 @@ const state = {
   pendingControl: null, controlTimer: null, grantTimer: null, audioElements: new Map(), speakerPool: [], nativeInfo: null,
   audioContext: null, silentOutput: null, microphoneMonitor: null, microphoneTest: null, speaker: true, phoneScreen: null,
   mediaPending: new Map(), sharingPending: false,
+  relayPlaybackBlocked: false, relayCompatibilityNotified: false,
   leaving: false, epoch: 0, preparing: null, preparingHost: false, preparingInternet: false,
   started: 0, lastMove: 0, seq: 0, pressed: new Set(), pressedButtons: new Set(), lastPoint: { x: .5, y: .5 }, statsTimer: null, durationTimer: null,
 };
 let preferences;
 try { preferences = JSON.parse(localStorage.getItem('auralink.preferences') || '{}'); } catch { preferences = {}; }
-preferences = { name: 'My device', quality: 'auto', stun: '', microphone: '', camera: '', speaker: '', internetOrigin: '', internetOnline: false, ...preferences };
+preferences = { name: 'My device', quality: 'auto', stun: '', microphone: '', speaker: '', internetOrigin: '', internetOnline: false, ...preferences };
+delete preferences.camera;
 if (!['auto', '720', '1080', '1440'].includes(preferences.quality)) preferences.quality = 'auto';
 preferences.name = String(preferences.name).slice(0, 48) || 'My device';
 preferences.stun = String(preferences.stun || '');
-for (const key of ['microphone', 'camera', 'speaker']) if (typeof preferences[key] !== 'string' || preferences[key].length > 256 || /[\x00-\x1f]/.test(preferences[key])) preferences[key] = '';
+for (const key of ['microphone', 'speaker']) if (typeof preferences[key] !== 'string' || preferences[key].length > 256 || /[\x00-\x1f]/.test(preferences[key])) preferences[key] = '';
 $('display-name').value = preferences.name;
+$('quick-name').value = preferences.name;
 $('join-name').value = preferences.name;
 $('settings-quality').value = preferences.quality;
 $('quality-select').value = preferences.quality;
@@ -100,7 +101,8 @@ document.querySelectorAll('[data-close]').forEach((button) => button.addEventLis
 document.querySelectorAll('.nav-item').forEach((button) => button.addEventListener('click', () => showView(button.dataset.view)));
 document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showView('rooms'); });
 $('help-button').addEventListener('click', () => openDialog('help-dialog'));
-$('host-button').addEventListener('click', () => {
+$('host-button').addEventListener('click', () => openPublicRoom());
+$('advanced-host-button').addEventListener('click', () => {
   if (!bridge?.hostRoom) $('host-mode').value = 'internet';
   updateHostMode();
   if ($('host-mode').value === 'internet' && !internetRoomPreflight()) return;
@@ -117,8 +119,77 @@ function updateInviteDetails() {
   const globalRoom = state.room?.internet === true;
   $('invite-fingerprint-box').hidden = globalRoom;
   $('invite-fingerprint').textContent = state.room?.fingerprint || 'No fingerprint available';
-  $('invite-help').textContent = globalRoom ? 'The guest pairs with your private Internet service first. This invitation requests entry; you still approve them.' : 'Start with devices on the same Wi-Fi. Browser users must trust the host certificate; verify its fingerprint before proceeding.';
+  $('invite-help').textContent = state.room?.access === 'invite' ? 'Anyone with this invitation can join while it is open. Share it privately. Screen sharing and remote control need separate permission.' : globalRoom ? 'The guest pairs with your private Internet service first. This invitation requests entry; you still approve them.' : 'Start with devices on the same Wi-Fi. Browser users must trust the host certificate; verify its fingerprint before proceeding.';
+  $('invite-description').textContent = state.room?.access === 'invite' ? 'Send the code or link to someone you want here. They can join immediately while invitations are open.' : 'Send this invitation privately. Anyone with it can request access; you still approve each participant.';
 }
+function renderRoomInvitation() {
+  const publicRoom = state.room?.access === 'invite' && state.joined;
+  // Only the owner receives rotated capabilities. An admitted guest must not
+  // offer a stale invitation after the owner has replaced it.
+  $('invite-button').hidden = publicRoom && !state.isHost;
+  $('invite-button').disabled = publicRoom && state.room.inviteEnabled === false;
+  $('room-invitation-bar').hidden = !publicRoom || !state.isHost;
+  $('room-security-bar').hidden = !publicRoom || !state.isHost;
+  if (!publicRoom) return;
+  const enabled = state.room.inviteEnabled !== false;
+  if (!enabled && $('invite-dialog').open) $('invite-dialog').close();
+  $('room-code').value = enabled ? roomCode(state.room) || state.room.invite || '' : 'Invitation closed';
+  for (const id of ['copy-room-code', 'copy-room-link', 'lock-room-button']) $(id).disabled = !enabled;
+  $('room-access-status').textContent = enabled ? 'Invitations open · anyone with the link can join' : 'Room locked · old invitations cannot join';
+  $('lock-room-button').textContent = enabled ? 'Lock room' : 'Room locked';
+}
+async function copyRoomValue(value, label) {
+  if (!value) return;
+  try { if (bridge?.copyText) await bridge.copyText(value); else await navigator.clipboard.writeText(value); toast(`${label} copied. Share it privately.`); }
+  catch { $('room-code').focus(); $('room-code').select(); toast('Copy the selected invitation from this field.'); }
+}
+$('copy-room-code').addEventListener('click', () => copyRoomValue(roomCode(state.room) || state.room?.invite, 'Room code'));
+$('copy-room-link').addEventListener('click', () => copyRoomValue(state.room?.invite, 'Invitation link'));
+$('lock-room-button').addEventListener('click', () => { if (state.isHost && state.room?.access === 'invite') send({ type: 'burn-invite' }); });
+$('rotate-room-invite').addEventListener('click', () => { if (state.isHost && state.room?.access === 'invite') send({ type: 'rotate-invite' }); });
+$('room-people-button').addEventListener('click', () => showView('devices'));
+function updateQuickName() {
+  preferences.name = $('quick-name').value.trim().slice(0, 48) || 'My device'; $('display-name').value = preferences.name; $('join-name').value = preferences.name; savePreferences();
+}
+$('quick-name').addEventListener('change', updateQuickName);
+$('cancel-room-start').addEventListener('click', () => leaveRoom());
+async function openPublicRoom() {
+  updateQuickName(); const epoch = beginAdmission(null, 'internet'); if (epoch === null) return;
+  prepareListening(); setStatus('Opening your room…', 'waiting');
+  try {
+    await configureSpeakers(); if (!admissionCurrent(epoch)) return;
+    await internet.openPublic(DEFAULT_PUBLIC_ORIGIN, { name: preferences.name }); if (!admissionCurrent(epoch)) return;
+    const room = await internet.createRoom(`${preferences.name}’s room`); if (!admissionCurrent(epoch)) return;
+    state.room = { ...room, access: 'invite', public: true }; await connect(state.room, true);
+  } catch (error) { if (state.epoch === epoch) { toast(`Could not open the room: ${cleanError(error)}`, true); if (!state.joined) await leaveRoom(); } }
+}
+$('quick-join-form').addEventListener('submit', async event => {
+  event.preventDefault(); let room;
+  try { room = roomInvitation($('quick-join-invite').value); if (!room) throw new Error('Paste an Internet room code or link. Use the Nearby option for a local invitation.'); }
+  catch (error) { toast(cleanError(error), true); $('quick-join-invite').focus(); return; }
+  updateQuickName(); const epoch = beginAdmission(null, 'internet'); if (epoch === null) return;
+  prepareListening(); setStatus('Joining the room…', 'waiting');
+  try {
+    await configureSpeakers(); if (!admissionCurrent(epoch)) return;
+    await internet.openPublic(room.url, { name: preferences.name }); if (!admissionCurrent(epoch)) return;
+    state.room = { ...room, access: 'invite', public: true, name: 'Invited room' }; await connect(state.room, false);
+  } catch (error) { if (state.epoch === epoch) { toast(`Could not join the room: ${cleanError(error)}`, true); if (!state.joined) await leaveRoom(); } }
+});
+let appInvitationInFlight = '';
+function receiveAppInvitation(code) {
+  if (!code) return;
+  try { const parsed = roomInvitation(code); if (!parsed?.internet || !String(code).startsWith('A1.')) throw new Error('The app received an incomplete invitation.'); }
+  catch (error) { toast(cleanError(error), true); return; }
+  if ((state.joined || state.joining) && (roomCode(state.room) === code || state.joining && appInvitationInFlight === code)) return;
+  $('quick-join-invite').value = code;
+  if (state.joined || state.joining || state.leaving) {
+    $('incoming-invite-banner').hidden = false; toast('A new invitation is ready. Your current room stays connected.'); return;
+  }
+  for (const id of ['host-dialog', 'join-dialog']) if ($(id).open) $(id).close();
+  showView('rooms'); $('incoming-invite-banner').hidden = true; appInvitationInFlight = code; $('quick-join-form').requestSubmit();
+}
+bridge?.onInvitation?.(receiveAppInvitation);
+$('dismiss-incoming-invite').addEventListener('click', () => { $('incoming-invite-banner').hidden = true; $('quick-join-invite').value = ''; });
 function updateHostMode() {
   const globalRoom = $('host-mode').value === 'internet';
   $('host-port-field').hidden = globalRoom; $('host-port').required = !globalRoom;
@@ -131,7 +202,7 @@ function showInternetSettings(message = '', focus = 'internet-service') {
   // so that Settings and its focused field are actually usable on phones.
   for (const id of ['host-dialog', 'join-dialog']) if ($(id).open) $(id).close();
   $('internet-setup-hint').textContent = message; $('internet-setup-hint').hidden = !message;
-  showView('settings'); $('internet-settings').scrollIntoView({ block: 'start', behavior: 'smooth' });
+  showView('settings'); $('advanced-internet-settings').open = true; $('internet-settings').scrollIntoView({ block: 'start', behavior: 'smooth' });
   $(focus).focus();
 }
 document.querySelectorAll('[data-internet-settings]').forEach(button => button.addEventListener('click', () => showInternetSettings()));
@@ -152,27 +223,30 @@ function internetRoomPreflight(value = $('internet-service').value, nextStep = '
       return false;
     }
   }
-  if (internet.status === 'online' && internet.origin === origin) return true;
+  if (internet.status === 'online' && internet.origin === origin && internet.mode === 'private') return true;
   if (['connecting', 'retrying'].includes(internet.status)) {
     showInternetSettings(`Your Internet connection is still connecting. ${finish}`, 'internet-setup-hint'); return false;
   }
   // Saved, paired devices retain their normal reconnect behavior. A first
   // pairing is explicit through Go online, before any room admission starts.
   if (internet.identity(origin)) return true;
+  if (internet.mode === 'public' && internet.status === 'online') {
+    showInternetSettings(`Go offline to finish using the invitation connection, then enter your private group's pairing code and tap Go online. ${finish}`, 'internet-go-offline'); return false;
+  }
   showInternetSettings(`Enter the private pairing code supplied by your group owner, then tap Go online. ${finish}`, $('internet-pairing-code').value.trim() ? 'internet-go-online' : 'internet-pairing-code');
   return false;
 }
 function renderInternet() {
   const labels = { offline: 'Offline', connecting: 'Connecting…', online: 'Online', retrying: 'Reconnecting…' };
   $('internet-status').textContent = labels[internet.status]; $('internet-status').dataset.status = internet.status;
-  $('internet-lobby-status').textContent = internet.status === 'online' ? 'Your private devices are online' : internet.status === 'retrying' ? 'Reconnecting to your private devices' : 'Connect beyond your Wi-Fi';
+  $('internet-lobby-status').textContent = internet.mode === 'public' && internet.status === 'online' ? 'Invitation room connection active' : internet.status === 'online' ? 'Your private devices are online' : internet.status === 'retrying' ? 'Reconnecting' : 'Use your own connection';
   const busy = ['connecting', 'retrying'].includes(internet.status);
   $('internet-go-online').disabled = busy || internet.status === 'online';
   $('internet-go-offline').disabled = internet.status === 'offline';
   $('internet-forget').disabled = !internet.identity($('internet-service').value.trim()) && !internet.deviceId;
   $('internet-pairing-code').disabled = busy || internet.status === 'online';
   $('internet-service').disabled = busy || internet.status === 'online';
-  $('internet-account-hint').textContent = internet.status === 'online' ? 'Paired on this device. Your private group can see this device online; nobody can join a room or control it without approval.' : 'Use the same service address and private pairing code on your devices. The code is cleared after pairing. Your device credential stays on this device.';
+  $('internet-account-hint').textContent = internet.mode === 'public' && internet.status === 'online' ? 'Your invitation room is connected. Go offline before connecting a separate private group. Its saved credentials are kept.' : internet.status === 'online' ? 'Paired on this device. Your private group can see this device online; nobody can join a private-group room or control it without approval.' : 'Use the same service address and private pairing code on your devices. The code is cleared after pairing. Your device credential stays on this device.';
   if (!state.joined && !state.joining && !state.leaving) setStatus(internet.status === 'online' ? 'Internet ready' : internet.status === 'retrying' ? 'Internet reconnecting…' : internet.status === 'connecting' ? 'Going online…' : 'Ready on this device', busy ? 'waiting' : '');
   renderDevices();
 }
@@ -189,7 +263,7 @@ async function ensureInternetOnline(origin = $('internet-service').value) {
   origin = internetOrigin(origin);
   // Names stay fixed during a room. If preferences changed while in the
   // directory, reconnect before admission so the host sees the new name.
-  if (internet.status === 'online' && internet.origin === origin && internet.name === preferences.name) return;
+  if (internet.status === 'online' && internet.origin === origin && internet.name === preferences.name && internet.mode === 'private') return;
   if (!internet.identity(origin) && !$('internet-pairing-code').value.trim()) throw new Error('Enter the private pairing code supplied by your group owner, then tap Go online.');
   await internet.open(origin, { pairingKey: $('internet-pairing-code').value, name: preferences.name });
   $('internet-pairing-code').value = ''; $('internet-setup-hint').hidden = true; preferences.internetOrigin = origin; preferences.internetOnline = true; $('internet-service').value = origin; savePreferences(); renderInternet();
@@ -209,6 +283,7 @@ $('internet-forget').addEventListener('click', async () => {
   $('internet-forget').disabled = true;
   try {
     if (state.room?.internet || state.preparingInternet) await leaveRoom();
+    if (internet.mode === 'public') { internet.close(); toast('The invitation connection is closed. Private-group credentials were kept.'); return; }
     await internet.forget(); preferences.internetOnline = false; $('internet-pairing-code').value = ''; savePreferences(); toast('The service removed this device. Pair again before going online.');
   } catch (error) { toast(cleanError(error), true); }
   finally { renderInternet(); }
@@ -229,6 +304,16 @@ $('copy-invite').addEventListener('click', async () => {
 $('review-requests').addEventListener('click', () => { renderRequests(); openDialog('requests-dialog'); });
 $('diagnostics-toggle').addEventListener('click', () => { $('diagnostics').hidden = !$('diagnostics').hidden; refreshStats(); });
 $('diagnostics-close').addEventListener('click', () => { $('diagnostics').hidden = true; });
+$('copy-diagnostics').addEventListener('click', async () => {
+  const rtc = state.rtc; const epoch = state.epoch; if (!rtc) return;
+  try {
+    const rows = await rtc.stats(); if (!roomCurrent(epoch, rtc)) return;
+    // Diagnostics intentionally omit invitation keys, IDs and device names.
+    const text = JSON.stringify({ platform: bridge?.platform || 'browser', connections: rows.map(({ state, route, protocol, roundTripMs, downloadMbps, uploadMbps, incoming, outgoing, incomingCodec, outgoingCodec, fps, receivedAudioPackets, sentAudioPackets }) => ({ state, route, protocol, roundTripMs, downloadMbps, uploadMbps, incoming, outgoing, incomingCodec, outgoingCodec, fps, receivedAudioPackets, sentAudioPackets })) }, null, 2);
+    if (bridge?.copyText) await bridge.copyText(text); else await navigator.clipboard.writeText(text);
+    toast('Connection details copied.');
+  } catch (error) { if (roomCurrent(epoch, rtc)) toast(`Could not copy connection details: ${cleanError(error)}`, true); }
+});
 $('fullscreen-button').addEventListener('click', async () => {
   try { if (document.fullscreenElement) await document.exitFullscreen(); else await $('stage').requestFullscreen(); }
   catch (error) { toast(`Fullscreen: ${cleanError(error)}`, true); }
@@ -260,12 +345,15 @@ function prepareListening() {
     void audio.play().catch(() => {});
   }
   for (const audio of state.audioElements.values()) void playRemoteAudio(audio);
+  void state.rtc?.resumePlayback?.().catch(() => {});
 }
 async function updatePhoneAudioRoute() {
-  if (bridge?.setAudioRoute) await bridge.setAudioRoute({ active: Boolean(state.joined || state.microphoneTest), speaker: state.speaker });
+  const ongoing = Boolean(state.joined && (state.local.has('audio') || state.mediaPending.has('audio') || [...state.audioElements.values()].some(audio => audio.srcObject)));
+  const playback = Boolean(state.joined && [...state.audioElements.values()].some(audio => audio.srcObject));
+  if (bridge?.setAudioRoute) await bridge.setAudioRoute({ active: Boolean(state.joined || state.microphoneTest), ongoing, playback, speaker: state.speaker });
 }
 function updateAudioBanner() {
-  const blocked = [...state.audioElements.values()].some(audio => audio.dataset.blocked === 'true');
+  const blocked = state.relayPlaybackBlocked || [...state.audioElements.values()].some(audio => audio.dataset.blocked === 'true');
   $('audio-banner').hidden = !blocked;
 }
 async function playRemoteAudio(audio) {
@@ -284,11 +372,10 @@ $('phone-speaker-toggle').addEventListener('click', async () => {
   $('phone-speaker-toggle').setAttribute('aria-pressed', String(state.speaker));
   try { await updatePhoneAudioRoute(); } catch (error) { toast(`Audio route: ${cleanError(error)}`, true); }
 });
-function mediaError(error, kind) {
-  const name = kind === 'audio' ? 'microphone' : 'camera';
-  if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) return `Allow ${name} access in your device privacy settings, then try again. ${kind === 'audio' ? 'Windows: Settings → Privacy & security → Microphone, including desktop apps.' : ''}`;
-  if (['NotReadableError', 'TrackStartError'].includes(error?.name)) return `Your ${name} could not start. Close another app using it, check the device connection, or select System default in Preferences.`;
-  if (error?.name === 'NotFoundError') return `No ${name} was found. Connect one and check the selected device in Preferences.`;
+function microphoneError(error) {
+  if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) return 'Allow microphone access in your device privacy settings, then try again. Windows: Settings → Privacy & security → Microphone, including desktop apps.';
+  if (['NotReadableError', 'TrackStartError'].includes(error?.name)) return 'Your microphone could not start. Close another app using it, check the device connection, or select System default in Preferences.';
+  if (error?.name === 'NotFoundError') return 'No microphone was found. Connect one and check the selected device in Preferences.';
   return cleanError(error);
 }
 function startMicrophoneMonitor(stream, { test = false } = {}) {
@@ -332,14 +419,14 @@ $('test-microphone').addEventListener('click', async () => {
   if (state.microphoneTest) { stopMicrophoneTest(); $('mic-test-status').textContent = 'Microphone test stopped.'; return; }
   prepareListening(); $('test-microphone').disabled = true;
   try {
-    const live = state.local.get('audio'); const stream = live?.stream || await captureMedia('audio');
+    const live = state.local.get('audio'); const stream = live?.stream || await captureMicrophone();
     if (!$('audio-check-dialog').open) { if (!live) stream.getTracks().forEach(track => track.stop()); return; }
     const test = { stream, owned: !live, monitor: startMicrophoneMonitor(stream, { test: true }), timer: null };
     state.microphoneTest = test; $('test-microphone').textContent = 'Stop test';
     await updatePhoneAudioRoute();
     test.timer = setTimeout(() => { stopMicrophoneTest(); $('mic-test-status').textContent += ' Test finished.'; }, 10000);
     await refreshDevices();
-  } catch (error) { stopMicrophoneTest(); $('mic-test-status').textContent = mediaError(error, 'audio'); }
+  } catch (error) { stopMicrophoneTest(); $('mic-test-status').textContent = microphoneError(error); }
   finally { $('test-microphone').disabled = false; }
 });
 $('test-speaker').addEventListener('click', async () => {
@@ -374,7 +461,7 @@ async function configureSpeakers(deviceId = preferences.speaker, warn = true) {
     if (deviceId && warn) toast(`Selected speaker unavailable; using system default. ${cleanError(error)}`, true);
   }
 }
-const deviceSelections = [['audioinput', 'microphone-device', 'microphone', 'Microphone'], ['videoinput', 'camera-device', 'camera', 'Camera'], ['audiooutput', 'speaker-device', 'speaker', 'Speaker']];
+const deviceSelections = [['audioinput', 'microphone-device', 'microphone', 'Microphone'], ['audiooutput', 'speaker-device', 'speaker', 'Speaker']];
 const editedDeviceSelections = new Set();
 let deviceRefreshGeneration = 0;
 for (const [, selectId] of deviceSelections) $(selectId).addEventListener('change', () => editedDeviceSelections.add(selectId));
@@ -397,7 +484,7 @@ async function refreshDevices(warn = false) {
       }
       select.value = chosen;
     }
-    $('device-help').textContent = devices.some((device) => device.label) ? 'Available equipment refreshed. Input changes apply the next time you enable mic or camera.' : 'Device names appear after camera or microphone permission. Refreshing does not enable either.';
+    $('device-help').textContent = devices.some((device) => device.label) ? 'Available equipment refreshed. Input changes apply the next time you enable your microphone.' : 'Device names appear after microphone permission. Refreshing does not enable it.';
   } catch (error) {
     if (generation !== deviceRefreshGeneration) return;
     $('device-help').textContent = 'Device list unavailable. You can still try the system default.'; if (warn) toast(cleanError(error), true);
@@ -415,8 +502,9 @@ $('save-settings').addEventListener('click', async () => {
   const stun = $('stun-server').value.trim();
   if (stun && !/^stuns?:[^\s]{1,220}$/i.test(stun)) { toast('Enter a STUN address beginning with stun: or stuns:, or leave the field blank.', true); return; }
   preferences.name = $('display-name').value.trim().slice(0, 48) || 'My device';
+  $('quick-name').value = preferences.name;
   preferences.quality = $('settings-quality').value; preferences.stun = stun;
-  preferences.microphone = $('microphone-device').value; preferences.camera = $('camera-device').value; preferences.speaker = $('speaker-device').value;
+  preferences.microphone = $('microphone-device').value; preferences.speaker = $('speaker-device').value;
   editedDeviceSelections.clear();
   const speakers = configureSpeakers(preferences.speaker);
   $('quality-select').value = preferences.quality;
@@ -494,12 +582,12 @@ async function connect(room, isHost) {
   $('session-eyebrow').textContent = isHost ? 'YOUR PRIVATE ROOM' : 'INVITED CONNECTION';
   $('invite-button').hidden = !isHost;
   $('session-subtitle').textContent = 'Connecting to the room host…';
-  $('stage-empty-text').textContent = isHost ? 'Invite someone, then choose what you want to share.' : 'The host must approve your request before the session starts.';
+  $('stage-empty-text').textContent = isHost ? 'Invite someone, then choose what you want to share.' : room.access === 'invite' ? 'Joining with your invitation. Microphone and screen sharing start off.' : 'The host must approve your request before the session starts.';
   setStatus('Connecting…', 'waiting'); updateButtons();
   if (room.internet) {
     state.socket = internet.socket;
     if (room.deviceId) internet.joinDevice(room.deviceId); else internet.joinRoom(room, isHost);
-    setStatus(isHost ? 'Opening Internet room…' : 'Awaiting host approval', 'waiting');
+    setStatus(isHost ? 'Opening Internet room…' : room.access === 'invite' ? 'Joining room…' : 'Awaiting host approval', 'waiting');
     return;
   }
   const socketURL = new URL('/ws', room.url); socketURL.protocol = 'wss:';
@@ -537,21 +625,22 @@ async function handleMessage(message) {
       if (state.room?.internet && state.room.roomId && message.room?.id !== state.room.roomId) return;
       if (state.room?.pendingSelfId && message.selfId !== state.room.pendingSelfId) return;
       state.selfId = message.selfId; state.hostId = message.hostId; state.joined = true; state.joining = false;
-      $('stage-empty-text').textContent = 'Turn on your microphone for a conversation, or share a camera or screen.';
+      if (message.room) state.room = { ...state.room, roomId: message.room.id, access: message.room.access || state.room.access, inviteEnabled: message.room.inviteEnabled };
+      $('stage-empty-text').textContent = 'Turn on your microphone to talk, or share your screen to show what you are working on.';
       void updatePhoneAudioRoute().catch(error => toast(`Audio output: ${cleanError(error)}`, true));
       if (message.room?.name || message.name || message.roomName) $('room-title').textContent = message.room?.name || message.roomName || message.name;
-      state.rtc = new RoomRTC({ selfId: state.selfId, signal: (to, data) => send({ type: 'signal', to, data }), iceServers: state.room?.internet ? message.iceServers || [] : preferences.stun ? [{ urls: preferences.stun }] : [], relaySecondsLimit: state.room?.internet ? message.relaySecondsLimit : 0, relayBytesLimit: state.room?.internet ? message.relayBytesLimit : 0, iceTransportPolicy: message.iceTransportPolicy || 'all' });
+      state.rtc = new RoomRTC({ selfId: state.selfId, signal: (to, data) => send({ type: 'signal', to, data }), iceServers: state.room?.internet ? message.iceServers || [] : preferences.stun ? [{ urls: preferences.stun }] : [], relaySecondsLimit: state.room?.internet ? message.relaySecondsLimit : 0, relayBytesLimit: state.room?.internet ? message.relayBytesLimit : 0, iceTransportPolicy: message.iceTransportPolicy || 'all', relayKey: message.relayKey, websocketRelayEnabled: message.websocketRelayEnabled === true, relayLimits: message.websocketRelayLimits });
       $('internet-relay-note').hidden = !state.room?.internet;
-      $('internet-relay-note').textContent = message.relayEnabled ? 'Direct connection first. Relay availability depends on the free allowance; this test room stops when its relay safety limit is reached.' : 'Direct connection only. Relay is unavailable, so some mobile and restricted networks cannot connect.';
+      $('internet-relay-note').textContent = message.websocketRelayEnabled ? 'Direct connection first, with encrypted Secure relay when needed. Connection details show actual quality. Free relay time and data limits apply.' : message.relayEnabled ? 'Direct connection first. Relay availability depends on the free allowance; this test room stops when its relay safety limit is reached.' : 'Direct connection only. Relay is unavailable, so some mobile and restricted networks cannot connect.';
       state.rtc.setVideoLimits(preferences.quality);
       bindRTC();
       for (const peer of message.peers || []) addPeer(peer);
       state.started = Date.now();
       state.statsTimer = setInterval(refreshStats, 2000);
       state.durationTimer = setInterval(updateDuration, 1000);
-      setStatus('Room connected'); updateRoomSubtitle(); updateButtons(); renderParticipants(); renderDevices();
-      if (state.isHost) { prepareInvite(); $('invite-value').value = state.room.invite; updateInviteDetails(); openDialog('invite-dialog'); }
-      else toast('The host accepted your request. Choose when to turn on your microphone or camera.');
+      setStatus('Room connected'); updateRoomSubtitle(); updateButtons(); renderParticipants(); renderDevices(); renderRoomInvitation();
+      if (state.isHost && state.room.access !== 'invite') { prepareInvite(); $('invite-value').value = state.room.invite; updateInviteDetails(); openDialog('invite-dialog'); }
+      else if (!state.isHost) toast(state.room.access === 'invite' ? 'You joined the room. Turn on your microphone or share your screen when you are ready.' : 'The host accepted your request. Turn on your microphone or share your screen when you are ready.');
       break;
     case 'join-request':
       if (state.isHost) { state.requests.set(message.peerId, { id: message.peerId, name: message.name || 'Guest' }); renderRequests(); toast(`${String(message.name || 'A guest').slice(0, 48)} is requesting to join.`); }
@@ -563,6 +652,16 @@ async function handleMessage(message) {
       state.requests.delete(message.peer?.id || message.peerId); renderRequests(); updateRoomSubtitle(); break;
     case 'peer-left':
       await removePeer(message.peerId || message.id); break;
+    case 'invite-disabled': case 'invite-status':
+      if (state.room?.access !== 'invite' || message.roomId !== state.room.roomId) return;
+      state.room.inviteEnabled = message.inviteEnabled === true; renderRoomInvitation(); break;
+    case 'invite-updated':
+      if (!state.isHost || state.room?.access !== 'invite' || message.roomId !== state.room.roomId || !/^[A-Za-z0-9_-]{43}$/.test(message.roomKey || '')) return;
+      state.room.roomKey = message.roomKey; state.room.inviteEnabled = true;
+      state.room.invite = `${state.room.url}/#${new URLSearchParams({ internet: '1', room: state.room.roomId, key: state.room.roomKey })}`;
+      renderRoomInvitation(); toast('New invitation ready. The old invitation no longer works.'); break;
+    case 'peer-kicked': case 'peer-blocked':
+      if (state.isHost) toast(message.type === 'peer-blocked' ? 'Participant removed and the old invitation closed. Share a new invitation with the people you trust.' : 'Participant removed. They can use the invitation again while it remains open.'); break;
     case 'signal':
       if (message.data?.controlStop) {
         const sessionId = message.data.controlStop.sessionId;
@@ -599,6 +698,11 @@ async function handleMessage(message) {
     case 'left': case 'room-left':
       if (state.room?.internet) await leaveRoom(false); break;
     case 'error':
+      if (message.code === 'websocket-relay-limit') {
+        const reason = message.message || message.reason || 'The secure relay allowance was reached. Try later or use Nearby.';
+        if (state.rtc?.stopWebsocketRelay) state.rtc.stopWebsocketRelay(reason); else toast(reason, true);
+        break;
+      }
       if (state.grant && !state.grant.confirmed) await revokeControl('The room did not confirm desktop control.');
       toast(message.message || message.reason || 'The room could not complete that request.', true);
       if (state.room?.internet && state.joining && !state.joined) await leaveRoom(); break;
@@ -619,21 +723,32 @@ async function removePeer(peerId) {
   const audio = state.audioElements.get(peerId); if (audio) { audio.srcObject = null; audio.dataset.blocked = 'false'; audio.remove(); state.audioElements.delete(peerId); state.speakerPool.push(audio); updateAudioBanner(); }
   if (state.selected?.peerId === peerId) state.selected = null;
   renderParticipants(); renderStage(); renderDevices(); renderRequests(); updateRoomSubtitle(); updateButtons();
+  void updatePhoneAudioRoute().catch(() => {});
 }
 function bindRTC() {
   const rtc = state.rtc; const epoch = state.epoch;
   const on = (type, listener) => rtc.addEventListener(type, event => { if (state.rtc === rtc && state.epoch === epoch && !state.leaving) void listener(event); });
+  on('playback-blocked', ({ detail }) => { state.relayPlaybackBlocked = Boolean(detail.blocked); updateAudioBanner(); });
+  on('relay-codec', ({ detail }) => {
+    if (!state.room?.internet) return;
+    $('internet-relay-note').hidden = false;
+    $('internet-relay-note').textContent = detail.compatibility ? 'Compatibility relay: screen detail is limited to 1280 pixels at about 4 fps. Microphone audio remains available. Free relay time and data limits apply.' : `Secure relay is using ${detail.codec || 'encoded'} screen transport. Read Connection details for actual received quality. Free relay time and data limits apply.`;
+    if (detail.compatibility && !state.relayCompatibilityNotified) { state.relayCompatibilityNotified = true; toast(detail.reason || 'Your media engine is using a lower-quality compatibility relay.', true, 12000); }
+  });
   on('relay-budget', ({ detail }) => { toast(detail.reason || 'The relay safety limit was reached. Your room has stopped.', true, 12000); void leaveRoom(); });
   on('track', ({ detail }) => {
     const tracks = state.tracks.get(detail.peerId); if (!tracks) return;
-    tracks.set(detail.kind, { track: detail.track, stream: new MediaStream([detail.track]) });
+    // Repeated state/signaling must not restart an unchanged presentation.
+    if (tracks.get(detail.kind)?.track === detail.track) return;
+    const stream = detail.stream?.getTracks().includes(detail.track) ? detail.stream : new MediaStream([detail.track]);
+    tracks.set(detail.kind, { track: detail.track, stream });
     if (detail.kind === 'audio') attachAudio(detail.peerId, detail.track);
     if (detail.kind === 'screen') state.selected = { peerId: detail.peerId, kind: 'screen' };
     renderParticipants(); renderStage(); updateButtons();
   });
   on('track-removed', async ({ detail }) => {
     state.tracks.get(detail.peerId)?.delete(detail.kind);
-    if (detail.kind === 'audio') { const audio = state.audioElements.get(detail.peerId); if (audio) { audio.srcObject = null; audio.dataset.blocked = 'false'; updateAudioBanner(); } }
+    if (detail.kind === 'audio') { const audio = state.audioElements.get(detail.peerId); if (audio) { audio.srcObject = null; audio.dataset.blocked = 'false'; updateAudioBanner(); } void updatePhoneAudioRoute().catch(() => {}); }
     if (detail.kind === 'screen' && state.controlling?.peerId === detail.peerId) clearControlling('Screen sharing ended.');
     if (state.selected?.peerId === detail.peerId && state.selected.kind === detail.kind) state.selected = null;
     renderParticipants(); renderStage(); updateButtons();
@@ -671,13 +786,14 @@ function attachAudio(peerId, track) {
   audio.muted = false; audio.volume = 1;
   audio.srcObject = new MediaStream([track]);
   track.addEventListener('unmute', () => { if (state.audioElements.get(peerId) === audio) void playRemoteAudio(audio); });
+  void updatePhoneAudioRoute().catch(() => {});
   void playRemoteAudio(audio);
 }
 
 function updateRoomSubtitle() {
   const count = state.peers.size + (state.joined ? 1 : 0);
   const connecting = [...state.peers.values()].some((peer) => peer.connection !== 'connected');
-  $('session-subtitle').textContent = state.joined ? `${count} of 4 participants · ${connecting ? 'Establishing media connections' : 'Ready for audio, video and sharing'}` : 'Waiting for the host';
+  $('session-subtitle').textContent = state.joined ? `${count} of 4 participants · ${connecting ? 'Establishing media connections' : 'Ready to share your screen or talk'}` : 'Waiting for the host';
 }
 function renderRequests() {
   $('pending-banner').hidden = state.requests.size === 0; $('request-count').textContent = state.requests.size;
@@ -705,14 +821,14 @@ function renderParticipants() {
   for (const peer of allParticipants()) {
     const item = document.createElement('button'); item.className = 'participant'; item.setAttribute('aria-label', `View ${peer.name}`);
     item.classList.toggle('selected', state.selected?.peerId === peer.id);
-    const camera = getTrack(peer.id, 'camera');
-    if (camera) { const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true; video.srcObject = camera.stream; item.append(video); }
+    const screen = getTrack(peer.id, 'screen');
+    if (screen) { const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; video.muted = true; video.srcObject = screen.stream; item.append(video); }
     else { const background = document.createElement('div'); background.className = 'participant-avatar'; const avatar = document.createElement('div'); avatar.className = 'avatar'; avatar.textContent = initials(peer.name); background.append(avatar); item.append(background); }
     const role = document.createElement('span'); role.className = 'participant-role'; role.textContent = peer.role === 'host' ? 'HOST' : peer.local ? 'YOU' : 'GUEST'; item.append(role);
     const label = document.createElement('span'); label.className = 'participant-label'; const name = document.createElement('span'); name.textContent = peer.name;
     const badge = document.createElement('span'); badge.className = 'participant-icons'; badge.innerHTML = icon(peer.media?.audio ? 'mic' : 'mic-off') + (getTrack(peer.id, 'screen') ? icon('monitor') : '');
     label.append(name, badge); item.append(label);
-    item.addEventListener('click', () => { state.selected = { peerId: peer.id, kind: getTrack(peer.id, 'screen') ? 'screen' : 'camera' }; renderStage(); renderParticipants(); updateButtons(); });
+    item.addEventListener('click', () => { state.selected = getTrack(peer.id, 'screen') ? { peerId: peer.id, kind: 'screen' } : null; renderStage(); renderParticipants(); updateButtons(); });
     $('participants').append(item);
   }
 }
@@ -720,9 +836,7 @@ function renderStage() {
   let item = state.selected && getTrack(state.selected.peerId, state.selected.kind);
   if (!item) {
     const screenPeer = allParticipants().find((peer) => getTrack(peer.id, 'screen'));
-    const cameraPeer = allParticipants().find((peer) => !peer.local && getTrack(peer.id, 'camera'));
-    const selectedPeer = screenPeer || cameraPeer;
-    state.selected = selectedPeer ? { peerId: selectedPeer.id, kind: screenPeer ? 'screen' : 'camera' } : null;
+    state.selected = screenPeer ? { peerId: screenPeer.id, kind: 'screen' } : null;
     item = state.selected && getTrack(state.selected.peerId, state.selected.kind);
   }
   const video = $('stage-video');
@@ -730,7 +844,7 @@ function renderStage() {
     if (video.srcObject !== item.stream) video.srcObject = item.stream;
     video.muted = true; video.hidden = false; $('stage-empty').hidden = true; $('stage-label').hidden = false;
     const peerName = state.selected.peerId === state.selfId ? 'Your' : `${state.peers.get(state.selected.peerId)?.name || 'Participant'}’s`;
-    $('stage-label-text').textContent = `${peerName} ${state.selected.kind === 'screen' ? 'screen' : 'camera'}`;
+    $('stage-label-text').textContent = `${peerName} screen`;
   } else {
     video.srcObject = null; video.hidden = true; $('stage-empty').hidden = false; $('stage-label').hidden = true;
   }
@@ -746,10 +860,18 @@ function renderDevices() {
     const card = document.createElement('article'); card.className = 'device-card';
     const glyph = document.createElement('span'); glyph.className = 'device-icon'; glyph.innerHTML = icon('monitor');
     const name = document.createElement('h3'); name.textContent = peer.name;
-    const detail = document.createElement('p'); detail.textContent = peer.local ? `${state.nativeInfo?.platform || bridge?.platform || 'Browser'} · ${state.joined ? 'In this room' : 'App open'}` : `${peer.role === 'host' ? 'Room host' : 'Room participant'} · Approved`;
+    const detail = document.createElement('p'); detail.textContent = peer.local ? `${state.nativeInfo?.platform || bridge?.platform || 'Browser'} · ${state.joined ? 'In this room' : 'App open'}` : `${peer.role === 'host' ? 'Room host' : 'Room participant'} · ${state.room?.access === 'invite' ? 'Invited' : 'Approved'}`;
     const status = document.createElement('div'); status.className = 'device-status'; const dot = document.createElement('span'); dot.className = 'local-dot';
     const statusLabel = peer.connection === 'connected' ? 'Connected' : peer.local ? 'Ready on this device' : `Media ${peer.connection || 'connecting'}`;
     status.append(dot, document.createTextNode(statusLabel)); card.append(glyph, name, detail, status); $('device-list').append(card);
+    if (state.isHost && state.room?.access === 'invite' && !peer.local) {
+      const actions = document.createElement('div'); actions.className = 'participant-actions';
+      for (const [type, label] of [['kick', 'Remove'], ['block', 'Remove & close invite']]) {
+        const button = document.createElement('button'); button.className = `button button-compact ${type === 'block' ? 'button-danger' : 'button-secondary'}`; button.textContent = label;
+        button.addEventListener('click', () => { if (state.isHost && state.joined && state.peers.has(peer.id)) send({ type, peerId: peer.id }); }); actions.append(button);
+      }
+      card.append(actions);
+    }
   }
   $('online-device-list').replaceChildren();
   const paired = internet.devices.filter(device => device.id !== internet.deviceId);
@@ -774,21 +896,19 @@ function renderDevices() {
 
 function updateButtons() {
   const ready = state.joined;
-  $('host-button').disabled = state.joined || state.joining || state.leaving;
-  $('join-button').disabled = state.joined || state.joining || state.leaving;
-  for (const id of ['mic-button', 'camera-button', 'share-button']) $(id).disabled = !ready;
+  for (const id of ['host-button', 'advanced-host-button', 'join-button', 'quick-join-button', 'quick-join-invite', 'quick-name']) $(id).disabled = state.joined || state.joining || state.leaving;
+  $('room-start-status').hidden = !state.joining || Boolean(state.room) || Boolean(state.preparing);
+  for (const id of ['mic-button', 'share-button']) $(id).disabled = !ready;
   if (state.mediaPending.has('audio')) $('mic-button').disabled = true;
-  if (state.mediaPending.has('camera')) $('camera-button').disabled = true;
   if (state.sharingPending) $('share-button').disabled = true;
   if (bridge?.platform === 'android' && !bridge?.startScreenShare) $('share-button').disabled = true;
   for (const [kind, buttonId, onIcon, offIcon, onText, offText] of [
     ['audio', 'mic-button', 'mic', 'mic-off', 'Mic on', 'Mic off'],
-    ['camera', 'camera-button', 'video', 'video-off', 'Camera on', 'Camera off'],
     ['screen', 'share-button', 'share', 'share', 'Stop sharing', 'Share screen'],
   ]) {
     const on = state.local.has(kind); const button = $(buttonId); button.classList.toggle('enabled', on);
     button.querySelector('[data-icon]').innerHTML = icon(on ? onIcon : offIcon); button.querySelector('small').textContent = on ? onText : offText;
-    button.setAttribute('aria-label', on ? (kind === 'screen' ? 'Stop sharing screen' : `Turn ${kind === 'audio' ? 'microphone' : 'camera'} off`) : (kind === 'screen' ? 'Share screen' : `Turn ${kind === 'audio' ? 'microphone' : 'camera'} on`));
+    button.setAttribute('aria-label', on ? (kind === 'screen' ? 'Stop sharing screen' : 'Turn microphone off') : (kind === 'screen' ? 'Share screen' : 'Turn microphone on'));
     if (kind === 'screen' && bridge?.platform === 'android' && !bridge?.startScreenShare) { button.querySelector('small').textContent = 'Phone sharing unavailable'; button.setAttribute('aria-label', 'Phone screen sharing is unavailable in this build'); }
   }
   const canRequest = ready && state.selected?.kind === 'screen' && state.selected.peerId !== state.selfId && !state.controlling && !state.pendingControl;
@@ -798,48 +918,48 @@ function updateButtons() {
   $('request-control').title = canRequest ? 'Ask the screen owner for desktop control' : 'Select another participant’s shared desktop to request control';
 }
 
-$('mic-button').addEventListener('click', () => toggleMedia('audio'));
-$('camera-button').addEventListener('click', () => toggleMedia('camera'));
-async function toggleMedia(kind) {
+$('mic-button').addEventListener('click', () => toggleMicrophone());
+async function toggleMicrophone() {
+  const kind = 'audio';
   if (!state.joined || state.mediaPending.has(kind)) return;
   const rtc = state.rtc; const epoch = state.epoch; const operation = {};
   state.mediaPending.set(kind, operation);
   prepareListening();
-  const button = $(kind === 'audio' ? 'mic-button' : 'camera-button'); button.disabled = true;
+  $('mic-button').disabled = true;
   try {
     if (state.local.has(kind)) {
       const item = state.local.get(kind); state.local.delete(kind); item.stream.getTracks().forEach((track) => track.stop()); await rtc.setTrack(kind, null);
-      if (kind === 'audio') stopMicrophoneMonitor();
+      stopMicrophoneMonitor();
     } else {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Camera and microphone require a trusted HTTPS connection and browser support.');
-      const stream = await captureMedia(kind, () => roomCurrent(epoch, rtc));
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture requires a trusted HTTPS connection and browser support.');
+      const stream = await captureMicrophone(() => roomCurrent(epoch, rtc));
       const track = stream.getTracks()[0];
       if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach((item) => item.stop()); return; }
       state.local.set(kind, { track, stream }); await rtc.setTrack(kind, track, stream);
       if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
-      if (kind === 'audio') { stopMicrophoneMonitor(); state.microphoneMonitor = startMicrophoneMonitor(stream); await updatePhoneAudioRoute(); }
+      stopMicrophoneMonitor(); state.microphoneMonitor = startMicrophoneMonitor(stream); await updatePhoneAudioRoute();
       await refreshDevices();
-      track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); state.rtc?.setTrack(kind, null); if (kind === 'audio') { stopMicrophoneMonitor(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; } updateButtons(); renderParticipants(); renderStage(); } });
+      track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); state.rtc?.setTrack(kind, null); stopMicrophoneMonitor(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); } });
     }
-  } catch (error) { if (roomCurrent(epoch, rtc)) { const message = mediaError(error, kind); if (kind === 'audio') { $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; } toast(`${kind === 'audio' ? 'Microphone' : 'Camera'}: ${message}`, true, 12000); } }
-  finally { if (state.mediaPending.get(kind) === operation) state.mediaPending.delete(kind); updateButtons(); renderParticipants(); renderStage(); }
+  } catch (error) { if (roomCurrent(epoch, rtc)) { $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; toast(`Microphone: ${microphoneError(error)}`, true, 12000); } }
+  finally { if (state.mediaPending.get(kind) === operation) state.mediaPending.delete(kind); if (roomCurrent(epoch, rtc)) void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); }
 }
-async function captureMedia(kind, current = () => true) {
+async function captureMicrophone(current = () => true) {
   if (bridge?.requestMedia) {
-    const permission = await bridge.requestMedia(kind === 'audio' ? 'microphone' : 'camera');
+    const permission = await bridge.requestMedia('microphone');
     if (permission?.ok === false || permission?.granted === false || permission === false) throw new DOMException(permission?.reason || 'Device permission denied.', 'NotAllowedError');
   }
   if (!current()) throw new DOMException('The capture request was cancelled.', 'AbortError');
-  const source = kind === 'audio' ? { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 } } : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 }, facingMode: { ideal: 'user' } };
-  const deviceId = preferences[kind === 'audio' ? 'microphone' : 'camera'];
-  const constraints = kind === 'audio' ? { audio: source, video: false } : { audio: false, video: source };
+  const source = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 }, sampleRate: { ideal: 48000 } };
+  const deviceId = preferences.microphone;
+  const constraints = { audio: source, video: false };
   if (deviceId) source.deviceId = { exact: deviceId };
   try { return await navigator.mediaDevices.getUserMedia(constraints); }
   catch (error) {
     if (!deviceId || !['NotFoundError', 'OverconstrainedError'].includes(error.name)) throw error;
     if (!current()) throw new DOMException('The capture request was cancelled.', 'AbortError');
-    delete source.deviceId; toast(`Selected ${kind === 'audio' ? 'microphone' : 'camera'} unavailable; trying system default.`);
-    preferences[kind === 'audio' ? 'microphone' : 'camera'] = ''; savePreferences();
+    delete source.deviceId; toast('Selected microphone unavailable; trying system default.');
+    preferences.microphone = ''; savePreferences();
     return navigator.mediaDevices.getUserMedia(constraints);
   }
 }
@@ -902,7 +1022,7 @@ async function beginPhoneSharing() {
   if (typeof MediaStreamTrackGenerator !== 'function' || typeof VideoFrame !== 'function' || typeof createImageBitmap !== 'function') throw new Error('Update Android System WebView to enable phone screen streaming, including sharing while another app is open.');
   const rtc = state.rtc; const epoch = state.epoch;
   $('share-button').disabled = true;
-  const screen = await bridge.startScreenShare({ quality: preferences.quality === '720' || preferences.quality === 'auto' ? '720p' : '1080p', microphone: state.local.has('audio'), camera: state.local.has('camera') });
+  const screen = await bridge.startScreenShare({ quality: preferences.quality === '720' || preferences.quality === 'auto' ? '720p' : '1080p', microphone: state.local.has('audio') });
   const captureId = phoneCaptureId(screen?.captureId);
   if (!roomCurrent(epoch, rtc)) { if (captureId) await bridge.stopScreenShare({ captureId }); return; }
   try {
@@ -1059,16 +1179,23 @@ $('stop-control').addEventListener('click', async () => {
   if (state.grant) await revokeControl('Desktop control stopped.');
   if (state.controlling) { const { peerId, sessionId } = state.controlling; releaseKeys(); send({ type: 'signal', to: peerId, data: { controlStop: { sessionId } } }); clearControlling('You released desktop control.'); }
 });
-bridge?.onEmergencyStop?.(reason => revokeControl(typeof reason === 'string' ? reason : 'Emergency stop: remote control revoked.'));
+bridge?.onEmergencyStop?.(async reason => {
+  const message = typeof reason === 'string' ? reason : 'Emergency stop: remote control revoked.';
+  if (message === 'Display layout changed. Select a screen and approve control again.') {
+    await revokeControl(message);
+    await stopSharing().catch(() => {});
+    toast(message, true, 12000);
+  } else await revokeControl(message);
+});
 bridge?.onMediaError?.(async reason => {
-  for (const kind of ['audio', 'camera']) {
+  for (const kind of ['audio']) {
     const item = state.local.get(kind); state.local.delete(kind);
     await state.rtc?.setTrack(kind, null); item?.stream.getTracks().forEach(track => track.stop());
   }
   stopMicrophoneMonitor(); updateButtons(); renderParticipants(); renderStage();
-  toast(reason || 'Android stopped microphone and camera capture. Stop sharing, then enable them again.', true, 12000);
+  toast(reason || 'Android stopped microphone capture. Stop sharing, then enable your microphone again.', true, 12000);
 });
-bridge?.onSessionStop?.((reason) => { leaveRoom(); toast(reason || 'The Android app moved to the background. Your room and media have stopped.'); });
+bridge?.onSessionStop?.((reason) => { leaveRoom(); toast(reason || 'The Android call ended. Your room and media have stopped.'); });
 
 function videoPoint(event, clamp = false) {
   const video = $('stage-video'); const rect = video.getBoundingClientRect();
@@ -1231,20 +1358,22 @@ for (const [id, deltaY] of [['remote-scroll-up', -250], ['remote-scroll-down', 2
 
 async function refreshStats() {
   if (!state.rtc || $('diagnostics').hidden) return;
-  const stats = await state.rtc.stats(); $('rtc-stats').replaceChildren();
+  const rtc = state.rtc; const epoch = state.epoch; const stats = await rtc.stats();
+  if (!roomCurrent(epoch, rtc) || $('diagnostics').hidden) return;
+  $('rtc-stats').replaceChildren();
   if (!stats.length) { const empty = document.createElement('p'); empty.className = 'empty-note'; empty.textContent = 'Invite a participant to see live measurements.'; $('rtc-stats').append(empty); }
   for (const measurement of stats) {
     const panel = document.createElement('div'); panel.className = 'stats-peer'; const name = document.createElement('strong'); name.textContent = measurement.name; panel.append(name);
     for (const [label, value] of [
       ['Media connection', measurement.state], ['Route', measurement.route ? `${measurement.route} · ${measurement.protocol || '—'}` : null],
-      ['Round-trip latency', measurement.roundTripMs !== null ? `${measurement.roundTripMs} ms` : null],
-      ['Download', measurement.downloadMbps !== null ? `${measurement.downloadMbps.toFixed(2)} Mbps` : null],
-      ['Upload', measurement.uploadMbps !== null ? `${measurement.uploadMbps.toFixed(2)} Mbps` : null],
-      ['Received video', measurement.incoming], ['Received frame rate', measurement.fps !== null ? `${measurement.fps} fps` : null],
-      ['Received codec', measurement.incomingCodec], ['Sent video', measurement.outgoing], ['Sent codec', measurement.outgoingCodec], ['Packet loss (total)', measurement.packetLoss !== null ? `${measurement.packetLoss.toFixed(1)}%` : null],
-      ['Audio received', measurement.receivedAudioPackets !== null ? `${measurement.receivedAudioPackets} packets` : null],
-      ['Audio sent', measurement.sentAudioPackets !== null ? `${measurement.sentAudioPackets} packets` : null], ['Audio codec', measurement.audioCodec],
-      ['Microphone level', measurement.microphoneLevel !== null ? `${Math.round(measurement.microphoneLevel * 100)}%` : null],
+      ['Round-trip latency', Number.isFinite(measurement.roundTripMs) ? `${measurement.roundTripMs} ms` : null],
+      ['Download', Number.isFinite(measurement.downloadMbps) ? `${measurement.downloadMbps.toFixed(2)} Mbps` : null],
+      ['Upload', Number.isFinite(measurement.uploadMbps) ? `${measurement.uploadMbps.toFixed(2)} Mbps` : null],
+      ['Received video', measurement.incoming], ['Received frame rate', Number.isFinite(measurement.fps) ? `${measurement.fps} fps` : null],
+      ['Received codec', measurement.incomingCodec], ['Sent video', measurement.outgoing], ['Sent codec', measurement.outgoingCodec], ['Packet loss (total)', Number.isFinite(measurement.packetLoss) ? `${measurement.packetLoss.toFixed(1)}%` : null],
+      ['Audio received', Number.isFinite(measurement.receivedAudioPackets) ? `${measurement.receivedAudioPackets} packets` : null],
+      ['Audio sent', Number.isFinite(measurement.sentAudioPackets) ? `${measurement.sentAudioPackets} packets` : null], ['Audio codec', measurement.audioCodec],
+      ['Microphone level', Number.isFinite(measurement.microphoneLevel) ? `${Math.round(measurement.microphoneLevel * 100)}%` : null],
       ['Playback', state.audioElements.get(measurement.peerId)?.dataset.blocked === 'true' ? 'Tap Enable sound' : state.audioElements.get(measurement.peerId)?.srcObject ? 'Enabled' : 'No remote microphone'],
     ]) {
       const row = document.createElement('div'); row.className = 'stat-row'; const key = document.createElement('span'); key.textContent = label; const val = document.createElement('strong'); val.textContent = value ?? '—'; row.append(key, val); panel.append(row);
@@ -1265,10 +1394,12 @@ async function leaveRoom(stopHost = true) {
   // Invalidate native host preparation before any cleanup awaits. Otherwise
   // a cancelled certificate/broker task can overwrite a replacement room.
   if (stopNearbyHost) { try { stoppingHost = bridge?.stopRoom?.(); } catch {} }
+  const cancelPublicSetup = state.preparingInternet && !state.room && internet.mode === 'public';
   state.leaving = true; state.epoch++; state.preparing = null; state.mediaPending.clear(); state.sharingPending = false;
   state.preparingHost = false; state.preparingInternet = false;
   const leavingInternetRoom = globalRoom && (state.joined || state.joining);
   state.joined = false; state.joining = false;
+  if (cancelPublicSetup) internet.close();
   updateButtons(); setStatus('Closing room…', 'waiting');
   // Stop outgoing media immediately, before native cleanup awaits. A lost
   // directory socket must never leave capture running during reconnect.
@@ -1292,12 +1423,12 @@ async function leaveRoom(stopHost = true) {
   if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch {} }
   try { await stoppingHost; } catch { /* Broker may already be stopped. */ }
   state.isHost = false; state.joined = false; state.joining = false; state.selfId = null; state.hostId = null; state.selected = null; state.sourceId = null; state.controlRequest = null; state.room = null;
-  $('audio-banner').hidden = true; await updatePhoneAudioRoute().catch(() => {});
+  state.relayPlaybackBlocked = false; state.relayCompatibilityNotified = false; $('audio-banner').hidden = true; await updatePhoneAudioRoute().catch(() => {});
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
   $('session').hidden = true; $('lobby').hidden = false; $('room-duration').textContent = '00:00';
   $('internet-relay-note').hidden = true;
   state.leaving = false;
-  setStatus(internet.status === 'online' ? 'Internet ready' : 'Ready on this device'); renderRequests(); renderParticipants(); renderStage(); renderDevices(); renderControl(); updateButtons();
+  setStatus(internet.status === 'online' ? 'Internet ready' : 'Ready on this device'); renderRequests(); renderParticipants(); renderStage(); renderDevices(); renderControl(); renderRoomInvitation(); updateButtons();
 }
 window.addEventListener('beforeunload', () => { state.rtc?.close(); bridge?.revokeControl(); state.socket?.close(); internet.close(); });
 
@@ -1306,6 +1437,7 @@ async function initialize() {
   try { state.nativeInfo = await bridge?.getInfo?.(); } catch { /* Browser clients do not expose native information. */ }
   const browserPlatform = /Android/i.test(navigator.userAgent) ? 'Android browser' : /Macintosh/i.test(navigator.userAgent) ? 'Mac browser' : /Windows/i.test(navigator.userAgent) ? 'Windows browser' : 'Browser client';
   $('profile-platform').textContent = state.nativeInfo?.platform || bridge?.platform || browserPlatform;
+  $('android-help').hidden = bridge?.platform !== 'android';
   if (bridge?.platform === 'android') {
     if (preferences.quality === '1440') { preferences.quality = '1080'; savePreferences(); }
     for (const id of ['quality-select', 'settings-quality']) {
@@ -1314,29 +1446,29 @@ async function initialize() {
       const phoneMaximum = select.querySelector('option[value="1080"]'); if (phoneMaximum) phoneMaximum.textContent = '1080p · phone maximum';
     }
     $('profile-platform').textContent = 'Android companion';
-    $('host-mode').value = 'internet'; $('host-button').title = 'Create an Internet room after pairing this phone';
-    const connectionText = $('lobby').querySelector('.connection-note p');
-    if (connectionText) connectionText.textContent = 'Use a nearby desktop invitation or pair this phone with your private Internet service. Phone sharing needs Android’s capture permission; phone control needs Auralink Accessibility and your separate approval. You can stop sharing outside the app.';
+    $('host-mode').value = 'internet'; $('host-button').title = 'Open an invitation room';
     $('share-button').title = 'Share your phone using Android screen-capture permission';
     $('phone-speaker-toggle').hidden = !bridge?.setAudioRoute;
   }
   renderDevices();
   await refreshDevices();
   if (!$('stage').requestFullscreen) { $('fullscreen-button').disabled = true; $('fullscreen-button').title = 'Fullscreen is unavailable in this browser'; }
-  if (!bridge?.hostRoom) { $('host-mode').value = 'internet'; $('host-button').title = 'Create an Internet room after pairing this device'; }
+  if (!bridge?.hostRoom) { $('host-mode').value = 'internet'; $('advanced-host-button').title = 'Create a private-group Internet room'; }
   updateHostMode(); renderInternet();
-  if (preferences.internetOnline && preferences.internetOrigin && internet.identity(preferences.internetOrigin)) {
-    void ensureInternetOnline(preferences.internetOrigin).catch(error => toast(cleanError(error), true));
-  }
   consumeInvitation();
+  try { receiveAppInvitation(await bridge?.getPendingInvitation?.()); } catch { /* A pending invitation can also arrive through the live listener. */ }
+  if (!state.joined && !state.joining && !state.leaving && preferences.internetOnline && preferences.internetOrigin && internet.identity(preferences.internetOrigin)) {
+    void ensureInternetOnline(preferences.internetOrigin).catch(error => { if (!state.joined && !state.joining && internet.mode === 'private') toast(cleanError(error), true); });
+  }
   updateButtons();
 }
 function consumeInvitation() {
   const params = new URLSearchParams(location.hash.slice(1));
   if (!params.has('key') || location.protocol !== 'https:') return;
-  $('join-invite').value = location.href;
+  const invite = location.href; $('join-invite').value = invite;
   try { history.replaceState(null, '', `${location.pathname}${location.search}`); } catch { /* Fragment remains local if history API unavailable. */ }
   if (state.joined || state.joining) toast('An invitation was received. Leave the current room before joining another.');
+  else if (params.get('internet') === '1' && location.origin === DEFAULT_PUBLIC_ORIGIN) { $('quick-join-invite').value = invite; showView('rooms'); $('quick-join-form').requestSubmit(); }
   else openDialog('join-dialog');
 }
 window.addEventListener('hashchange', consumeInvitation);
