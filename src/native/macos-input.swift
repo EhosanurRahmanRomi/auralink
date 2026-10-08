@@ -287,7 +287,7 @@ if CommandLine.arguments.contains("--self-test") {
     fieldChecks.append(buttonEvent(source: nil, button: 3, down: true, point: point, flags: [], clickCount: 1) == nil)
     fieldChecks.append(buttonEvent(source: nil, button: 0, down: true, point: point, flags: [], clickCount: 0) == nil)
     fieldChecks.append(buttonEvent(source: nil, button: 0, down: true, point: point, flags: [], clickCount: 4) == nil)
-    fieldChecks.append(buttonEvent(source: nil, button: 0, down: true, point: CGPoint(x: .infinity, y: 0), flags: [], clickCount: 1) == nil)
+    fieldChecks.append(buttonEvent(source: nil, button: 0, down: true, point: CGPoint(x: CGFloat.infinity, y: 0), flags: [], clickCount: 1) == nil)
     checks.append(contentsOf: fieldChecks)
     output(["type": "self-test", "passed": checks.allSatisfy { $0 }, "checks": checks.count,
             "clickTrackingChecks": clickChecks.count, "quartzClickFieldChecks": fieldChecks.count, "inputPosted": false])
