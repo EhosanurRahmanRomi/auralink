@@ -13,7 +13,10 @@ async function main(){
   let application,page,phase='launch';
   const errors=[];
   try{
-    application=await electron.launch({args:[root,'--smoke-test',`--user-data-dir=${profile}`],env,timeout:60000});
+    // A hosted runner has no camera. Supply a synthetic device so this check
+    // proves policy refusal, rather than merely a missing-device error. Screen
+    // capture still uses the actual native source picker and app window.
+    application=await electron.launch({args:[root,'--smoke-test',`--user-data-dir=${profile}`,'--use-fake-device-for-media-stream'],env,timeout:60000});
     application.process().stderr.on('data',data=>{const line=data.toString();if(/Error|Unhandled/i.test(line))errors.push(line);});
     page=await application.firstWindow();
     page.on('pageerror',error=>errors.push(error.message));
@@ -66,7 +69,7 @@ async function main(){
     await page.waitForFunction(()=>document.querySelector('#session').hidden);
     assert.equal(errors.length,0,errors.join('\n'));
     const sourceHashes=Object.fromEntries(['src/main.cjs','src/preload.cjs','src/renderer/app.js','src/renderer/rtc.js','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/internet.js'].map(file=>[file,createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex')]));
-    fs.writeFileSync(path.join(out,'desktop-smoke.json'),JSON.stringify({passed:true,isolatedUserData:true,checks:['Electron loads isolated renderer and test profile','settings persist within the test profile','real HTTPS room starts','pinned invitation generated','room diagnostics render','native camera capture denied','actual native app-window capture','capture stops','room teardown'],cameraPermission,capture,errors,sourceHashes},null,2));
+    fs.writeFileSync(path.join(out,'desktop-smoke.json'),JSON.stringify({passed:true,isolatedUserData:true,cameraDeviceFixture:'Synthetic device; production permission handlers unchanged',checks:['Electron loads isolated renderer and test profile','settings persist within the test profile','real HTTPS room starts','pinned invitation generated','room diagnostics render','native camera capture denied','actual native app-window capture','capture stops','room teardown'],cameraPermission,capture,errors,sourceHashes},null,2));
     console.log('Desktop smoke passed: window, preferences, HTTPS room, invitation, native app-window capture and teardown.');
   }catch(error){
     const diagnostics=page?await page.evaluate(()=>{
