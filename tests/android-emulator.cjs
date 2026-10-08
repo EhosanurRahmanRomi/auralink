@@ -550,12 +550,16 @@ async function checkPublicRoomStart(fixture) {
   await findNativeRoomAction(label('Turn microphone on'));
   assert.ok(!(await hierarchy()).some(node=>node['resource-id']==='camera-button'));
   checkpoint('openPublicRoomHomeReturn',{passed:true,existingRoomCodeRetained:true,sameProcess:true,roomServiceRemainsActive:true,microphoneRemainsOff:true,noCameraControl:true});
+  phase='native invitation intent while public room remains open';console.log(phase);
   const pendingCode='A1.00000000-0000-4000-8000-000000000004.'+'A'.repeat(43);
   await adb(['shell','am','start','-a','android.intent.action.VIEW','-d','auralink://join#code='+pendingCode,'-n','local.auralink.mobile/.MainActivity']);
+  phase='observe pending native invitation banner';console.log(phase);
   await findNativeRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
   await findNode(node=>/A new invitation is ready\. Leave your current room/.test(node.text || ''));
+  phase='verify original public room retained after invitation';console.log(phase);
   await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===beforeCode);
   assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore,'App invitation must reuse the current process');
+  phase='owner dismisses pending native invitation';console.log(phase);
   await tapRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
   checkpoint('nativeAppInvitationWhileRoomOpen',{passed:true,actualAndroidViewIntent:true,currentRoomRetained:true,sameProcess:true,newInvitationRequiresLeavingCurrentRoom:true,noCaptureOrControlGranted:true});
   if (testedMajor>0 || testedMinor>4 || testedMinor===4 && testedPatch>=1) await checkNativePublicRelayMedia(fixture,beforeCode);
