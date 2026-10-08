@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       build_android:
-        description: Build the deferred Android test package
+        description: Include the Android test package
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -153,7 +153,7 @@ jobs:
           retention-days: 7
 
   android-apk:
-    if: github.event_name == 'workflow_dispatch' && inputs.build_android
+    if: github.event_name == 'push' || inputs.build_android
     name: Android companion APK
     needs: checks
     runs-on: windows-latest

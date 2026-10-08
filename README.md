@@ -12,11 +12,11 @@
 
 </div>
 
-Auralink is an open-source screen-sharing and attended remote-control app. The current milestone focuses on **Windows 11 and Apple Silicon macOS**, with optional microphone audio. Camera calls, messaging, files and recording are outside the current scope. Android development is retained for later delivery.
+Auralink is an open-source screen-sharing and attended remote-control app for **Windows 11, Apple Silicon macOS and Android 10+**, with optional microphone audio. Camera calls, messaging, files and recording are outside the current scope.
 
 The room flow is **Open a room → copy its invitation → join from the other device**. Invitation holders enter automatically while invitations are open. Screen capture and remote control remain separate, deliberate actions.
 
-**0.4.1 repairs screen and microphone recovery.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). Both desktops must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
+**0.4.1 repairs screen and microphone recovery on Windows, Apple Silicon macOS and Android.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
 
 ## Download and connect
 
@@ -26,16 +26,19 @@ Expand **Assets** on the release page and choose a matching version:
 |---|---|
 | Windows 11 / x64 | Auralink-Setup-VERSION-Windows-x64.exe |
 | MacBook Air M4 / Apple Silicon, macOS 13+ | Auralink-VERSION-Mac-arm64.dmg |
+| Android 10+, including iQOO | Auralink-VERSION-Android.apk |
 
-Releases include checksums, source and a report describing the exact build and completed checks. Windows test installers are unsigned; Mac test builds are ad-hoc signed and unnotarized. Android delivery is deferred from this desktop milestone.
+Releases include checksums, source and a report describing the exact build and completed checks. Windows test installers are unsigned; Mac test builds are ad-hoc signed and unnotarized. Android uses the project's stable local development signing identity.
 
 1. Launch Auralink and click **Open a room**. Its built-in coordinator supplies the address; guests need no domain, account or pairing form.
 2. Share **Copy link** or **Copy code** privately. Open the link in Auralink or paste it into **Join room**. Native links depend on the installed package's protocol registration.
 3. Select **Share screen** and choose a display/window. Microphone audio is optional and starts off; use **Check sound** before enabling it.
-4. For remote help, view the other person's full-display share and **Request control**. The screen owner separately approves it. macOS also requires Accessibility permission.
+4. For remote help, view the other person's full-display share and **Request control**. The screen owner separately approves it. macOS requires Accessibility permission; Android requires its separately enabled attended Accessibility service and native owner confirmation.
 5. Stop with **Stop control**, **Stop sharing** or **Leave room**. Emergency stop: **Ctrl+Alt+Shift+Q** on Windows; **Command+Option+Shift+Q** on Mac.
 
 If a participant joins but screen or audio does not arrive, open **Connection → Retry through secure relay**. This reconnects the existing capture using the free fallback; control must be approved again. **Check sound** verifies your local microphone and speaker, while Connection details show actual packet counts and processing state. Use **Enable sound** when audio processing is paused after a native permission prompt.
+
+On Android, approve the system screen-sharing dialog and notification permission for visible Stop/End actions. Ordinary Home/return keeps the existing room and WebView; manufacturers can still stop apps under battery restrictions. Phone capture uses a selectable maximum 1280/1920-pixel long edge at up to 12 fps, rather than the desktop 1440p ceiling. A recent Android System WebView is required. Read the [Android guide](android/README.md) for capture, consent and battery/device boundaries.
 
 Hosts can remove participants, lock invitations and create new invitations. **Remove & close invite** removes that connection and invalidates the old code. A fresh anonymous app cannot be permanently identified as the same person; share new invitations only with people you trust.
 

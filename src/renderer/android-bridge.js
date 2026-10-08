@@ -213,7 +213,10 @@
       revokeControl: () => invoke('revokeControl'),
       applyInput: (args) => invoke('applyInput', args),
       inputStatus: () => invoke('inputStatus'),
-      setAudioRoute: (args) => invoke('setAudioRoute', args),
+      setAudioRoute: (args) => invoke('setAudioRoute', args).then((result) => {
+        if (result?.ok === false) throw new Error(String(result.reason || 'Android could not activate call audio.').slice(0, 240));
+        return result;
+      }),
       onScreenFrame: (listener) => {
         if (typeof listener !== 'function') return () => {};
         frameListeners.add(listener); return () => frameListeners.delete(listener);

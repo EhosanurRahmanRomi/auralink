@@ -95,7 +95,7 @@ public final class MainActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         root = new FrameLayout(this); webView = new WebView(this);
         root.addView(webView, new FrameLayout.LayoutParams(-1, -1)); setContentView(root);
-        callAudio = new CallAudio(this);
+        callAudio = new CallAudio(this, reason -> deliver(json("event", "media-error", "reason", reason)));
         // Android 15/16 enforce edge-to-edge. Reserve system bars and the keyboard
         // in native pixels so the mobile controls remain reachable on real phones.
         root.setOnApplyWindowInsetsListener((view, insets) -> {
@@ -295,7 +295,7 @@ public final class MainActivity extends Activity {
                 final String requestId = id; final boolean active = route.optBoolean("active", true), speaker = route.optBoolean("speaker", true);
                 Runnable update = () -> {
                     boolean ok = callAudio.update(active && (foreground || callSession() || projectionSession()), speaker);
-                    reply(requestId, json("ok", ok, "speaker", speaker, "reason", ok ? "" : "Android audio focus is busy. Retry after the other call ends."));
+                    reply(requestId, json("ok", ok, "speaker", speaker, "reason", ok ? "" : callAudio.lastError()));
                     if (!foreground && !transportPage()) stopSession("Call media ended while Auralink was in the background.");
                 };
                 if (active && roomMembership.hasRoom()) {
@@ -733,6 +733,7 @@ public final class MainActivity extends Activity {
     @Override protected void onStop() { super.onStop(); }
     @Override protected void onResume() {
         super.onResume(); foreground = true;
+        if (callAudio != null && !callAudio.resume()) deliver(json("event", "media-error", "reason", callAudio.lastError()));
         if (webView != null) {
             webView.onResume();
             if (!localDocument()) webView.loadUrl(PAGE);

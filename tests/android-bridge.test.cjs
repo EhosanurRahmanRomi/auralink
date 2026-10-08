@@ -90,6 +90,16 @@ test('Android capture cleanup preserves the opaque native session identifier', a
   assert.deepEqual(stopped, [{ reason: 'Owner stopped sharing.', captureId }]);
 });
 
+test('Android audio focus and route refusals reject instead of pretending the speaker is active', async () => {
+  let available = false;
+  const { bridge, messages } = setup({ response: message => message.method === 'setAudioRoute' ?
+    { ok: available, reason: 'Android could not select the call speaker.' } : { ok: true } });
+  await assert.rejects(bridge.setAudioRoute({ active: true, speaker: true }), /could not select the call speaker/);
+  available = true;
+  assert.equal((await bridge.setAudioRoute({ active: true, speaker: true })).ok, true);
+  assert.deepEqual(messages.map(message => message.method), ['setAudioRoute', 'setAudioRoute']);
+});
+
 test('old Android projection events cannot poison or stop a replacement capture', async () => {
   let captureId = 'old-native-capture';
   const { bridge, receive } = setup({ response: message => message.method === 'startScreenShare' ? { captureId } : { ok: true } });

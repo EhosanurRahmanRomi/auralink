@@ -1,6 +1,6 @@
 # Desktop device testing
 
-The active milestone is **Windows↔Apple Silicon macOS screen sharing, optional microphone audio and attended control**. Use matching versions. Camera calls and Android delivery are deferred. Package launch and synthetic media do not prove physical sound or MacBook permission behavior.
+The active milestone is **Windows, Apple Silicon macOS and Android screen sharing, optional microphone audio and attended control**. Use matching versions. Camera calls are excluded. Package launch and synthetic media do not prove physical sound, MacBook permissions or iQOO battery behavior.
 
 ## Room and invitation
 
@@ -56,4 +56,8 @@ For a local baseline use **Other connection options → Nearby / private room �
 
 Report release, OS, host direction, networks, route/codec/resolution/fps, permissions and reproducible steps. For sound include meter, speaker test and failing direction; for input include full display vs window and native consent. Exclude invitations, pairing/device tokens, ICE credentials and account identifiers.
 
-[Android development details](../android/README.md) are preserved without claiming physical iQOO success for this desktop milestone.
+## Android acceptance
+
+Install the matching APK as an update; it retains the project's local signing identity. On a recent Android System WebView, open a public room, use its invitation on Windows, enable microphones and test speech in both directions. Approve the separate Android screen-sharing prompt and notification permission, then switch to Home for a minute and return. The room, enabled microphone and selected share should remain; received motion/audio should advance while Home is foreground. A room without media should also survive Home/return without recreating its code.
+
+Test sharing/control both directions. Phone input requires the attended Accessibility service, native confirmation and active full-display projection; turning on Accessibility alone must not grant control. Use Stop control, the sharing notification and End session to verify revocation. Test rotation and Bluetooth only after built-in audio and portrait capture work. Review iQOO's battery/background settings if the operating system stops the app; forced process termination cannot preserve WebView media. The [Android guide](../android/README.md) lists the supported gestures and capture ceilings. Automated emulator proof does not establish physical iQOO performance.

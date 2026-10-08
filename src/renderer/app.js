@@ -1225,11 +1225,17 @@ bridge?.onEmergencyStop?.(async reason => {
   } else await revokeControl(message);
 });
 bridge?.onMediaError?.(async reason => {
+  const rtc = state.rtc, epoch = state.epoch;
   for (const kind of ['audio']) {
     const item = state.local.get(kind); state.local.delete(kind);
-    await state.rtc?.setTrack(kind, null); item?.stream.getTracks().forEach(track => track.stop());
+    item?.stream.getTracks().forEach(track => track.stop());
+    await rtc?.setTrack(kind, null).catch(() => {});
   }
+  if (!roomCurrent(epoch, rtc)) return;
+  state.relayCaptureSuspended = false; updateAudioBanner();
   stopMicrophoneMonitor(); updateButtons(); renderParticipants(); renderStage();
+  await updatePhoneAudioRoute().catch(() => {});
+  if (!roomCurrent(epoch, rtc)) return;
   toast(reason || 'Android stopped microphone capture. Stop sharing, then enable your microphone again.', true, 12000);
 });
 bridge?.onSessionStop?.((reason) => { leaveRoom(); toast(reason || 'The Android call ended. Your room and media have stopped.'); });

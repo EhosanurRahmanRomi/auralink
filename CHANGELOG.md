@@ -7,6 +7,8 @@
 - Added bounded screen-reader recovery, microphone track validation/cleanup, audio processing resumption after native prompts, and source/context/packet diagnostics.
 - Corrected macOS microphone refusal handling, shared overlapping permission prompts, invalidated stale screen selections, and rechecked Screen Recording access before capture.
 - Added regression cases for media queue saturation, capture backend failures, stopped microphone tracks during connection setup, and actual signed Mac microphone entitlements.
+- Included Android screen/audio/control delivery, retaining public rooms and native foreground services during ordinary Home/return. Audio routing now reports refused devices, restores prior settings and contains native focus-recovery exceptions.
+- Added native Android runtime coverage for public relay media, room/call background return, rotation, consented projection/input and owner revocation; physical iQOO behavior remains a separate device test.
 - Added a guarded backend Cloudflare TURN adapter. It remains disabled unless an operator verifies free-only account controls; it does not itself create a spending cap. The shipped default retains finite Cloudflare Workers Free relay allowances and contacts no Metered service.
 
 ## 0.4.0 — Desktop screen assistance

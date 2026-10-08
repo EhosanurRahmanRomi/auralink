@@ -229,8 +229,8 @@ async function rtcEvidence(page,predicate,arg,timeout=45000) {
 async function startPhoneAudio(fixture) {
   phase='actual Android microphone permission and RTP';console.log(phase);
   await tapRoomAction(label('Turn microphone on'));
-  const permission=await findNode(node=>node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
-  await screenshot('android-emulator-microphone-permission.png');await tap(permission);
+  const permission=await findNode(node=>label('Turn microphone off')(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
+  if (!label('Turn microphone off')(permission)) { await screenshot('android-emulator-microphone-permission.png');await tap(permission); }
   await findNode(label('Turn microphone off'),30000);
   await rtcEvidence(fixture.page,async id=>{
     const entry=rtc.peers.get(id);const stats=(await rtc.stats()).find(row=>row.peerId===id);
@@ -543,9 +543,129 @@ async function checkPublicRoomStart(fixture) {
   assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore,'App invitation must reuse the current process');
   await tapRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
   checkpoint('nativeAppInvitationWhileRoomOpen',{passed:true,actualAndroidViewIntent:true,currentRoomRetained:true,sameProcess:true,newInvitationRequiresLeavingCurrentRoom:true,noCaptureOrControlGranted:true});
+  if (testedMajor>0 || testedMinor>4 || testedMinor===4 && testedPatch>=1) await checkNativePublicRelayMedia(fixture,beforeCode);
   await tapRoomAction(label('Leave room'));
   await findNativeRoomAction(node=>node['resource-id']==='join-button' && node.enabled==='true');
   checkpoint('freshPublicRoomLeftBeforeNearbyRegression');
+}
+
+async function checkNativePublicRelayMedia(fixture,codeText) {
+  phase='production Android media through the public encrypted relay';console.log(phase);
+  const code=/A1\.([a-f0-9-]{36})\.([A-Za-z0-9_-]{43})/i.exec(codeText);
+  assert.ok(code,'Native public room must expose a complete invitation capability');
+  const originMatch=fs.readFileSync(path.join(receiverAssets,'internet.js'),'utf8').match(/DEFAULT_PUBLIC_ORIGIN\s*=\s*'([^']+)'/);
+  assert.ok(originMatch);const origin=new URL(originMatch[1]);assert.equal(origin.protocol,'https:');
+  const publicURL=new URL('/internet/ws',origin);publicURL.protocol='wss:';
+  // The remote socket uses Node's normal CA/hostname validation. Only the
+  // localhost page serving the actual renderer modules is a self-signed fixture.
+  const socket=new WebSocket(publicURL.href,{rejectUnauthorized:true,maxPayload:262144});
+  let page,peerId,heartbeat,chain=Promise.resolve(),active=false;
+  const inbox=[],waiters=[],errors=[],wire={sent:0,received:0,encryptedEnvelopesOnly:true};
+  const send=packet=>{
+    if(socket.readyState!==WebSocket.OPEN)return false;
+    if(packet.type==='signal' && packet.data?.relay) {
+      wire.sent++;const envelope=packet.data.relay;
+      wire.encryptedEnvelopesOnly &&= Object.keys(packet.data).join(',')==='relay' && Object.keys(envelope).sort().join(',')==='ciphertext,counter,epoch,nonce,version';
+    }
+    socket.send(JSON.stringify(packet));return true;
+  };
+  const take=(type,timeout=30000)=>{
+    const index=inbox.findIndex(packet=>packet.type===type);if(index>=0)return Promise.resolve(inbox.splice(index,1)[0]);
+    return new Promise((resolve,reject)=>{const pending={type,resolve};pending.timer=setTimeout(()=>{const index=waiters.indexOf(pending);if(index>=0)waiters.splice(index,1);reject(new Error('The public relay fixture did not complete '+type));},timeout);waiters.push(pending);});
+  };
+  socket.on('message',raw=>{
+    const packet=JSON.parse(raw.toString());
+    if(packet.type==='signal' && packet.data?.relay) {wire.received++;wire.encryptedEnvelopesOnly &&= Object.keys(packet.data).join(',')==='relay';}
+    if(packet.type==='signal' && active) {chain=chain.then(()=>page.evaluate(packet=>publicRTC.receive(packet.from,packet.data),packet)).catch(error=>errors.push(safeError(error)));return;}
+    const index=waiters.findIndex(pending=>pending.type===packet.type);
+    if(index>=0){const [pending]=waiters.splice(index,1);clearTimeout(pending.timer);pending.resolve(packet);}else inbox.push(packet);
+  });
+  socket.on('error',error=>errors.push(safeError(error)));
+  try {
+    await new Promise((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);});
+    send({type:'bootstrap',name:'Android public relay receiver'});await take('registered');
+    heartbeat=setInterval(()=>send({type:'ping'}),15000);
+    send({type:'join',roomId:code[1],roomKey:code[2]});const welcome=await take('welcome');
+    assert.equal(welcome.websocketRelayEnabled,true);assert.match(welcome.relayKey,/^[A-Za-z0-9_-]{43}$/);
+    assert.equal(welcome.peers.length,1,'The isolated public room contains exactly the production APK owner');peerId=welcome.peers[0].id;
+    page=await fixture.browser.newPage({ignoreHTTPSErrors:true});
+    await page.exposeFunction('publicSignal',(to,data)=>send({type:'signal',to,data}));
+    await page.goto(`https://127.0.0.1:${fixture.broker.port}/health`);
+    await page.evaluate(async welcome=>{
+      const {RoomRTC}=await import('/rtc.js');window.publicPCs=[];window.publicErrors=[];
+      const RealRTC=window.RTCPeerConnection;
+      window.RTCPeerConnection=new Proxy(RealRTC,{construct(target,args){const pc=Reflect.construct(target,[{...args[0],iceServers:[],iceTransportPolicy:'relay'}]);publicPCs.push(pc);return pc;}});
+      document.body.textContent='Native Android public relay receiver';
+      window.publicRTC=new RoomRTC({selfId:welcome.selfId,signal:(to,data)=>window.publicSignal(to,data),iceServers:[],iceTransportPolicy:'relay',
+        websocketRelayEnabled:true,relayKey:welcome.relayKey,relayLimits:welcome.websocketRelayLimits});
+      publicRTC.setVideoLimits('720');publicRTC.addEventListener('error',event=>publicErrors.push(event.detail.error?.message));
+      publicRTC.addEventListener('track',event=>{
+        const {kind,stream}=event.detail;let element=document.getElementById('public-'+kind);
+        if(!element){element=document.createElement(kind==='audio'?'audio':'video');element.id='public-'+kind;element.autoplay=true;element.muted=true;element.playsInline=true;document.body.append(element);}
+        element.srcObject=stream;void element.play().catch(error=>publicErrors.push(error.message));
+      });
+      for(const peer of welcome.peers)publicRTC.addPeer(peer);
+      await publicRTC.useSecureRelay();
+      window.publicToneContext=new AudioContext({sampleRate:48000});await publicToneContext.resume();
+      const output=publicToneContext.createMediaStreamDestination();window.publicTone=publicToneContext.createOscillator();const gain=publicToneContext.createGain();
+      publicTone.frequency.value=660;gain.gain.value=.02;publicTone.connect(gain).connect(output);publicTone.start();
+      await publicRTC.setTrack('audio',output.stream.getAudioTracks()[0],output.stream);
+    },welcome);
+    active=true;
+    for(const packet of inbox.splice(0))if(packet.type==='signal')chain=chain.then(()=>page.evaluate(packet=>publicRTC.receive(packet.from,packet.data),packet));
+    await tapRoomAction(label('Turn microphone on'));
+    const permission=await findNode(node=>label('Turn microphone off')(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
+    if(!label('Turn microphone off')(permission))await tap(permission);
+    await findNode(label('Turn microphone off'));
+    await tapRoomAction(label('Share screen'));
+    const captureButton=node=>node.package==='com.android.systemui' && node.class==='android.widget.Button' && /^(Start now|Start recording|Start sharing|Share screen)$/i.test(node.text);
+    let capturePermission=await findNode(node=>captureButton(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
+    if(!captureButton(capturePermission)){await tap(capturePermission);await findNode(captureButton);}
+    await tapStable(captureButton);await findNode(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text));
+    await page.waitForFunction(()=>{const video=document.getElementById('public-screen');return video?.videoWidth>0 && video.readyState>=2 && video.getVideoPlaybackQuality().totalVideoFrames>2;},undefined,{timeout:60000});
+    const relayStats=async()=>page.evaluate(async id=>({row:(await publicRTC.stats()).find(value=>value.peerId===id),frames:document.getElementById('public-screen')?.getVideoPlaybackQuality().totalVideoFrames || 0,
+      width:document.getElementById('public-screen')?.videoWidth,height:document.getElementById('public-screen')?.videoHeight,
+      allDirectClosed:publicPCs.length>0 && publicPCs.every(pc=>pc.connectionState==='closed'),noTurnServers:publicPCs.every(pc=>pc.getConfiguration().iceServers.length===0 && pc.getConfiguration().iceTransportPolicy==='relay')}),peerId);
+    const deadline=Date.now()+45000;let media;
+    do {media=await relayStats();if(media.row?.route==='Secure relay' && media.row.receivedAudioPackets>5 && media.row.sentAudioPackets>5 && media.allDirectClosed)break;await delay(300);}while(Date.now()<deadline);
+    assert.equal(media?.row?.route,'Secure relay');assert.ok(media.row.receivedAudioPackets>5 && media.row.sentAudioPackets>5 && media.allDirectClosed && media.noTurnServers);
+    await tapRoomAction(node=>node['resource-id']==='diagnostics-toggle');
+    await findNativeRoomAction(node=>/Secure relay.*TLS.*WebSocket/.test(node.text || node['content-desc'] || ''));
+    await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio received');
+    const nativeText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
+    const nativeAudio=/Audio received\s+(\d+) packets/.exec(nativeText);
+    assert.ok(nativeAudio && Number(nativeAudio[1])>5,'Actual Android public relay must decode incoming PCM packets');
+    await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
+    const processBefore=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
+    const imageHash=()=>page.evaluate(()=>{const video=document.getElementById('public-screen');const canvas=document.createElement('canvas');canvas.width=90;canvas.height=160;canvas.getContext('2d').drawImage(video,0,0,90,160);let hash=2166136261;for(const value of canvas.getContext('2d').getImageData(0,0,90,160).data)hash=Math.imul(hash^value,16777619);return hash>>>0;});
+    const homeComponent=(await adb(['shell','cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.HOME'])).trim().split(/\r?\n/).find(line=>/^[\w.]+\//.test(line));
+    assert.ok(homeComponent);const homePackage=homeComponent.split('/')[0];
+    await adb(['shell','input','keyevent','3']);await findNode(node=>node.package===homePackage);await delay(1500);
+    const before=await relayStats(),oldPixels=await imageHash();await adb(['shell','input','keyevent','24']);
+    const backgroundDeadline=Date.now()+30000;let background;
+    do {background=await relayStats();if(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels)break;await delay(300);}while(Date.now()<backgroundDeadline);
+    assert.ok(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels,'Native screen pixels and both-direction encrypted audio must advance during actual Home');
+    const top=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));assert.ok(top?.includes(homePackage),'Actual Android Home remains foreground while media advances');
+    await callServiceTypes(0x10|0x80);assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
+    await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);await findNode(label('Turn microphone off'));
+    assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
+    await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+    const summary={passed:true,coordinator:'Deployed public Worker via native system PKI and Node hostname-verified WSS',route:'Secure relay',directRTCImpossible:true,allDirectClosed:true,
+      actualProjection:{width:background.width,height:background.height,decodedFrames:background.frames,changedPixelsDuringHome:true},
+      audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:background.row.sentAudioPackets,actualAndroidPcmPacketsDecoded:Number(nativeAudio[1]),physicalMicrophoneAndSpeakerVerified:false},
+      encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,encryptedSent:wire.sent,encryptedReceived:wire.received,homeMediaAdvanced:true,sameProcessAndRoomOnReturn:true,newCaptureAndControlRemainConsentRequired:true};
+    assert.equal(wire.encryptedEnvelopesOnly,true);assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>publicErrors),[]);
+    checkpoint('nativePublicRelayMedia',summary);
+    await tapRoomAction(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text));await findNode(label('Share screen'));
+    await tapRoomAction(label('Turn microphone off'));await findNode(label('Turn microphone on'));
+    assert.ok(!(await adb(['shell','dumpsys','media_projection'])).includes('local.auralink.mobile'));
+  } finally {
+    clearInterval(heartbeat);
+    active=false;socket.removeAllListeners('message');await chain.catch(()=>{});
+    for(const pending of waiters)clearTimeout(pending.timer);
+    if(page) {await page.evaluate(async()=>{publicRTC?.close();publicTone?.stop();await publicToneContext?.close();}).catch(()=>{});await page.close().catch(()=>{});}
+    if(socket.readyState===WebSocket.OPEN)send({type:'leave'});socket.close();
+  }
 }
 
 async function runUI(fixture) {

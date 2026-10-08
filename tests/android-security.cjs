@@ -9,6 +9,7 @@ const https = require('node:https');
 const WebSocket = require('ws');
 const selfsigned = require('selfsigned');
 const { createBroker } = require('../src/core/broker.cjs');
+const { runCallAudioHarness } = require('./android-call-audio.cjs');
 
 const root = path.resolve(__dirname, '..');
 const resultsDir = path.join(root, 'test-results');
@@ -205,6 +206,7 @@ async function sourcePolicies() {
 async function main() {
   await fs.mkdir(classesDir, { recursive: true });
   const java = await executable('java'); const javac = await executable('javac');
+  evidence.checks.callAudioLifecycle = await runCallAudioHarness({ run, javac, java, fixtureDir, packageDir });
   const libs = ['Java-WebSocket-1.6.0.jar', 'slf4j-api-2.0.13.jar'].map(name => path.join(root, 'android', 'libs', name));
   const classpath = libs.join(path.delimiter);
   const sources = ['Invitation.java', 'AppInvitation.java', 'InternetServiceEndpoint.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'RoomMembership.java', 'ProjectionOwnership.java', 'RelayMediaPolicy.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
