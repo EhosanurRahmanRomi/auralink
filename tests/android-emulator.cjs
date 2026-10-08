@@ -231,7 +231,7 @@ async function startPhoneAudio(fixture) {
   await tapRoomAction(label('Turn microphone on'));
   const permission=await findNode(node=>label('Turn microphone off')(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
   if (!label('Turn microphone off')(permission)) { await screenshot('android-emulator-microphone-permission.png');await tap(permission); }
-  await findNode(label('Turn microphone off'),30000);
+  await findNativeRoomAction(label('Turn microphone off'),30000);
   await rtcEvidence(fixture.page,async id=>{
     const entry=rtc.peers.get(id);const stats=(await rtc.stats()).find(row=>row.peerId===id);
     return entry?.remoteTracks.get('audio')?.track.readyState==='live' && stats?.receivedAudioPackets>0;
@@ -314,7 +314,7 @@ async function checkCallHomeReturn(fixture,audio) {
   const top=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
   assert.ok(top?.includes(homePackage),'Home must remain foreground while both-direction audio evidence advances');
   await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);
-  await findNode(label('Turn microphone off'));
+  await findNativeRoomAction(label('Turn microphone off'));
   assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore,'Returning must not restart the native process');
   assert.equal(await activityIdentity(),activityBefore,'Returning must reuse the existing Activity');
   assert.equal(fixture.network.incomingTypes.join || 0,joins,'Returning must not rejoin the room');
@@ -516,7 +516,7 @@ async function checkPublicRoomStart(fixture) {
   assert.equal(create.enabled,'true');await tap(create);
   const code=await findNode(node=>node['resource-id']==='room-code' && /A1\.[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}/i.test(node.text || node['content-desc'] || ''),60000);
   assert.ok(code,'Fresh Android must open a public room and expose a share code without a service/pairing form');
-  await findNode(label('Turn microphone on'));
+  await findNativeRoomAction(label('Turn microphone on'));
   assert.ok(!(await hierarchy()).some(node=>node['resource-id']==='camera-button'), 'Screen and audio room has no camera control');
   const projection=await adb(['shell','dumpsys','media_projection']);
   assert.ok(!projection.includes('local.auralink.mobile'),'Starting a public room must not silently capture the screen');
@@ -532,7 +532,7 @@ async function checkPublicRoomStart(fixture) {
   const retained=await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===beforeCode);
   assert.ok(retained,'Returning to an open room must retain the exact room capability rather than opening a replacement');
   assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
-  await findNode(label('Turn microphone on'));
+  await findNativeRoomAction(label('Turn microphone on'));
   assert.ok(!(await hierarchy()).some(node=>node['resource-id']==='camera-button'));
   checkpoint('openPublicRoomHomeReturn',{passed:true,existingRoomCodeRetained:true,sameProcess:true,roomServiceRemainsActive:true,microphoneRemainsOff:true,noCameraControl:true});
   const pendingCode='A1.00000000-0000-4000-8000-000000000004.'+'A'.repeat(43);
@@ -544,13 +544,15 @@ async function checkPublicRoomStart(fixture) {
   await tapRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
   checkpoint('nativeAppInvitationWhileRoomOpen',{passed:true,actualAndroidViewIntent:true,currentRoomRetained:true,sameProcess:true,newInvitationRequiresLeavingCurrentRoom:true,noCaptureOrControlGranted:true});
   if (testedMajor>0 || testedMinor>4 || testedMinor===4 && testedPatch>=1) await checkNativePublicRelayMedia(fixture,beforeCode);
+  phase='owner leaves tested public room before Nearby regression';console.log(phase);
   await tapRoomAction(label('Leave room'));
   await findNativeRoomAction(node=>node['resource-id']==='join-button' && node.enabled==='true');
   checkpoint('freshPublicRoomLeftBeforeNearbyRegression');
 }
 
 async function checkNativePublicRelayMedia(fixture,codeText) {
-  phase='production Android media through the public encrypted relay';console.log(phase);
+  const publicPhase=detail=>{phase='Android public relay: '+detail;console.log(phase);};
+  publicPhase('open hostname-verified public socket');
   const code=/A1\.([a-f0-9-]{36})\.([A-Za-z0-9_-]{43})/i.exec(codeText);
   assert.ok(code,'Native public room must expose a complete invitation capability');
   const originMatch=fs.readFileSync(path.join(receiverAssets,'internet.js'),'utf8').match(/DEFAULT_PUBLIC_ORIGIN\s*=\s*'([^']+)'/);
@@ -559,7 +561,7 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
   // The remote socket uses Node's normal CA/hostname validation. Only the
   // localhost page serving the actual renderer modules is a self-signed fixture.
   const socket=new WebSocket(publicURL.href,{rejectUnauthorized:true,maxPayload:262144});
-  let page,peerId,heartbeat,chain=Promise.resolve(),active=false;
+  let page,peerId,heartbeat,recordPublicProgress,chain=Promise.resolve(),active=false;
   const inbox=[],waiters=[],errors=[],wire={sent:0,received:0,encryptedEnvelopesOnly:true};
   const send=packet=>{
     if(socket.readyState!==WebSocket.OPEN)return false;
@@ -583,11 +585,14 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
   socket.on('error',error=>errors.push(safeError(error)));
   try {
     await new Promise((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);});
+    publicPhase('register fixture receiver');
     send({type:'bootstrap',name:'Android public relay receiver'});await take('registered');
     heartbeat=setInterval(()=>send({type:'ping'}),15000);
+    publicPhase('join the actual native public room');
     send({type:'join',roomId:code[1],roomKey:code[2]});const welcome=await take('welcome');
     assert.equal(welcome.websocketRelayEnabled,true);assert.match(welcome.relayKey,/^[A-Za-z0-9_-]{43}$/);
     assert.equal(welcome.peers.length,1,'The isolated public room contains exactly the production APK owner');peerId=welcome.peers[0].id;
+    publicPhase('force receiver onto encrypted relay and start synthetic reverse audio');
     page=await fixture.browser.newPage({ignoreHTTPSErrors:true});
     await page.exposeFunction('publicSignal',(to,data)=>send({type:'signal',to,data}));
     await page.goto(`https://127.0.0.1:${fixture.broker.port}/health`);
@@ -613,45 +618,79 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     },welcome);
     active=true;
     for(const packet of inbox.splice(0))if(packet.type==='signal')chain=chain.then(()=>page.evaluate(packet=>publicRTC.receive(packet.from,packet.data),packet));
-    await tapRoomAction(label('Turn microphone on'));
-    const permission=await findNode(node=>label('Turn microphone off')(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
-    if(!label('Turn microphone off')(permission))await tap(permission);
-    await findNode(label('Turn microphone off'));
-    await tapRoomAction(label('Share screen'));
-    const captureButton=node=>node.package==='com.android.systemui' && node.class==='android.widget.Button' && /^(Start now|Start recording|Start sharing|Share screen)$/i.test(node.text);
-    let capturePermission=await findNode(node=>captureButton(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
-    if(!captureButton(capturePermission)){await tap(capturePermission);await findNode(captureButton);}
-    await tapStable(captureButton);await findNode(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text));
-    await page.waitForFunction(()=>{const video=document.getElementById('public-screen');return video?.videoWidth>0 && video.readyState>=2 && video.getVideoPlaybackQuality().totalVideoFrames>2;},undefined,{timeout:60000});
     const relayStats=async()=>page.evaluate(async id=>({row:(await publicRTC.stats()).find(value=>value.peerId===id),frames:document.getElementById('public-screen')?.getVideoPlaybackQuality().totalVideoFrames || 0,
       width:document.getElementById('public-screen')?.videoWidth,height:document.getElementById('public-screen')?.videoHeight,
       allDirectClosed:publicPCs.length>0 && publicPCs.every(pc=>pc.connectionState==='closed'),noTurnServers:publicPCs.every(pc=>pc.getConfiguration().iceServers.length===0 && pc.getConfiguration().iceTransportPolicy==='relay')}),peerId);
+    recordPublicProgress=async stage=>{
+      const stats=await relayStats();
+      const summary={stage,route:stats.row?.route || null,width:stats.width || 0,height:stats.height || 0,decodedScreenFrames:stats.frames,
+        phoneMicrophonePacketsReceived:stats.row?.receivedAudioPackets || 0,syntheticReversePacketsSent:stats.row?.sentAudioPackets || 0,
+        receiverAudioProcessing:stats.row?.playbackContextState || 'off',directConnectionsClosed:stats.allDirectClosed,noTurnServers:stats.noTurnServers,
+        encryptedSent:wire.sent,encryptedReceived:wire.received,encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,
+        transportErrors:errors.map(safeError),receiverErrors:await page.evaluate(()=>publicErrors.map(String)).then(values=>values.map(safeError))};
+      runtimeDiagnostics.nativePublicRelay=summary;checkpoint('nativePublicRelayProgress',summary);
+    };
+    await recordPublicProgress('receiverReadyBeforeOwnerMicrophone');
+    publicPhase('owner microphone action');
+    await tapRoomAction(label('Turn microphone on'));
+    publicPhase('owner microphone permission or existing grant');
+    const permission=await findNode(node=>label('Turn microphone off')(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_foreground_only_button' || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
+    if(!label('Turn microphone off')(permission))await tap(permission);
+    await recordPublicProgress('ownerMicrophonePermissionCompleted');
+    publicPhase('confirm enabled microphone in scrollable native room');
+    await findNativeRoomAction(label('Turn microphone off'));
+    publicPhase('owner screen-sharing action');
+    await tapRoomAction(label('Share screen'));
+    publicPhase('owner Android notification and screen projection consent');
+    const captureButton=node=>node.package==='com.android.systemui' && node.class==='android.widget.Button' && /^(Start now|Start recording|Start sharing|Share screen)$/i.test(node.text);
+    let capturePermission=await findNode(node=>captureButton(node) || node['resource-id']==='com.android.permissioncontroller:id/permission_allow_button');
+    if(!captureButton(capturePermission)){await tap(capturePermission);await findNode(captureButton);}
+    publicPhase('owner approves native projection');
+    await tapStable(captureButton);
+    await recordPublicProgress('ownerApprovedProjectionBeforeRoomConfirmation');
+    publicPhase('confirm sharing action in scrollable native room');
+    await findNativeRoomAction(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text));
+    await recordPublicProgress('nativeSharingActionConfirmedBeforeDecodeGate');
+    publicPhase('decode actual phone screen at receiver');
+    await page.waitForFunction(()=>{const video=document.getElementById('public-screen');return video?.videoWidth>0 && video.readyState>=2 && video.getVideoPlaybackQuality().totalVideoFrames>2;},undefined,{timeout:60000});
+    await recordPublicProgress('actualPhoneScreenDecoded');
+    publicPhase('require encrypted PCM both directions and closed direct RTC');
     const deadline=Date.now()+45000;let media;
     do {media=await relayStats();if(media.row?.route==='Secure relay' && media.row.receivedAudioPackets>5 && media.row.sentAudioPackets>5 && media.allDirectClosed)break;await delay(300);}while(Date.now()<deadline);
+    await recordPublicProgress('screenAndBidirectionalPcmGate');
     assert.equal(media?.row?.route,'Secure relay');assert.ok(media.row.receivedAudioPackets>5 && media.row.sentAudioPackets>5 && media.allDirectClosed && media.noTurnServers);
+    publicPhase('open native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-toggle');
+    publicPhase('confirm native secure-relay route diagnostics');
     await findNativeRoomAction(node=>/Secure relay.*TLS.*WebSocket/.test(node.text || node['content-desc'] || ''));
+    publicPhase('read native incoming PCM counter before Home');
     await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio received');
     const nativeText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
     const nativeAudio=/Audio received\s+(\d+) packets/.exec(nativeText);
     assert.ok(nativeAudio && Number(nativeAudio[1])>5,'Actual Android public relay must decode incoming PCM packets');
+    publicPhase('close native diagnostics before Home');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
     const processBefore=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
     const imageHash=()=>page.evaluate(()=>{const video=document.getElementById('public-screen');const canvas=document.createElement('canvas');canvas.width=90;canvas.height=160;canvas.getContext('2d').drawImage(video,0,0,90,160);let hash=2166136261;for(const value of canvas.getContext('2d').getImageData(0,0,90,160).data)hash=Math.imul(hash^value,16777619);return hash>>>0;});
     const homeComponent=(await adb(['shell','cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.HOME'])).trim().split(/\r?\n/).find(line=>/^[\w.]+\//.test(line));
     assert.ok(homeComponent);const homePackage=homeComponent.split('/')[0];
+    publicPhase('actual Android Home remains foreground');
     await adb(['shell','input','keyevent','3']);await findNode(node=>node.package===homePackage);await delay(1500);
+    publicPhase('change Home pixels and require background screen and audio upload');
     const before=await relayStats(),oldPixels=await imageHash();await adb(['shell','input','keyevent','24']);
     const backgroundDeadline=Date.now()+30000;let background;
     do {background=await relayStats();if(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels)break;await delay(300);}while(Date.now()<backgroundDeadline);
+    await recordPublicProgress('actualHomeMediaGate');
     assert.ok(background.frames>before.frames && background.row.receivedAudioPackets>before.row.receivedAudioPackets && background.row.sentAudioPackets>before.row.sentAudioPackets && await imageHash()!==oldPixels,'Native screen pixels, phone microphone upload and reverse PCM transmission must advance during actual Home');
     const top=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));assert.ok(top?.includes(homePackage),'Actual Android Home remains foreground while media advances');
+    publicPhase('verify native microphone foreground service and projection during Home');
     await callServiceTypes(0x10|0x80);assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
     // Stop only the synthetic sender's local capture before bringing Android
     // back. Keep the remote audio track advertised, so its processing context
     // remains observable. The returned counter cannot be supplied by a freshly
     // restarted sender; this proves delivery across Home/return, without
     // claiming exactly when a hidden decoder ran or that a speaker was audible.
+    publicPhase('stop synthetic reverse sender while Home remains foreground');
     await page.evaluate(async id=>{
       publicRTC.relayMedia.stopSource('audio');
       publicTone?.stop();publicTone?.disconnect();window.publicTone=null;
@@ -662,19 +701,27 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     assert.equal((await relayStats()).row.sentAudioPackets,reversePacketsWhenStopped,'Synthetic reverse PCM must remain stopped before Android returns');
     const stoppedTop=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
     assert.ok(stoppedTop?.includes(homePackage),'Android Home must remain foreground when the reverse sender stops');
-    await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);await findNode(label('Turn microphone off'));
+    await recordPublicProgress('reverseSenderStoppedDuringHome');
+    publicPhase('return to actual Android room and confirm microphone remains enabled');
+    await adb(['shell','am','start','-n','local.auralink.mobile/.MainActivity']);await findNativeRoomAction(label('Turn microphone off'));
     assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
+    publicPhase('confirm original public room capability retained after Home');
     await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+    await recordPublicProgress('originalRoomRetainedAfterHome');
+    publicPhase('open returned native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-toggle');
+    publicPhase('require native incoming PCM advanced across Home and return');
     await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio received');
     const returnedAudioText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
     const returnedAudio=/Audio received\s+(\d+) packets/.exec(returnedAudioText);
     assert.ok(returnedAudio && Number(returnedAudio[1])>Number(nativeAudio[1]),'Android incoming PCM must advance across Home/return after the reverse sender has stopped');
+    publicPhase('require native audio playback processing running after return');
     await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio playback processing');
     const returnedProcessingText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
     const returnedProcessing=/Audio playback processing\s+(running|suspended|interrupted|off)/.exec(returnedProcessingText);
     assert.equal(returnedProcessing?.[1],'running','Android incoming PCM playback processing must be running after Home/return');
     assert.equal((await relayStats()).row.sentAudioPackets,reversePacketsWhenStopped,'The synthetic reverse sender must remain stopped through the returned Android counter check');
+    publicPhase('close returned native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
     const summary={passed:true,coordinator:'Deployed public Worker via native system PKI and Node hostname-verified WSS',route:'Secure relay',directRTCImpossible:true,allDirectClosed:true,
       actualProjection:{width:background.width,height:background.height,decodedFrames:background.frames,changedPixelsDuringHome:true},
@@ -684,9 +731,17 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,encryptedSent:wire.sent,encryptedReceived:wire.received,homeMediaAdvanced:true,sameProcessAndRoomOnReturn:true,newCaptureAndControlRemainConsentRequired:true};
     assert.equal(wire.encryptedEnvelopesOnly,true);assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>publicErrors),[]);
     checkpoint('nativePublicRelayMedia',summary);
-    await tapRoomAction(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text));await findNode(label('Share screen'));
-    await tapRoomAction(label('Turn microphone off'));await findNode(label('Turn microphone on'));
+    publicPhase('owner stops public screen share');
+    await tapRoomAction(node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text));await findNativeRoomAction(label('Share screen'));
+    publicPhase('owner stops public microphone');
+    await tapRoomAction(label('Turn microphone off'));await findNativeRoomAction(label('Turn microphone on'));
+    publicPhase('confirm owner projection cleanup');
     assert.ok(!(await adb(['shell','dumpsys','media_projection'])).includes('local.auralink.mobile'));
+  } catch(error) {
+    // Capture fresh safe receiver counters before teardown even when a native
+    // UI lookup times out. Never retain invitations, peer IDs or media payloads.
+    await recordPublicProgress?.('failedPublicRelayStage').catch(()=>{});
+    throw error;
   } finally {
     clearInterval(heartbeat);
     active=false;socket.removeAllListeners('message');await chain.catch(()=>{});
@@ -730,7 +785,7 @@ async function runUI(fixture) {
   runtimeDiagnostics.invitation.submitBounds=submit.bounds;
   phase='native pinned invitation admission';
   await fixture.take('join-request',45000);
-  await findNode(label('Turn microphone on'),45000);await screenshot('android-emulator-room.png');
+  await findNativeRoomAction(label('Turn microphone on'),45000);await screenshot('android-emulator-room.png');
   checkpoint('nativePinnedRoomAdmitted');
   const audio=await startPhoneAudio(fixture);
   checkpoint('actualAudioTransport',audio);
@@ -745,7 +800,7 @@ async function runUI(fixture) {
   await screenshot('android-emulator-projection-permission.png');await tapStable(systemCaptureButton);
   const sharingLabel=node=>/^(Stop sharing(?: screen)?|Stop screen sharing)$/.test(node['content-desc'] || node.text);
   try {
-    const started=await findNode(node=>sharingLabel(node) || /^(?:Screen capture could not start|Screen delivery stalled|Screen frame conversion failed|Screen sharing was canceled|Sharing failed:|Screen share failed:)/.test(node.text || ''),30000);
+    const started=await findNativeRoomAction(node=>sharingLabel(node) || /^(?:Screen capture could not start|Screen delivery stalled|Screen frame conversion failed|Screen sharing was canceled|Sharing failed:|Screen share failed:)/.test(node.text || ''),30000);
     if(!sharingLabel(started)) throw new Error(safeError(started.text || started['content-desc'] || 'Phone capture did not start.'));
     checkpoint('nativeCaptureStartedAfterOwnerConsent');
   } catch(error) {
@@ -771,7 +826,7 @@ async function runUI(fixture) {
     await accessibilityBound();checkpoint('accessibilityServiceStillBoundBeforeApproval');
     await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.channel?.readyState==='open',fixture.peerId,{timeout:30000});
     fixture.send({type:'control-request',to:fixture.peerId});
-    await tapStable(label('Review and allow'),30000);
+    await tapRoomAction(label('Review and allow'),30000);
     await screenshot('android-emulator-native-control-consent.png');
     await tapStable(node=>node['resource-id']==='android:id/button1' && /^allow control$/i.test(node.text),30000);
     const grant=await fixture.take('control-response',30000);
@@ -829,10 +884,10 @@ async function runUI(fixture) {
   checkpoint('ownerScreenStopReleasedProjection');
   phase='owner microphone stop and call audio cleanup';console.log(phase);
   await tapRoomAction(label('Turn microphone off'));
-  await findNode(label('Turn microphone on'));
+  await findNativeRoomAction(label('Turn microphone on'));
   await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.remoteState.audio===false,fixture.peerId,{timeout:15000});
   await tapRoomAction(label('Leave room'));
-  await findNode(label('Enter invitation'));
+  await findNativeRoomAction(label('Enter invitation'));
   await audioMode('MODE_NORMAL');
   audio.checks.push('Owner microphone stop updates receiver media state','Leaving the room releases Android communication audio mode');
   checkpoint('ownerAudioStopAndRouteCleanup');
