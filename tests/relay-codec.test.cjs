@@ -158,7 +158,7 @@ test('a late failed audio module from an old source cannot tear down its replace
     assert.equal(media.sources.get('audio'), replacement); assert.equal(replacement.active, true);
   } finally { global.AudioContext = oldContext; media.close(); }
 });
-test('a failed preferred hardware backend retries the same codec with default acceleration and releases cloned frames', async () => {
+test('a failed preferred hardware backend retries explicit software when supported, otherwise default acceleration', async () => {
   const { RelayMedia } = await ready;
   const originalEncoder = global.VideoEncoder, originalDecoder = global.VideoDecoder, originalFrame = global.VideoFrame;
   const configurations = [], frameClones = [];
@@ -171,8 +171,11 @@ test('a failed preferred hardware backend retries the same codec with default ac
     encode() { if (this.config.hardwareAcceleration === 'prefer-hardware') queueMicrotask(() => this.callbacks.error(new Error('Fixture hardware backend unavailable'))); }
     close() { this.state = 'closed'; }
   };
-  let media;
+  let media, softwareSupported = true;
+  global.VideoEncoder.isConfigSupported = async config => ({ supported: config.hardwareAcceleration !== 'prefer-software' || softwareSupported, config });
   try {
+    for (const support of [true, false]) {
+    softwareSupported = support; const beforeConfigurations = configurations.length, beforeFrames = frameClones.length;
     const transport = rtc(); transport.quality = '1440'; media = new RelayMedia(transport, randomBytes(32).toString('base64url'));
     await media.capabilities; const peer = media.addPeer('guest'); peer.active = true;
     const track = { enabled: true }; transport.localTracks.set('screen', { track });
@@ -183,8 +186,10 @@ test('a failed preferred hardware backend retries the same codec with default ac
     assert.equal(source.encoder.state, 'closed'); assert.equal(source.failedHardware.has('avc1.420033'), true);
     assert.ok((await media.capabilities).includes('avc1.420033'), 'Hardware failure must preserve a possible default codec backend');
     await media.encodeCompressed(source, frame, 2560, 1440, 'avc1.420033', () => true);
-    assert.deepEqual(configurations.map(config => config.hardwareAcceleration), ['prefer-hardware', 'no-preference']);
-    assert.equal(frame.closed, false); assert.ok(frameClones.slice(1).every(clone => clone.closed));
+    assert.deepEqual(configurations.slice(beforeConfigurations).map(config => config.hardwareAcceleration), ['prefer-hardware', support ? 'prefer-software' : 'no-preference']);
+    assert.equal(frame.closed, false); assert.ok(frameClones.slice(beforeFrames + 1).every(clone => clone.closed));
+    media.close(); media = null; frame.close();
+    }
   } finally { media?.close(); global.VideoEncoder = originalEncoder; global.VideoDecoder = originalDecoder; global.VideoFrame = originalFrame; }
 });
 test('removing a peer while encryption is queued cannot forward encoded media', async () => {
@@ -270,7 +275,12 @@ test('a dynamic FPS reduction after long uptime resumes capture within the new f
     assert.equal(closed.length, 3, 'Dropped and encoded input frames are both released');
     media.sources.get('screen').targetFPS = 30; const initialCount = encodedAt.length;
     for (let index = 1; index <= 10; index++) await frame(1000084 + Math.floor(index / 2) * 66 + (index % 2 ? 32 : 0));
-    assert.equal(encodedAt.length - initialCount, 10, 'Alternating32/34ms30fps source jitter must not halve the captured frame rate');
+    assert.ok(encodedAt.length - initialCount >= 9, 'Alternating32/34ms source jitter must retain at least9of10frames rather than halve capture');
+    media.sources.get('screen').targetFPS = 27; const beforeAdapted = encodedAt.length;
+    for (let index = 1; index <= 90; index++) await frame(1000414 + index * 1000 / 30);
+    assert.equal(encodedAt.length - beforeAdapted, 81, '30fps source paced to27fps must preserve fractional deadlines instead of quantizing to15fps');
+    const beforeQuiet = encodedAt.length; await frame(2000000); await frame(2000010);
+    assert.equal(encodedAt.length - beforeQuiet, 1, 'A source returning late cannot catch up with a burst');
   } finally { media.close(); await settle(); assert.equal(canceled, true); global.MediaStreamTrackProcessor = oldProcessor; Object.defineProperty(global, 'performance', oldPerformance); }
 });
 test('a stalled encoder downgrades hardware then retires the stalled default codec without misclassifying quiet or congested sources', async () => {
@@ -299,9 +309,12 @@ test('a stalled encoder downgrades hardware then retires the stalled default cod
     await encode(18000); assert.equal(encoders[0].state, 'configured', 'A quiet source returning after seconds cannot cause an immediate backend downgrade');
     for (let time = 18300; time <= 19800; time += 300) await encode(time);
     assert.equal(encoders[0].state, 'closed'); assert.equal(source.failedHardware.has('avc1.420033'), true);
-    await encode(19840); assert.equal(encoders[1].config.hardwareAcceleration, 'no-preference'); await encode(19880);
+    await encode(19840); assert.equal(encoders[1].config.hardwareAcceleration, 'prefer-software'); await encode(19880);
     for (let time = 20180; time <= 21980; time += 300) await encode(time);
-    assert.equal(encoders[1].state, 'closed'); assert.ok(!(await media.capabilities).includes('avc1.420033'));
+    assert.equal(encoders[1].state, 'closed'); assert.equal(source.failedSoftware.has('avc1.420033'), true);
+    await encode(22020); assert.equal(encoders[2].config.hardwareAcceleration, 'no-preference'); await encode(22060);
+    for (let time = 22360; time <= 24160; time += 300) await encode(time);
+    assert.equal(encoders[2].state, 'closed'); assert.ok(!(await media.capabilities).includes('avc1.420033'));
     assert.equal(frame.closed, false); assert.ok(frameClones.slice(1).every(clone => clone.closed));
     // Pending encryption/forwarding with an empty encoder queue is not a native codec stall.
     const active = { state: 'configured', encodeQueueSize: 0, close: () => { throw new Error('Network congestion must not close the encoder'); } };

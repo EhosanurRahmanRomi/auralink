@@ -456,12 +456,15 @@ export class RelayMedia {
     if (typeof MediaStreamTrackProcessor === 'function') {
       source.reader = new MediaStreamTrackProcessor({ track: source.clone }).readable.getReader();
       void (async () => {
-        let last = -Infinity;
+        let last = -Infinity, deadline = -Infinity, previousInterval = null;
         try { while (valid()) { const { done, value } = await source.reader.read(); if (done) break;
           try { const now = performance.now(), interval = source.jpeg ? 250 : 1000 / source.targetFPS;
+            if (interval !== previousInterval) { deadline = last + interval; previousInterval = interval; }
             // Source clocks have small scheduling jitter. The allowance avoids
-            // halving a 30 fps source, while elapsed pacing survives FPS changes.
-            if (now - last < interval - (source.jpeg ? 0 : 2) || source.pending || !source.track.enabled) continue;
+            // halving a 30 fps source. Fractional deadlines preserve adapted
+            // rates; a source returning late never emits a catch-up burst.
+            if (now + (source.jpeg ? 0 : 2) < deadline || source.pending || !source.track.enabled) continue;
+            deadline = !Number.isFinite(deadline) || now - deadline > interval ? now + interval : deadline + interval;
             last = now; await this.encodeVideo(kind, source, value, valid); }
           finally { value.close(); }
         } } catch { /* Source stop releases the reader. */ }
@@ -538,8 +541,10 @@ export class RelayMedia {
       source.encoder = null; source.stream = base64(crypto.getRandomValues(new Uint8Array(12))); source.sequence = 0; source.description = undefined;
       let config = { codec, width: targetWidth, height: targetHeight, bitrate: source.bitrate || cap, framerate: source.targetFPS,
         latencyMode: 'realtime', bitrateMode: 'variable', ...(codec.startsWith('avc1') ? { avc: { format: 'annexb' } } : {}) };
-      let supported; const preferred = source.failedHardware?.has(codec) ? 'no-preference' : this.hardwarePreferences.get(codec) || 'no-preference';
-      for (const hardwareAcceleration of preferred === 'prefer-hardware' ? ['prefer-hardware', 'no-preference'] : ['no-preference']) {
+      let supported; const preferred = this.hardwarePreferences.get(codec) || 'no-preference';
+      const accelerations = preferred === 'prefer-hardware' ? ['prefer-hardware', 'prefer-software', 'no-preference'] : ['no-preference'];
+      for (const hardwareAcceleration of accelerations) {
+        if (hardwareAcceleration === 'prefer-hardware' && source.failedHardware?.has(codec) || hardwareAcceleration === 'prefer-software' && source.failedSoftware?.has(codec)) continue;
         config = { ...config, hardwareAcceleration };
         try { supported = await VideoEncoder.isConfigSupported(config); } catch { supported = null; }
         if (supported?.supported) break;
@@ -592,6 +597,8 @@ export class RelayMedia {
     source.forceKey = true;
     if (hardwareAcceleration === 'prefer-hardware') {
       if (!source.failedHardware) source.failedHardware = new Set(); source.failedHardware.add(codec);
+    } else if (hardwareAcceleration === 'prefer-software') {
+      if (!source.failedSoftware) source.failedSoftware = new Set(); source.failedSoftware.add(codec);
     } else this.capabilities = this.capabilities.then(codecs => codecs.filter(item => item !== codec));
   }
   state() {

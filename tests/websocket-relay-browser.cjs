@@ -52,6 +52,28 @@ async function localHTTPS(runtime) {
 async function mediaProof(page, otherName, sender) {
   await page.getByRole('button', { name: `View ${otherName}`, exact: true }).click();
   await page.waitForFunction(() => { const video = document.getElementById('stage-video'); return !video.hidden && video.videoWidth > 0 && video.currentTime > 0 && video.readyState >= 2; });
+  // A real codec backend may recover from startup stalls after its first frame.
+  // Bound that startup period explicitly, then measure sustained playback with
+  // the unchanged resolution/FPS assertions below.
+  const startup = await page.locator('#stage-video').evaluate(async video => {
+    const started = performance.now(), deadline = started + 35000;
+    let stream = video.srcObject, track = stream?.getVideoTracks()[0], stableSince = started;
+    let initialFrames = video.getVideoPlaybackQuality().totalVideoFrames, changes = 0;
+    while (true) {
+      const now = performance.now(), currentStream = video.srcObject, currentTrack = currentStream?.getVideoTracks()[0];
+      const frames = video.getVideoPlaybackQuality().totalVideoFrames;
+      if (currentStream !== stream || currentTrack !== track || frames < initialFrames) {
+        stream = currentStream; track = currentTrack; initialFrames = frames; stableSince = now; changes++;
+      }
+      const displayedFrames = frames - initialFrames, stableSeconds = (now - stableSince) / 1000;
+      const settled = Boolean(!video.hidden && video.readyState >= 2 && track?.readyState === 'live' && displayedFrames >= 30 && stableSeconds >= 2);
+      const snapshot = { settled, startupSettleSeconds: (now - started) / 1000, displayedFrames, stableSeconds, streamChanges: changes, width: video.videoWidth, height: video.videoHeight };
+      window.qaStartupSettle = snapshot;
+      if (settled || now >= deadline) return snapshot;
+      await new Promise(resolve => setTimeout(resolve, Math.min(500, deadline - now)));
+    }
+  });
+  assert.equal(startup.settled, true, 'Codec startup must settle within 35 seconds with 30 new displayed frames and a stable track: ' + JSON.stringify(startup));
   await page.waitForFunction(() => [...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject?.getAudioTracks().length && !audio.paused && !audio.muted));
   const audio = await page.evaluate(async () => {
     const audio = [...document.querySelectorAll('audio[data-peer]')].find(item => item.srcObject);
@@ -71,7 +93,8 @@ async function mediaProof(page, otherName, sender) {
     const frames = video.getVideoPlaybackQuality().totalVideoFrames - before; const seconds = (performance.now() - start) / 1000;
     return { width: video.videoWidth, height: video.videoHeight, time: video.currentTime, initialTime, sourcePaints: qaSourcePaints - sourcePaintsBefore, encodeRequests: qaEncodeRequests - encodesBefore, encodedOutputs: qaEncodedFrames - encodedBefore, decodedOutputs: qaDecodedFrames - decodedBefore, initialFrames: before, finalFrames: video.getVideoPlaybackQuality().totalVideoFrames, sameStream: video.srcObject === initialStream, sameTrack: video.srcObject?.getVideoTracks()[0] === initialTrack, decodedFrames: frames, measuredFps: frames / seconds };
   });
-  if (sender) { const sourceAfter = await sender.evaluate(() => ({ time: performance.now(), paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames })); motion.source = { seconds: (sourceAfter.time - sourceBefore.time) / 1000, paints: sourceAfter.paints - sourceBefore.paints, encodes: sourceAfter.encodes - sourceBefore.encodes, encoded: sourceAfter.encoded - sourceBefore.encoded }; }
+  motion.startup = startup;
+  if (sender) { const sourceAfter = await sender.evaluate(() => ({ time: performance.now(), paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames, encoderConfigurations: qaEncoderConfigurations.slice(), encoderErrors: qaEncoderErrors })); motion.source = { seconds: (sourceAfter.time - sourceBefore.time) / 1000, paints: sourceAfter.paints - sourceBefore.paints, encodes: sourceAfter.encodes - sourceBefore.encodes, encoded: sourceAfter.encoded - sourceBefore.encoded, encoderConfigurations: sourceAfter.encoderConfigurations, encoderErrors: sourceAfter.encoderErrors }; }
   assert.equal(motion.sameStream, true, 'Presentation stream must remain stable throughout quality proof: ' + JSON.stringify(motion));
   assert.equal(motion.sameTrack, true, 'Presentation track must remain stable throughout quality proof: ' + JSON.stringify(motion));
   assert.equal(motion.width, 2560, 'High-quality fallback must preserve the selected 1440p screen width');
@@ -124,8 +147,18 @@ async function main() {
             return send(raw);
           }; return socket;
         } });
-        window.qaSourcePaints = 0; window.qaEncodeRequests = 0; window.qaEncodedFrames = 0; window.qaDecodedFrames = 0;
-        if (typeof VideoEncoder === 'function') { const NativeEncoder = VideoEncoder; window.VideoEncoder = new Proxy(NativeEncoder, { construct(target, args) { const options = args[0]; const encoder = Reflect.construct(target, [{ ...options, output: (...values) => { qaEncodedFrames++; return options.output(...values); } }]); const encode = encoder.encode.bind(encoder); encoder.encode = (...values) => { qaEncodeRequests++; return encode(...values); }; return encoder; } }); }
+        window.qaSourcePaints = 0; window.qaEncodeRequests = 0; window.qaEncodedFrames = 0; window.qaDecodedFrames = 0; window.qaEncoderConfigurations = []; window.qaEncoderErrors = 0; window.qaStartupSettle = null;
+        if (typeof VideoEncoder === 'function') {
+          const NativeEncoder = VideoEncoder;
+          window.VideoEncoder = new Proxy(NativeEncoder, { construct(target, args) {
+            const options = args[0];
+            const encoder = Reflect.construct(target, [{ ...options, output: (...values) => { qaEncodedFrames++; return options.output(...values); }, error: (...values) => { qaEncoderErrors++; return options.error?.(...values); } }]);
+            const configure = encoder.configure.bind(encoder);
+            encoder.configure = config => { qaEncoderConfigurations.push({ codec: config.codec, hardwareAcceleration: config.hardwareAcceleration || 'unspecified', width: config.width, height: config.height }); if (qaEncoderConfigurations.length > 10) qaEncoderConfigurations.shift(); return configure(config); };
+            const encode = encoder.encode.bind(encoder); encoder.encode = (...values) => { qaEncodeRequests++; return encode(...values); };
+            return encoder;
+          } });
+        }
         if (typeof VideoDecoder === 'function') { const NativeDecoder = VideoDecoder; window.VideoDecoder = new Proxy(NativeDecoder, { construct(target, args) { const options = args[0]; return Reflect.construct(target, [{ ...options, output: (...values) => { qaDecodedFrames++; return options.output(...values); } }]); } }); }
         const NativeRTC = window.RTCPeerConnection; window.RTCPeerConnection = new Proxy(NativeRTC, { construct(target, args) { const pc = Reflect.construct(target, [{ ...args[0], iceServers: [], iceTransportPolicy: 'relay' }]); qaPCs.push(pc); return pc; } });
         const nativeCapture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
@@ -234,7 +267,7 @@ async function main() {
     proof.sourceHashes = Object.fromEntries(['src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/renderer/internet.js'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')]));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify(proof, null, 2)); console.log(JSON.stringify(proof, null, 2));
   } catch (error) {
-    const diagnostics = await Promise.all(pages.map(page => page.evaluate(() => ({ inputs: qaInputs.map(({ event }) => event), grants: qaGrants.length, consentVisible: !document.getElementById('control-banner').hidden, toast: document.getElementById('toast-region').textContent, screen: { hidden: document.getElementById('stage-video').hidden, time: document.getElementById('stage-video').currentTime, width: document.getElementById('stage-video').videoWidth }, audio: [...document.querySelectorAll('audio[data-peer]')].map(audio => ({ hasStream: Boolean(audio.srcObject), paused: audio.paused, muted: audio.muted })), rtcStates: qaPCs.map(pc => pc.connectionState) })).catch(() => null)));
+    const diagnostics = await Promise.all(pages.map(page => page.evaluate(() => ({ inputs: qaInputs.map(({ event }) => event), grants: qaGrants.length, consentVisible: !document.getElementById('control-banner').hidden, toast: document.getElementById('toast-region').textContent, screen: { hidden: document.getElementById('stage-video').hidden, time: document.getElementById('stage-video').currentTime, width: document.getElementById('stage-video').videoWidth }, startup: qaStartupSettle, source: { paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames, decoded: qaDecodedFrames, encoderConfigurations: qaEncoderConfigurations.slice(), encoderErrors: qaEncoderErrors }, audio: [...document.querySelectorAll('audio[data-peer]')].map(audio => ({ hasStream: Boolean(audio.srcObject), paused: audio.paused, muted: audio.muted })), rtcStates: qaPCs.map(pc => pc.connectionState) })).catch(() => null)));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify({ ...proof, status: 'failed', phase, error: error.message, pageErrors: errors, diagnostics }, null, 2)); throw error;
   } finally { await browser?.close(); await proxy?.close(); await runtime?.close(); }
 }
