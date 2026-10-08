@@ -74,7 +74,6 @@ jobs:
 
   windows-installer:
     name: Windows per-user installer
-    needs: checks
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -104,7 +103,6 @@ jobs:
           retention-days: 7
 
   macos-installer:
-    needs: checks
     name: macOS Apple Silicon DMG
     runs-on: macos-15
     timeout-minutes: 25
@@ -122,6 +120,8 @@ jobs:
         run: node -e "if(process.platform !== 'darwin' || process.arch !== 'arm64') process.exit(1)"
       - name: Install locked dependencies
         run: npm ci
+      - name: Compile and safely verify native arm64 input helper
+        run: npm run build:mac-helper
       - name: Install isolated browser and coordinator fixture
         run: |
           npm ci --prefix internet-service
@@ -136,8 +136,6 @@ jobs:
         run: |
           npm run check
           npm test
-      - name: Compile and safely verify native arm64 input helper
-        run: npm run build:mac-helper
       - name: Build ad-hoc signed Apple Silicon test DMG
         run: npm run dist:mac -- --publish never
       - name: Verify actual mounted DMG, signed bundle and application launch

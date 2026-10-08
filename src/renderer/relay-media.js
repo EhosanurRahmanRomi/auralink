@@ -456,11 +456,13 @@ export class RelayMedia {
     if (typeof MediaStreamTrackProcessor === 'function') {
       source.reader = new MediaStreamTrackProcessor({ track: source.clone }).readable.getReader();
       void (async () => {
-        let last = 0, slot = -1;
+        let last = -Infinity;
         try { while (valid()) { const { done, value } = await source.reader.read(); if (done) break;
-          try { const now = performance.now(), nextSlot = Math.floor(now * source.targetFPS / 1000);
-            if ((source.jpeg ? now - last < 250 : nextSlot <= slot) || source.pending || !source.track.enabled) continue;
-            last = now; slot = nextSlot; await this.encodeVideo(kind, source, value, valid); }
+          try { const now = performance.now(), interval = source.jpeg ? 250 : 1000 / source.targetFPS;
+            // Source clocks have small scheduling jitter. The allowance avoids
+            // halving a 30 fps source, while elapsed pacing survives FPS changes.
+            if (now - last < interval - (source.jpeg ? 0 : 2) || source.pending || !source.track.enabled) continue;
+            last = now; await this.encodeVideo(kind, source, value, valid); }
           finally { value.close(); }
         } } catch { /* Source stop releases the reader. */ }
       })();
@@ -506,6 +508,7 @@ export class RelayMedia {
     } finally { source.pending = false; }
   }
   async encodeCompressed(source, frame, width, height, codec, valid) {
+    if (!valid()) return;
     const now = performance.now(), quality = this.rtc.quality || 'auto';
     const ceiling = { auto: 1920, '720': 1280, '1080': 1920, '1440': 2560 }[quality] || 1920;
     const totalCap = { auto: 3000000, '720': 1800000, '1080': 3500000, '1440': 4500000 }[quality] || 3000000;
@@ -514,7 +517,15 @@ export class RelayMedia {
     if (source.cap !== cap) { source.bitrate = Math.min(source.bitrate || cap, cap); source.cap = cap; source.forceKey = true; }
     const scale = Math.min(1, ceiling / Math.max(width, height), Math.sqrt(MAX_VIDEO_PIXELS / (width * height)));
     const targetWidth = Math.max(2, Math.floor(width * scale / 2) * 2), targetHeight = Math.max(2, Math.floor(height * scale / 2) * 2);
-    const congested = [...this.peers.values()].some(peer => peer.active && peer.pendingVideo >= 2) || source.encoder?.encodeQueueSize >= 2;
+    const encoder = source.encoder, lastCheck = source.lastEncoderCheck;
+    source.lastEncoderCheck = now;
+    if (encoder?.state === 'configured' && encoder.encodeQueueSize >= 2) {
+      if (!Number.isFinite(lastCheck) || now - lastCheck > 500 || !Number.isFinite(source.encoderBlockedSince)) source.encoderBlockedSince = now;
+      if (valid() && now - source.encoderBlockedSince >= 1500 && now - (source.lastEncoderOutput ?? source.encoderStartedAt ?? now) >= 1500) {
+        this.encoderFailed(source, source.codec, source.config?.hardwareAcceleration); try { encoder.close(); } catch {} source.encoderBlockedSince = null; return;
+      }
+    } else source.encoderBlockedSince = null;
+    const congested = [...this.peers.values()].some(peer => peer.active && peer.pendingVideo >= 2) || source.encoder?.state === 'configured' && source.encoder.encodeQueueSize >= 2;
     if (congested) {
       if (now - source.lastAdapt > 1000) { source.bitrate = Math.max(700000, Math.round((source.bitrate || cap) * .8)); source.targetFPS = Math.max(12, source.targetFPS - 3); source.lastAdapt = now; }
       return;
@@ -540,6 +551,7 @@ export class RelayMedia {
       let encoder;
       try { encoder = new VideoEncoder({ output: (chunk, metadata) => {
         if (!valid() || source.encoder !== encoder || !source.track.enabled) return;
+        source.lastEncoderOutput = performance.now(); source.encoderBlockedSince = null;
         if (metadata?.decoderConfig?.description) source.description = base64(new Uint8Array(metadata.decoderConfig.description));
         const sequence = ++source.sequence;
         if (chunk.byteLength > MAX_ENCODED_FRAME_BYTES || (source.description?.length || 0) > 1400) { source.forceKey = true; source.bitrate = Math.max(700000, Math.round(source.bitrate * .7)); return; }
@@ -554,6 +566,7 @@ export class RelayMedia {
         this.encoderFailed(source, codec, config.hardwareAcceleration); try { encoder.close(); } catch {}
       } } }); } catch { this.encoderFailed(source, codec, config.hardwareAcceleration); return; }
       source.encoder = encoder; source.codec = codec; source.width = targetWidth; source.height = targetHeight;
+      source.encoderStartedAt = now; source.lastEncoderOutput = now; source.encoderBlockedSince = null;
       source.config = config; source.forceKey = true;
       try { encoder.configure(supported.config); } catch { try { encoder.close(); } catch {} this.encoderFailed(source, codec, config.hardwareAcceleration); return; }
       this.rtc.emit('relay-codec', { codec: codec.startsWith('avc1') ? 'H.264' : 'VP8', width: targetWidth, height: targetHeight, framerate: source.targetFPS, compatibility: false });

@@ -251,3 +251,62 @@ test('async input encryption and forwarding exceptions revoke once, while stale 
     assert.equal(peer.pendingData, 0); media.close();
   }
 });
+test('a dynamic FPS reduction after long uptime resumes capture within the new frame interval', async () => {
+  const { RelayMedia } = await ready;
+  const oldPerformance = Object.getOwnPropertyDescriptor(global, 'performance'), oldProcessor = global.MediaStreamTrackProcessor;
+  let now = 1000000, push, canceled = false; const encodedAt = [], closed = [];
+  Object.defineProperty(global, 'performance', { configurable: true, value: { now: () => now } });
+  global.MediaStreamTrackProcessor = class { constructor() { this.readable = { getReader: () => ({ read: () => new Promise(resolve => { push = resolve; }), cancel: async () => { canceled = true; push?.({ done: true }); } }) }; } };
+  const transport = rtc(), media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
+  const track = { enabled: true, clone: () => ({ stop: () => {} }) }; transport.localTracks.set('screen', { track });
+  media.encodeVideo = async () => { encodedAt.push(now); };
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const frame = async time => { now = time; push({ done: false, value: { close: () => closed.push(time) } }); await settle(); };
+  try {
+    await media.syncSource('screen'); await frame(1000000);
+    media.sources.get('screen').targetFPS = 12;
+    await frame(1000040); await frame(1000084);
+    assert.deepEqual(encodedAt, [1000000, 1000084], 'FPS changes use elapsed time rather than a slot tied to the old absolute FPS');
+    assert.equal(closed.length, 3, 'Dropped and encoded input frames are both released');
+    media.sources.get('screen').targetFPS = 30; const initialCount = encodedAt.length;
+    for (let index = 1; index <= 10; index++) await frame(1000084 + Math.floor(index / 2) * 66 + (index % 2 ? 32 : 0));
+    assert.equal(encodedAt.length - initialCount, 10, 'Alternating32/34ms30fps source jitter must not halve the captured frame rate');
+  } finally { media.close(); await settle(); assert.equal(canceled, true); global.MediaStreamTrackProcessor = oldProcessor; Object.defineProperty(global, 'performance', oldPerformance); }
+});
+test('a stalled encoder downgrades hardware then retires the stalled default codec without misclassifying quiet or congested sources', async () => {
+  const { RelayMedia } = await ready;
+  const oldPerformance = Object.getOwnPropertyDescriptor(global, 'performance'), oldEncoder = global.VideoEncoder, oldDecoder = global.VideoDecoder, oldFrame = global.VideoFrame;
+  let now = 10000; const encoders = [], frameClones = [];
+  Object.defineProperty(global, 'performance', { configurable: true, value: { now: () => now } });
+  global.VideoDecoder = class { static async isConfigSupported(config) { return { supported: true, config }; } };
+  global.VideoFrame = class { constructor(frame) { this.displayWidth = frame.displayWidth; this.displayHeight = frame.displayHeight; this.closed = false; frameClones.push(this); } close() { this.closed = true; } };
+  global.VideoEncoder = class {
+    static async isConfigSupported(config) { return { supported: true, config }; }
+    constructor() { this.state = 'unconfigured'; this.encodeQueueSize = 0; encoders.push(this); }
+    configure(config) { this.config = config; this.state = 'configured'; }
+    encode() { this.encodeQueueSize++; } // A native backend accepts but never outputs.
+    close() { this.state = 'closed'; }
+  };
+  let media;
+  try {
+    const transport = rtc(); transport.quality = '1440'; media = new RelayMedia(transport, randomBytes(32).toString('base64url'));
+    await media.capabilities; const peer = media.addPeer('guest'); peer.active = true;
+    const track = { enabled: true }; transport.localTracks.set('screen', { track });
+    const source = { track, active: true, targetFPS: 30, forceKey: true, sequence: 0, lastKey: 0, lastAdapt: now }; media.sources.set('screen', source);
+    const frame = new global.VideoFrame({ displayWidth: 2560, displayHeight: 1440 });
+    const encode = async time => { now = time; await media.encodeCompressed(source, frame, 2560, 1440, 'avc1.420033', () => true); };
+    await encode(10000); await encode(10040); assert.equal(encoders[0].encodeQueueSize, 2);
+    await encode(18000); assert.equal(encoders[0].state, 'configured', 'A quiet source returning after seconds cannot cause an immediate backend downgrade');
+    for (let time = 18300; time <= 19800; time += 300) await encode(time);
+    assert.equal(encoders[0].state, 'closed'); assert.equal(source.failedHardware.has('avc1.420033'), true);
+    await encode(19840); assert.equal(encoders[1].config.hardwareAcceleration, 'no-preference'); await encode(19880);
+    for (let time = 20180; time <= 21980; time += 300) await encode(time);
+    assert.equal(encoders[1].state, 'closed'); assert.ok(!(await media.capabilities).includes('avc1.420033'));
+    assert.equal(frame.closed, false); assert.ok(frameClones.slice(1).every(clone => clone.closed));
+    // Pending encryption/forwarding with an empty encoder queue is not a native codec stall.
+    const active = { state: 'configured', encodeQueueSize: 0, close: () => { throw new Error('Network congestion must not close the encoder'); } };
+    source.encoder = active; peer.pendingVideo = 2; now = 40000;
+    await media.encodeCompressed(source, frame, 2560, 1440, 'vp8', () => true); assert.equal(source.encoder, active);
+    media.sources.delete('screen');
+  } finally { media?.close(); global.VideoEncoder = oldEncoder; global.VideoDecoder = oldDecoder; global.VideoFrame = oldFrame; Object.defineProperty(global, 'performance', oldPerformance); }
+});
