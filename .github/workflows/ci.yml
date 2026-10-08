@@ -122,16 +122,10 @@ jobs:
         run: npm ci
       - name: Compile and safely verify native arm64 input helper
         run: npm run build:mac-helper
-      - name: Install isolated browser and coordinator fixture
-        run: |
-          npm ci --prefix internet-service
-          npx playwright install chromium
-          node <<'JS'
-          const fs = require('node:fs');
-          fs.appendFileSync(process.env.GITHUB_ENV, 'AURALINK_TEST_BROWSER=' + require('playwright').chromium.executablePath() + '\n');
-          JS
-      - name: Actual Apple Silicon compressed relay decoder and invitation UI
-        run: node tests/websocket-relay-browser.cjs
+      - name: Install isolated coordinator fixture
+        run: npm ci --prefix internet-service
+      - name: Visible Apple Silicon Electron relay with synthetic media and input
+        run: node tests/websocket-relay-browser.cjs --electron
       - name: JavaScript syntax and protocol permissions
         run: |
           npm run check

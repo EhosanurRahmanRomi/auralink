@@ -13,12 +13,76 @@ const { createHash, X509Certificate } = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const WebSocket = require('ws');
 const selfsigned = require('selfsigned');
-const { chromium } = require('playwright');
+const { chromium, _electron } = require('playwright');
 const root = path.resolve(__dirname, '..');
 const output = path.join(root, 'test-results');
 const live = process.argv.includes('--live');
+const electronMode = process.argv.includes('--electron');
 const browserPath = [process.env.AURALINK_TEST_BROWSER, 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Google/Chrome/Application/chrome.exe', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/chromium', '/usr/bin/google-chrome'].filter(Boolean).find(file => fs.existsSync(file));
-if (!browserPath) throw new Error('Install Edge/Chrome or set AURALINK_TEST_BROWSER.');
+if (!electronMode && !browserPath) throw new Error('Install Edge/Chrome or set AURALINK_TEST_BROWSER.');
+
+async function electronEngine(spkiHash) {
+  const generated = fs.mkdtempSync(path.join(output, 'relay-electron-fixture-'));
+  const profile = path.join(generated, 'profile'), mainPath = path.join(generated, 'main.cjs');
+  fs.mkdirSync(profile);
+  const verifyContained = candidate => {
+    const relative = path.relative(path.resolve(output), path.resolve(candidate));
+    assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative), 'Generated Electron fixture must stay within test-results');
+  };
+  verifyContained(generated); verifyContained(profile); verifyContained(mainPath);
+  // This QA main is deliberately separate from production preload/native WSS.
+  // It exercises the shipped Electron engine with secure visible renderers and
+  // fake microphone/display/input sources, trusting only this fixture's SPKI.
+  fs.writeFileSync(mainPath, `
+const {app,BrowserWindow,session}=require('electron');
+app.setName('Auralink relay engine fixture');
+app.commandLine.appendSwitch('ignore-certificate-errors-spki-list',${JSON.stringify(spkiHash)});
+app.commandLine.appendSwitch('use-fake-device-for-media-stream');
+app.commandLine.appendSwitch('use-fake-ui-for-media-stream');
+app.commandLine.appendSwitch('autoplay-policy','no-user-gesture-required');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('disable-features','WebRtcHideLocalIpsWithMdns');
+const windows=[];
+app.whenReady().then(async()=>{
+  for(let index=0;index<3;index++){
+    const partition='auralink-relay-engine-'+index;
+    const isolated=session.fromPartition(partition);
+    isolated.setPermissionRequestHandler((_contents,permission,callback,details={})=>callback(permission==='media' && !(details.mediaTypes||[]).includes('video') || permission==='speaker-selection'));
+    isolated.setPermissionCheckHandler((_contents,permission,_origin,details={})=>permission==='media' && details.mediaType!=='video' || permission==='speaker-selection');
+    const window=new BrowserWindow({width:1380,height:940,useContentSize:true,show:true,title:'Auralink relay engine fixture '+index,webPreferences:{partition,nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,backgroundThrottling:false}});
+    windows.push(window);
+    window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+    await window.loadURL('about:blank');
+  }
+});
+app.on('window-all-closed',()=>app.quit());
+`);
+  const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
+  let application;
+  const cleanup = async () => {
+    try { await application?.close(); }
+    finally { verifyContained(generated); fs.rmSync(path.resolve(generated), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
+  };
+  try {
+    application = await _electron.launch({ args: [mainPath, `--user-data-dir=${profile}`], env, timeout: 60000 });
+    const deadline = Date.now() + 30000;
+    while (application.windows().length < 3 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(application.windows().length, 3, 'Electron fixture must create three isolated visible windows');
+    const windows = application.windows(), context = application.context();
+    const runtime = await application.evaluate(() => ({ chromiumVersion: process.versions.chrome, electronVersion: process.versions.electron, platform: process.platform, arch: process.arch }));
+    let next = 0, installed = false;
+    return { runtime, version: () => runtime.chromiumVersion, close: cleanup, newContext: async () => {
+      const page = windows[next++]; assert.ok(page, 'Each Electron fixture context must have its own window');
+      return { addInitScript: async (script, arg) => {
+        // Playwright exposes one context for all Electron partitions. Installing
+        // once prevents nested RTC/WebSocket/codec wrappers in every window.
+        if (installed) return; installed = true; await context.addInitScript(script, { ...arg, phone: false });
+      }, newPage: async () => page };
+    } };
+  } catch (error) { await cleanup(); throw error; }
+}
 
 async function localHTTPS(runtime) {
   const cert = await selfsigned.generate([{ name: 'commonName', value: 'localhost' }], { keySize: 2048, algorithm: 'sha256' });
@@ -127,8 +191,9 @@ async function main() {
     const { createLocalCoordinator } = await import(pathToFileURL(path.join(root, 'internet-service/tests/local-runtime.mjs')).href);
     runtime = live ? null : await createLocalCoordinator({ bindings: { PUBLIC_ROOMS: 'true', WEBSOCKET_RELAY: 'true' } });
     proxy = await localHTTPS(runtime || { url: 'https://auralink-private-coordinator.auralink-internet-service.workers.dev' });
-    browser = await chromium.launch({ executablePath: browserPath, headless: true, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=WebRtcHideLocalIpsWithMdns', `--ignore-certificate-errors-spki-list=${proxy.spkiHash}`] });
-    proof.browser = { executable: path.basename(browserPath), version: browser.version() };
+    browser = electronMode ? await electronEngine(proxy.spkiHash) : await chromium.launch({ executablePath: browserPath, headless: true, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=WebRtcHideLocalIpsWithMdns', `--ignore-certificate-errors-spki-list=${proxy.spkiHash}`] });
+    proof.browser = { executable: electronMode ? path.basename(require('electron')) : path.basename(browserPath), version: browser.version() };
+    proof.engine = electronMode ? { mode: 'visible-electron', description: 'Visible BrowserWindows using packaged Electron dependency with synthetic media/native fixtures', ...browser.runtime, electronDependencyVersion: require('electron/package.json').version } : { mode: 'headless-chromium', description: 'Headless installed Chromium browser with synthetic media/native fixtures', platform: process.platform, arch: process.arch, chromiumVersion: browser.version() };
     const contexts = [];
     for (const [width, height, phone] of [[1380, 940, false], [1380, 940, false], [1380, 940, false]]) {
       const context = await browser.newContext({ viewport: { width, height }, isMobile: phone, hasTouch: phone, permissions: ['microphone'] }); contexts.push(context);
@@ -263,7 +328,7 @@ async function main() {
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     }
     assert.deepEqual(errors, []); proof.status = 'passed'; proof.coordinator = live ? 'Deployed public Cloudflare Worker via PKI-verified WSS' : 'Local workerd via TLS fixture';
-    proof.boundary = 'Actual renderer and TLS WebSocket; real RTC restricted to relay-only with no TURN. Synthetic microphone and OffscreenCanvas→generatedVideoFrame screen and native consent fixture. This measures one presenter at a time in both directions plus bidirectional voice over blocked-P2P fallback on two same-PC clients, not physical Mac audio/capture/input or different carriers/countries.';
+    proof.boundary = (electronMode ? 'Visible Electron dependency BrowserWindows with isolated synthetic/native bridge fixtures; this is not production preload/native WSS evidence. ' : '') + 'Actual renderer and TLS WebSocket; real RTC restricted to relay-only with no TURN. Synthetic microphone and OffscreenCanvas→generatedVideoFrame screen and native consent fixture. This measures one presenter at a time in both directions plus bidirectional voice over blocked-P2P fallback on two same-PC clients, not physical Mac audio/capture/input or different carriers/countries.';
     proof.sourceHashes = Object.fromEntries(['src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/renderer/internet.js'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')]));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify(proof, null, 2)); console.log(JSON.stringify(proof, null, 2));
   } catch (error) {
