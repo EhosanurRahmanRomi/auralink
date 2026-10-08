@@ -18,6 +18,11 @@ const root = path.resolve(__dirname, '..');
 const output = path.join(root, 'test-results');
 const live = process.argv.includes('--live');
 const electronMode = process.argv.includes('--electron');
+// Hosted Mac's native fake microphone produces zero PCM even with verified
+// launch flags/raw capture. Use an explicitly declared generated transport
+// source there, retaining native capture as a separate measured diagnostic.
+// The opt-in flag exercises this branch locally without changing Windows CI.
+const generatedMicrophone = process.platform === 'darwin' || process.argv.includes('--generated-microphone-fixture');
 const browserPath = [process.env.AURALINK_TEST_BROWSER, 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Google/Chrome/Application/chrome.exe', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/chromium', '/usr/bin/google-chrome'].filter(Boolean).find(file => fs.existsSync(file));
 if (!electronMode && !browserPath) throw new Error('Install Edge/Chrome or set AURALINK_TEST_BROWSER.');
 
@@ -221,13 +226,13 @@ async function main() {
     runtime = live ? null : await createLocalCoordinator({ bindings: { PUBLIC_ROOMS: 'true', WEBSOCKET_RELAY: 'true' } });
     proxy = await localHTTPS(runtime || { url: 'https://auralink-private-coordinator.auralink-internet-service.workers.dev' });
     browser = electronMode ? await electronEngine(proxy.spkiHash, wav) : await chromium.launch({ executablePath: browserPath, headless: true, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`, '--disable-audio-output', '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=WebRtcHideLocalIpsWithMdns', `--ignore-certificate-errors-spki-list=${proxy.spkiHash}`] });
-    proof.microphoneFixture = { source: 'Looping synthetic WAV through native getUserMedia fake device', sampleRate: 48000, channels: 1, frequencyHz: 440, durationSeconds: 2, outputDevice: 'Chromium fake final OS output stream; normal browser mixer and audio clock', measurement: 'Actual relay MediaStream output pulled through a silent analyzer branch', processing: 'Fixture-only raw capture: echoCancellation, noiseSuppression and autoGainControl disabled for the synthetic WAV as Chromium documents; production source unchanged', productionDefaultProcessingVerified: false, physicalMicrophoneVerified: false };
+    proof.microphoneFixture = { source: generatedMicrophone ? 'Synthetic native AudioContext→MediaStreamDestination microphone fixture; physical/defaultMacinput not verified' : 'Looping synthetic WAV through native getUserMedia fake device', sampleRate: 48000, channels: generatedMicrophone ? 2 : 1, frequencyHz: 440, durationSeconds: generatedMicrophone ? null : 2, outputDevice: 'Chromium fake final OS output stream; normal browser mixer and audio clock', measurement: 'Actual relay MediaStream output pulled through a silent analyzer branch', processing: generatedMicrophone ? 'Generated transport signal bypasses platform audio processing; native raw getUserMedia capture is measured separately, stopped and never used for transport. Production source unchanged.' : 'Fixture-only raw capture: echoCancellation, noiseSuppression and autoGainControl disabled for the synthetic WAV as Chromium documents; production source unchanged', nativeFakeCaptureUsedForTransport: !generatedMicrophone, nativeFakeInputVerified: generatedMicrophone ? false : null, productionDefaultProcessingVerified: false, physicalMicrophoneVerified: false };
     proof.browser = { executable: electronMode ? path.basename(require('electron')) : path.basename(browserPath), version: browser.version() };
     proof.engine = electronMode ? { mode: 'visible-electron', description: 'Visible BrowserWindows using packaged Electron dependency with synthetic media/native fixtures', ...browser.runtime, electronDependencyVersion: require('electron/package.json').version } : { mode: 'headless-chromium', description: 'Headless installed Chromium browser with synthetic media/native fixtures', platform: process.platform, arch: process.arch, chromiumVersion: browser.version() };
     const contexts = [];
     for (const [width, height, phone] of [[1380, 940, false], [1380, 940, false], [1380, 940, false]]) {
       const context = await browser.newContext({ viewport: { width, height }, isMobile: phone, hasTouch: phone, permissions: ['microphone'] }); contexts.push(context);
-      await context.addInitScript(({ origin, phone }) => {
+      await context.addInitScript(({ origin, phone, generatedMicrophone }) => {
         if (!localStorage.getItem('auralink.preferences')) localStorage.setItem('auralink.preferences', JSON.stringify({ name: 'My device', quality: '1440' }));
         window.qaSentTypes = []; window.qaCipherCount = 0; window.qaCipherViolation = false; window.qaCaptureCalls = []; window.qaStreams = []; window.qaPCs = []; window.qaTrustCalls = []; window.qaGrants = []; window.qaCopies = []; window.qaRoutes = []; window.qaInputs = [];
         const NativeSocket = window.WebSocket;
@@ -304,7 +309,46 @@ async function main() {
           request.actualProcessing = stream.getAudioTracks().map(track => processing(track.getSettings()));
           request.actualAudioTracks = stream.getAudioTracks().map(track => ({ label: track.label, sampleRate: track.getSettings().sampleRate, channelCount: track.getSettings().channelCount }));
           request.audioInputDevices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput').map(device => ({ label: device.label }));
-          qaStreams.push(stream); return stream;
+          qaStreams.push(stream);
+          if (!generatedMicrophone) return stream;
+          // This is an explicit Mac transport fixture, not recovery of a real
+          // microphone. Preserve the native fake-input result as independent
+          // evidence, including silence; it cannot make the media gate pass.
+          const context = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+          const analyser = context.createAnalyser(); analyser.fftSize = 512;
+          const silentPull = context.createGain(); silentPull.gain.value = 0;
+          analyser.connect(silentPull); silentPull.connect(context.destination);
+          const measure = async () => {
+            const values = new Float32Array(analyser.fftSize); let energy = 0;
+            for (let observations = 0; observations < 15; observations++) {
+              await new Promise(resolve => setTimeout(resolve, 80)); analyser.getFloatTimeDomainData(values);
+              energy = Math.max(energy, values.reduce((sum, sample) => sum + sample * sample, 0) / values.length);
+            }
+            return { meanSquareEnergy: energy, observations: 15, contextState: context.state, sampleRate: context.sampleRate };
+          };
+          let input, oscillator, gain, destination;
+          try {
+            await context.resume(); input = context.createMediaStreamSource(stream); input.connect(analyser);
+            request.nativeFakeInputDiagnostic = { ...await measure(), usedForTransport: false, verified: false };
+            request.nativeFakeInputDiagnostic.status = request.nativeFakeInputDiagnostic.meanSquareEnergy > .000001 ? 'Non-silent diagnostic only; not used for transport' : 'FAILED: native fake-input capture is silent; generated transport test does not verify it';
+            input.disconnect(); stream.getTracks().forEach(track => track.stop());
+            destination = context.createMediaStreamDestination(); oscillator = context.createOscillator(); gain = context.createGain();
+            oscillator.type = 'sine'; oscillator.frequency.value = 440; gain.gain.value = 8000 / 32768;
+            oscillator.connect(gain); gain.connect(destination); gain.connect(analyser); oscillator.start();
+            request.generatedTone = { ...await measure(), frequencyHz: 440, trackStopped: false, contextClosed: false };
+            if (request.generatedTone.meanSquareEnergy <= .000001 || context.state !== 'running') throw new Error('Generated microphone fixture must produce measured non-silent audio before relay capture');
+            const generated = destination.stream, track = generated.getAudioTracks()[0], stop = track.stop.bind(track); let cleaned = false;
+            request.generatedTone.actualAudioTracks = generated.getAudioTracks().map(item => ({ label: item.label, sampleRate: item.getSettings().sampleRate, channelCount: item.getSettings().channelCount }));
+            const cleanup = () => {
+              if (cleaned) return; cleaned = true; stop(); request.generatedTone.trackStopped = track.readyState === 'ended';
+              oscillator.stop(); oscillator.disconnect(); gain.disconnect(); analyser.disconnect(); silentPull.disconnect(); destination.disconnect();
+              void context.close().then(() => { request.generatedTone.contextClosed = context.state === 'closed'; });
+            };
+            track.stop = cleanup; track.addEventListener('ended', cleanup, { once: true });
+            qaStreams.push(generated); return generated;
+          } catch (error) {
+            stream.getTracks().forEach(track => track.stop()); input?.disconnect(); oscillator?.stop(); oscillator?.disconnect(); gain?.disconnect(); analyser.disconnect(); silentPull.disconnect(); destination?.disconnect(); await context.close(); throw error;
+          }
         };
         navigator.mediaDevices.getDisplayMedia = async () => {
           qaCaptureCalls.push('screen');
@@ -321,7 +365,7 @@ async function main() {
           const stream = new MediaStream([track]); qaStreams.push(stream); return stream;
         };
         window.auralink = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); }, requestMedia: async () => ({ ok: true }), copyText: async value => { qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async value => { qaInputs.push(value); return { ok: true }; }, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {} };
-      }, { origin: proxy.origin, phone });
+      }, { origin: proxy.origin, phone, generatedMicrophone });
     }
     const host = await contexts[0].newPage(); const guest = await contexts[1].newPage(); const outsider = await contexts[2].newPage();
     pages.push(host, guest);
@@ -345,8 +389,13 @@ async function main() {
     await shareScreen(host); proof.guestReceiver = await mediaProof(guest, 'Invitation host', host);
     proof.microphoneRequests = await Promise.all([host, guest].map(page => page.evaluate(() => qaMicrophoneRequests)));
     for (const requests of proof.microphoneRequests) for (const request of requests) {
-      assert.equal(request.completed, true, 'Fixture microphone must use completed native getUserMedia capture');
+      assert.equal(request.completed, true, 'Native getUserMedia acquisition must complete; Mac generated transport source is disclosed separately');
       for (const settings of request.actualProcessing) assert.deepEqual(settings, { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, 'Native fake microphone must honor exact raw-fixture processing constraints');
+      if (generatedMicrophone) {
+        assert.equal(request.nativeFakeInputDiagnostic.usedForTransport, false);
+        assert.equal(request.nativeFakeInputDiagnostic.verified, false, 'Generated source cannot verify native fake input');
+        assert.ok(request.generatedTone.meanSquareEnergy > .000001 && request.generatedTone.contextState === 'running', 'Generated source must have actual measured non-silent energy');
+      }
     }
     const codecProof = async page => { await page.locator('#diagnostics-toggle').click(); await page.waitForFunction(() => document.getElementById('diagnostics').textContent.includes('Secure relay')); const codecText = await page.locator('#diagnostics').innerText(); assert.match(codecText, /AVC|VP8|H\.264|avc1/i, 'Diagnostics must name the actual encoded screen codec'); await page.locator('#diagnostics-close').click(); return codecText.match(/AVC|VP8|H\.264|avc1/i)[0]; };
     proof.guestCodec = await codecProof(guest);
@@ -358,6 +407,10 @@ async function main() {
     proof.directRTCImpossibleAndClosed = true; proof.ciphertextOnlyMediaTransport = true;
     phase = 'relay microphone mute and restart'; await host.locator('#mic-button').click();
     await guest.waitForFunction(() => ![...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject));
+    if (generatedMicrophone) {
+      await host.waitForFunction(() => qaMicrophoneRequests.every(request => request.generatedTone?.trackStopped === true && request.generatedTone?.contextClosed === true));
+      proof.generatedMicrophoneMuteStopsTrackAndClosesContext = true;
+    }
     await host.locator('#mic-button').click(); proof.restartedAudio = (await mediaProof(guest, 'Invitation host', host)).audio;
     assert.ok(await guest.evaluate(() => qaRoutes.some(route => route.ongoing === true)), 'Audio bridge requests continuity after actual media is active');
     phase = 'lock keeps admitted people and blocks old capability'; await host.locator('#lock-room-button').click(); await host.waitForFunction(() => document.getElementById('room-code').value === 'Invitation closed');
@@ -411,7 +464,7 @@ async function main() {
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     }
     assert.deepEqual(errors, []); proof.status = 'passed'; proof.coordinator = live ? 'Deployed public Cloudflare Worker via PKI-verified WSS' : 'Local workerd via TLS fixture';
-    proof.boundary = (electronMode ? 'Visible Electron dependency BrowserWindows with isolated synthetic/native bridge fixtures; this is not production preload/native WSS evidence. ' : '') + 'Actual renderer and TLS WebSocket; real RTC restricted to relay-only with no TURN. Continuous synthetic WAV microphone through native fake getUserMedia with fixture-only raw processing constraints, Chromium fake final OS output stream, OffscreenCanvas→generatedVideoFrame screen and native consent fixture. Production audio constraints remain unchanged in shipped source; this raw-tone check does not verify default echo cancellation, noise suppression, automatic gain control or a physical Mac microphone. Receiver energy is measured from the actual decoded relay MediaStream, with real capture/playback PCM Worklet diagnostics. This measures one presenter at a time in both directions plus bidirectional voice over blocked-P2P fallback on two same-PC clients, not physical Mac audio/capture/input or different carriers/countries.';
+    proof.boundary = (electronMode ? 'Visible Electron dependency BrowserWindows with isolated synthetic/native bridge fixtures; this is not production preload/native WSS evidence. ' : '') + 'Actual renderer and TLS WebSocket; real RTC restricted to relay-only with no TURN. ' + (generatedMicrophone ? 'Explicit generated AudioContext oscillator→MediaStreamDestination microphone transport fixture. Native raw fake getUserMedia input is acquired, measured independently and stopped; its silence/failure is retained and is not verified by generated media. ' : 'Continuous synthetic WAV microphone through native fake getUserMedia with fixture-only raw processing constraints. ') + 'Chromium fake final OS output stream, OffscreenCanvas→generatedVideoFrame screen and native consent fixture. Production audio constraints remain unchanged in shipped source; this tone check does not verify default echo cancellation, noise suppression, automatic gain control or a physical Mac microphone. Receiver energy is measured from the actual decoded relay MediaStream, with real capture/playback PCM Worklet diagnostics. This measures one presenter at a time in both directions plus bidirectional voice over blocked-P2P fallback on two same-PC clients, not physical Mac audio/capture/input or different carriers/countries.';
     proof.sourceHashes = Object.fromEntries(['src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/renderer/internet.js'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')]));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify(proof, null, 2)); console.log(JSON.stringify(proof, null, 2));
   } catch (error) {
