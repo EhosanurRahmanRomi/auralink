@@ -176,7 +176,7 @@ export class RelayMedia {
   }
   addPeer(id) {
     if (!this.peers.has(id)) this.peers.set(id, { cipher: new RelayCipher(this.key, this.rtc.selfId, id), active: false,
-      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, needsKey: true, videoCodecs: null });
+      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingData: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, needsKey: true, videoCodecs: null });
     return this.peers.get(id);
   }
   activate(id) {
@@ -194,20 +194,32 @@ export class RelayMedia {
   }
   send(id, header, bytes) {
     const peer = this.peers.get(id);
-    if (this.closed || !peer?.active || peer.pending >= 3 || this.rtc.closed || !this.rtc.peers.has(id)) return false;
+    const data = header?.type === 'data', queue = data ? 'pendingData' : 'pending';
+    if (this.closed || !peer?.active || (data && peer.dataFailed) || peer[queue] >= (data ? 16 : 3) || this.rtc.closed || !this.rtc.peers.has(id)) return false;
+    if (data) {
+      try { const serialized = JSON.stringify(header.data); if (typeof serialized !== 'string' || serialized.length > 4096 || bytes?.length) return false; }
+      catch { return false; }
+    }
     let packet; try { packet = pack(header, bytes); } catch { return false; }
     if (packet.length > MAX_RELAY_PLAIN_BYTES) return false;
-    peer.pending++;
+    peer[queue]++;
     peer.sendQueue = peer.sendQueue.catch(() => {}).then(async () => {
-      if (this.closed || !peer.active || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
+      if (this.closed || !peer.active || (data && peer.dataFailed) || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
       const envelope = await peer.cipher.seal(packet);
       if (envelope && !this.closed && peer.active && this.peers.get(id) === peer && this.rtc.peers.has(id)) {
         const result = this.rtc.signal(id, { relay: envelope });
-        if (result !== false) peer.sent += packet.length;
-      }
-    }).catch(() => { if (!this.closed) this.rtc.emit('error', { peerId: id, error: new Error('The secure relay could not send media. Rejoin the room to retry.') }); })
-      .finally(() => { peer.pending--; });
+        if (result !== false) peer.sent += packet.length; else if (data) this.failData(id, peer);
+      } else if (data) this.failData(id, peer);
+    }).catch(() => {
+      if (data) this.failData(id, peer);
+      else if (!this.closed && this.peers.get(id) === peer && this.rtc.peers.has(id)) this.rtc.emit('error', { peerId: id, error: new Error('The secure relay could not send media. Rejoin the room to retry.') });
+    })
+      .finally(() => { peer[queue]--; });
     return true;
+  }
+  failData(id, peer) {
+    if (this.closed || this.rtc.closed || !peer.active || peer.dataFailed || peer.cipher.closed || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
+    peer.dataFailed = true; this.rtc.emit('channel', { peerId: id, open: false });
   }
   sendVideo(id, header, bytes) {
     const peer = this.peers.get(id);
@@ -240,7 +252,7 @@ export class RelayMedia {
   receive(id, envelope) {
     if (this.closed || !this.rtc.peers.has(id) || !validRelayEnvelope(envelope)) return;
     const peer = this.addPeer(id);
-    if ((peer.receiving || 0) >= 12) { peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
+    if ((peer.receiving || 0) >= 32) { this.failData(id, peer); peer.decoderNeedsKey = true; this.requestPeerKey(id, peer); return; }
     peer.receiving = (peer.receiving || 0) + 1;
     peer.receiveQueue = peer.receiveQueue.catch(() => {}).then(async () => {
       const bytes = await peer.cipher.open(envelope);
@@ -263,7 +275,7 @@ export class RelayMedia {
       } else if (header.type === 'video') await this.video(id, peer, header, payload);
       else if (header.type === 'video-chunk') await this.videoChunk(id, peer, header, payload);
       else if (header.type === 'audio') await this.audio(id, peer, header, payload);
-      else if (header.type === 'data' && payload.length === 0 && JSON.stringify(header.data).length <= 4096) this.rtc.emit('data', { peerId: id, data: header.data });
+      else if (header.type === 'data' && !peer.dataFailed && payload.length === 0 && JSON.stringify(header.data).length <= 4096) this.rtc.emit('data', { peerId: id, data: header.data });
     }).catch(() => { /* A malformed or interrupted media frame is discarded. */ }).finally(() => { peer.receiving--; });
   }
   async resumePlayback() { await Promise.all([...this.audioContexts].map(context => context.resume().catch(() => {}))); }

@@ -193,3 +193,61 @@ test('removing a peer while encryption is queued cannot forward encoded media', 
   assert.equal(media.sendVideo('guest', { type: 'video-chunk', chunkType: 'key' }, new Uint8Array(160000)), true);
   media.removePeer('guest'); transport.peers.delete('guest'); await peer.sendQueue; assert.equal(transport.calls.length, 0); media.close();
 });
+test('four ordered input events survive a full media queue and the independent input ceiling fails closed', async () => {
+  const { RelayMedia, RelayCipher } = await ready;
+  const transport = rtc(), key = randomBytes(32).toString('base64url'), media = new RelayMedia(transport, key);
+  const peer = media.addPeer('guest'); peer.active = true;
+  const events = ['ShiftDown', 'KeyDown', 'KeyUp', 'ShiftUp'];
+  for (let index = 0; index < 3; index++) assert.equal(media.send('guest', { type: 'audio', sampleRate: 24000 }, new Uint8Array(20)), true);
+  for (const event of events) assert.equal(media.send('guest', { type: 'data', data: { type: 'input', event } }), true, event + ' must have its own bounded queue allowance');
+  for (let index = 4; index < 16; index++) assert.equal(media.send('guest', { type: 'data', data: { type: 'input', index } }), true);
+  assert.equal(media.send('guest', { type: 'data', data: { type: 'input', index: 16 } }), false);
+  assert.equal(media.send('guest', { type: 'data', data: { type: 'input', payload: 'A'.repeat(4097) } }), false);
+  await peer.sendQueue;
+  const receiver = new RelayCipher(key, 'guest', 'owner'), decoded = [];
+  for (const item of transport.calls) {
+    const plain = await receiver.open(item.data.relay); assert.ok(plain);
+    const length = new DataView(plain.buffer, plain.byteOffset, plain.byteLength).getUint16(0);
+    decoded.push(JSON.parse(new TextDecoder().decode(plain.slice(2, length + 2))));
+  }
+  assert.deepEqual(decoded.filter(item => item.type === 'data').slice(0, 4).map(item => item.data.event), events);
+  assert.equal(peer.pending, 0); assert.equal(peer.pendingData, 0);
+  assert.equal(media.send('guest', { type: 'data', data: { type: 'input', event: 'late' } }), true);
+  const sent = transport.calls.length; media.removePeer('guest'); transport.peers.delete('guest'); await peer.sendQueue;
+  assert.equal(transport.calls.length, sent); receiver.close(); media.close();
+});
+test('an asynchronously refused encrypted input emits channel closure before another input can proceed', async () => {
+  const { RelayMedia } = await ready;
+  const transport = rtc(), emitted = []; transport.emit = (type, detail) => emitted.push({ type, detail }); transport.signal = () => false;
+  const media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
+  assert.equal(media.send('guest', { type: 'data', data: { type: 'input', event: { type: 'keyup' } } }), true);
+  await peer.sendQueue;
+  assert.deepEqual(emitted, [{ type: 'channel', detail: { peerId: 'guest', open: false } }]);
+  assert.equal(media.send('guest', { type: 'data', data: { type: 'input', event: { type: 'keydown' } } }), false);
+  assert.equal(peer.active, true, 'Control failure leaves media running'); media.close();
+});
+test('receive queue overflow revokes the input channel before discarding a possible release', async () => {
+  const { RelayMedia, RelayCipher } = await ready;
+  const transport = rtc(), emitted = []; transport.emit = (type, detail) => emitted.push({ type, detail });
+  const key = randomBytes(32).toString('base64url'), media = new RelayMedia(transport, key), peer = media.addPeer('guest'); peer.active = true; peer.receiving = 32;
+  const sender = new RelayCipher(key, 'guest', 'owner'); media.receive('guest', await sender.seal(new Uint8Array(4)));
+  assert.deepEqual(emitted, [{ type: 'channel', detail: { peerId: 'guest', open: false } }]);
+  assert.equal(peer.receiving, 32); assert.equal(peer.active, true); sender.close(); media.close();
+});
+test('async input encryption and forwarding exceptions revoke once, while stale failures after teardown cannot notify', async () => {
+  const { RelayMedia } = await ready;
+  for (const failure of ['seal-null', 'seal-throw', 'signal-throw', 'stale-seal-throw']) {
+    const transport = rtc(), emitted = []; transport.emit = (type, detail) => emitted.push({ type, detail });
+    const media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
+    let started, reject; const pending = new Promise(resolve => { started = resolve; });
+    if (failure === 'seal-null') peer.cipher.seal = async () => null;
+    if (failure === 'seal-throw') peer.cipher.seal = async () => { throw new Error('Fixture encryption failed'); };
+    if (failure === 'signal-throw') transport.signal = () => { throw new Error('Fixture forward failed'); };
+    if (failure === 'stale-seal-throw') peer.cipher.seal = () => { started(); return new Promise((resolve, rejectFailure) => { reject = rejectFailure; }); };
+    assert.equal(media.send('guest', { type: 'data', data: { type: 'input', event: { type: 'keyup' } } }), true);
+    if (failure === 'stale-seal-throw') { await pending; media.removePeer('guest'); transport.peers.delete('guest'); reject(new Error('Old encryption failed')); }
+    await peer.sendQueue;
+    assert.deepEqual(emitted, failure === 'stale-seal-throw' ? [] : [{ type: 'channel', detail: { peerId: 'guest', open: false } }], failure);
+    assert.equal(peer.pendingData, 0); media.close();
+  }
+});

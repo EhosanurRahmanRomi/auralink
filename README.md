@@ -55,7 +55,7 @@ These captures show the bundled interface. Validation identifies actual-app and 
 - Invitation rooms for up to four people, host removal, invitation closure/rotation and separate control consent.
 - Direct encrypted WebRTC plus bounded encrypted WebSocket fallback when enabled by the service.
 
-Two actual Electron apps on one Windows PC exchanged a **2560×1440 H.264 screen at 18–22 measured fps**, one presenter at a time in both directions, through the deployed relay with direct RTC deliberately blocked. This establishes that specific synthetic test, not physical Mac capture/control or a different-network result. **1440p/30 fps remains a ceiling, not a guarantee**; hardware, codecs, bandwidth and motion affect quality. Basic JPEG fallback is a limited compatibility mode. See [validation](VALIDATION.md).
+Two actual Electron apps on one Windows PC exchanged a **2560×1440 H.264 screen at 26–27 measured fps**, one presenter at a time in both directions, through the deployed relay with direct RTC deliberately blocked. This establishes that specific synthetic test, not physical Mac capture/control or a different-network result. **1440p/30 fps remains a ceiling, not a guarantee**; hardware, codecs, bandwidth and motion affect quality. Basic JPEG fallback is a limited compatibility mode. See [validation](VALIDATION.md).
 
 Different networks can block direct media while both apps appear online. Coordination makes rooms reachable; relay supplies an alternate media path. Free infrastructure has finite room, byte and message budgets, rather than unlimited hosting or full decentralization. TURN is optional and disabled until provider-enforced free quota and credential expiry are verified. See [service setup](internet-service/README.md).
 

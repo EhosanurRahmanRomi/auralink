@@ -98,7 +98,7 @@ async function rejectedJoin(page, code) {
 }
 
 async function main() {
-  let runtime, proxy, browser; const errors = []; let phase = 'setup'; const proof = {};
+  let runtime, proxy, browser; const errors = []; const pages = []; let phase = 'setup'; const proof = {};
   fs.mkdirSync(output, { recursive: true });
   try {
     const { createLocalCoordinator } = await import(pathToFileURL(path.join(root, 'internet-service/tests/local-runtime.mjs')).href);
@@ -111,7 +111,7 @@ async function main() {
       const context = await browser.newContext({ viewport: { width, height }, isMobile: phone, hasTouch: phone, permissions: ['microphone'] }); contexts.push(context);
       await context.addInitScript(({ origin, phone }) => {
         if (!localStorage.getItem('auralink.preferences')) localStorage.setItem('auralink.preferences', JSON.stringify({ name: 'My device', quality: '1440' }));
-        window.qaSentTypes = []; window.qaCipherCount = 0; window.qaCipherViolation = false; window.qaCaptureCalls = []; window.qaStreams = []; window.qaPCs = []; window.qaTrustCalls = []; window.qaGrants = []; window.qaCopies = []; window.qaRoutes = [];
+        window.qaSentTypes = []; window.qaCipherCount = 0; window.qaCipherViolation = false; window.qaCaptureCalls = []; window.qaStreams = []; window.qaPCs = []; window.qaTrustCalls = []; window.qaGrants = []; window.qaCopies = []; window.qaRoutes = []; window.qaInputs = [];
         const NativeSocket = window.WebSocket;
         window.WebSocket = new Proxy(NativeSocket, { construct(target, args) {
           const requested = new URL(args[0]); if (requested.protocol !== 'wss:' || requested.pathname !== '/internet/ws') throw new Error('Unexpected QA socket target');
@@ -144,10 +144,11 @@ async function main() {
           const stop = track.stop.bind(track); track.stop = () => { clearInterval(timer); void writer.abort().catch(() => {}); stop(); };
           const stream = new MediaStream([track]); qaStreams.push(stream); return stream;
         };
-        window.auralink = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); }, requestMedia: async () => ({ ok: true }), copyText: async value => { qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async () => {}, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {} };
+        window.auralink = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); }, requestMedia: async () => ({ ok: true }), copyText: async value => { qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async value => { qaInputs.push(value); return { ok: true }; }, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {} };
       }, { origin: proxy.origin, phone });
     }
     const host = await contexts[0].newPage(); const guest = await contexts[1].newPage(); const outsider = await contexts[2].newPage();
+    pages.push(host, guest);
     for (const page of [host, guest, outsider]) { page.on('pageerror', error => errors.push(`${phase}: ${error.message}`)); await page.goto(proxy.origin); }
     await host.locator('#quick-name').fill('Invitation host'); await guest.locator('#quick-name').fill('Invitation guest'); await outsider.locator('#quick-name').fill('Fresh identity');
     phase = 'single-click creation'; await host.locator('#host-button').click(); await host.waitForFunction(() => !document.getElementById('mic-button').disabled);
@@ -195,10 +196,34 @@ async function main() {
     // Public identities are deliberately ephemeral. A newly opened app has a
     // new identity and may enter with a newly shared capability, never the old one.
     await guest.reload(); await join(guest, thirdCode); await host.locator('.nav-item[data-view="rooms"]').click(); await shareScreen(host);
+    await guest.locator('#mic-button').click();
+    phase = 'new guest establishes live fallback before control consent';
+    await guest.waitForFunction(() => qaPCs.every(pc => pc.connectionState === 'closed') && document.getElementById('stage-video').videoWidth === 2560 && document.getElementById('stage-video').currentTime > 0 && [...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject?.getAudioTracks().length && !audio.paused && !audio.muted));
+    await host.waitForFunction(() => qaPCs.every(pc => pc.connectionState === 'closed') && [...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject?.getAudioTracks().length && !audio.paused && !audio.muted));
+    for (const page of [host, guest]) await page.waitForFunction(() => qaCipherCount > 10 && !qaCipherViolation);
+    phase = 'control is still a separate consent after fallback is established';
     await guest.waitForFunction(() => !document.getElementById('request-control').disabled); await guest.locator('#request-control').click(); await host.waitForFunction(() => document.getElementById('control-dialog').open);
     assert.deepEqual(await host.evaluate(() => qaGrants), []); await host.locator('#deny-control').click(); await guest.waitForFunction(() => document.getElementById('request-control').querySelector('small').textContent === 'Request control');
     await guest.locator('#request-control').click(); await host.waitForFunction(() => document.getElementById('control-dialog').open); await host.locator('#allow-control').click(); await guest.waitForFunction(() => !document.getElementById('control-banner').hidden);
     assert.equal(await host.evaluate(() => qaGrants.length), 1); proof.autoEntryDoesNotAuthorizeScreenCaptureOrRemoteControl = true;
+    phase = 'ordered encrypted shifted key burst during screen and voice';
+    assert.ok(await guest.evaluate(() => [...document.querySelectorAll('audio[data-peer]')].some(audio => audio.srcObject?.getAudioTracks().length && !audio.paused && !audio.muted)));
+    const beforeInputTime = await guest.locator('#stage-video').evaluate(video => video.currentTime);
+    await guest.locator('#stage-video').focus(); await guest.keyboard.press('Shift+A');
+    phase = 'owner receives all four encrypted shifted key events';
+    await host.waitForFunction(() => qaInputs.length >= 4);
+    const deliveredKeys = await host.evaluate(() => qaInputs.map(({ event }) => ({ type: event.type, code: event.code, key: event.key, seq: event.seq })));
+    assert.deepEqual(deliveredKeys.map(({ type, code, key }) => ({ type, code, key })), [
+      { type: 'keydown', code: 'ShiftLeft', key: 'Shift' }, { type: 'keydown', code: 'KeyA', key: 'A' },
+      { type: 'keyup', code: 'KeyA', key: 'A' }, { type: 'keyup', code: 'ShiftLeft', key: 'Shift' }
+    ], 'One shifted character must deliver all four down/up events in order over encrypted fallback');
+    assert.ok(deliveredKeys.every((event, index) => Number.isSafeInteger(event.seq) && (!index || event.seq > deliveredKeys[index - 1].seq)), 'Delivered control sequence must increase');
+    assert.equal(await guest.locator('#control-banner').isVisible(), true, 'A normal four-event key burst must retain control');
+    assert.equal(await host.locator('#control-banner').isVisible(), true, 'Owner consent must remain active after delivered key releases');
+    await guest.waitForFunction(before => document.getElementById('stage-video').currentTime > before, beforeInputTime);
+    for (const page of [host, guest]) assert.ok(await page.evaluate(() => qaCipherCount > 10 && !qaCipherViolation));
+    proof.shiftedKeyBurstDeliveredInOrder = deliveredKeys;
+    proof.shiftedKeyBurstRetainsConsentAndLiveMedia = true;
     phase = 'teardown'; await guest.locator('#end-button').click(); await guest.waitForFunction(() => document.getElementById('host-button').disabled === false); await host.locator('#end-button').click(); await host.waitForFunction(() => document.getElementById('host-button').disabled === false);
     for (const page of [host, guest, outsider]) {
       assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('auralink.internet.identity:')).length), 0);
@@ -209,7 +234,8 @@ async function main() {
     proof.sourceHashes = Object.fromEntries(['src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/renderer/internet.js'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')]));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify(proof, null, 2)); console.log(JSON.stringify(proof, null, 2));
   } catch (error) {
-    fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify({ ...proof, status: 'failed', phase, error: error.message, pageErrors: errors }, null, 2)); throw error;
+    const diagnostics = await Promise.all(pages.map(page => page.evaluate(() => ({ inputs: qaInputs.map(({ event }) => event), grants: qaGrants.length, consentVisible: !document.getElementById('control-banner').hidden, toast: document.getElementById('toast-region').textContent, screen: { hidden: document.getElementById('stage-video').hidden, time: document.getElementById('stage-video').currentTime, width: document.getElementById('stage-video').videoWidth }, audio: [...document.querySelectorAll('audio[data-peer]')].map(audio => ({ hasStream: Boolean(audio.srcObject), paused: audio.paused, muted: audio.muted })), rtcStates: qaPCs.map(pc => pc.connectionState) })).catch(() => null)));
+    fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify({ ...proof, status: 'failed', phase, error: error.message, pageErrors: errors, diagnostics }, null, 2)); throw error;
   } finally { await browser?.close(); await proxy?.close(); await runtime?.close(); }
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
