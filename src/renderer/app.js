@@ -568,7 +568,17 @@ $('join-form').addEventListener('submit', async (event) => {
     if (!admissionCurrent(epoch)) return;
     preferences.name = $('join-name').value.trim().slice(0, 48) || 'My device'; $('display-name').value = preferences.name; savePreferences();
     if (room.internet) await ensureInternetOnline(room.url);
-    else if (bridge?.trustInvite) room = { ...room, ...await bridge.trustInvite(room.invite) };
+    else {
+      if (bridge?.platform === 'android') {
+        // Android owns one native signaling socket. Leaving an Internet room
+        // keeps its directory online, so release that idle socket before a
+        // Nearby host is verified. The native bridge posts closeSocket and
+        // trustInvite onto the same main-thread queue in this call order.
+        internet.close(); preferences.internetOnline = false; savePreferences();
+      }
+      if (!admissionCurrent(epoch)) return;
+      if (bridge?.trustInvite) room = { ...room, ...await bridge.trustInvite(room.invite) };
+    }
     if (!admissionCurrent(epoch)) return;
     state.room = { ...room, name: 'Private room' };
     state.preparing = null; $('join-dialog').close();

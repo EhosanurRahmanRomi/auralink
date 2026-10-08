@@ -12,6 +12,8 @@ const { pathToFileURL } = require('node:url');
 const WebSocket = require('ws');
 const selfsigned = require('selfsigned');
 const { chromium } = require('playwright');
+const { createBroker } = require('../src/core/broker.cjs');
+const { fingerprint } = require('../src/core/invite.cjs');
 const root = path.resolve(__dirname, '..');
 const output = path.join(root, 'test-results');
 const browserPath = [process.env.AURALINK_TEST_BROWSER, 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Google/Chrome/Application/chrome.exe', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/chromium', '/usr/bin/google-chrome'].filter(Boolean).find(file => fs.existsSync(file));
@@ -39,9 +41,19 @@ async function localHTTPS(runtime) {
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const nearby = await createBroker({ host: '127.0.0.1', name: 'Nearby transition fixture', tls: { key: cert.private, cert: cert.cert } });
+  const nearbyHost = new WebSocket(nearby.url.replace(/^https:/, 'wss:') + '/ws', { rejectUnauthorized: false });
+  await new Promise((resolve, reject) => { nearbyHost.once('open', resolve); nearbyHost.once('error', reject); });
+  const hostWelcome = new Promise(resolve => nearbyHost.once('message', resolve));
+  nearbyHost.send(JSON.stringify({ type: 'join', name: 'Nearby fixture owner', roomKey: nearby.roomKey, hostToken: nearby.hostToken }));
+  assert.equal(JSON.parse(String(await hostWelcome)).type, 'welcome');
+  let nearbyApprovals = 0;
+  nearbyHost.on('message', raw => { const packet = JSON.parse(String(raw)); if (packet.type === 'join-request') { nearbyApprovals++; nearbyHost.send(JSON.stringify({ type: 'approve', peerId: packet.peerId })); } });
   const spkiHash = createHash('sha256').update(new X509Certificate(cert.cert).publicKey.export({ format: 'der', type: 'spki' })).digest('base64');
-  return { origin: `https://127.0.0.1:${server.address().port}`, spkiHash, close: async () => {
+  return { origin: `https://127.0.0.1:${server.address().port}`, spkiHash, nearbyOrigin: nearby.url,
+    nearbyInvite: `${nearby.url}/#key=${nearby.roomKey}&fp=${fingerprint(cert.cert)}`, nearbyApprovals: () => nearbyApprovals, close: async () => {
     for (const { client, upstream } of connections) { client.terminate(); upstream.terminate(); }
+    nearbyHost.terminate(); await nearby.stop();
     await new Promise(resolve => wss.close(resolve)); await new Promise(resolve => server.close(resolve));
   } };
 }
@@ -192,6 +204,58 @@ async function main() {
     await shareScreen(host); await guest.waitForFunction(() => !document.getElementById('request-control').disabled); await guest.locator('#request-control').click(); await host.waitForFunction(() => document.getElementById('control-dialog').open);
     assert.equal(await host.evaluate(() => qaGrants.length), 1, 'Reselected display cannot inherit old consent'); await host.locator('#allow-control').click(); await guest.waitForFunction(() => !document.getElementById('control-banner').hidden);
     assert.equal(await host.evaluate(() => qaGrants.length), 2); proof.changedDisplayRequiresReselectionAndNewConsent = true;
+    phase = 'Android public-room exit switches directly to Nearby';
+    const androidContext = await browser.newContext({ viewport: { width: 412, height: 915 }, isMobile: true, hasTouch: true });
+    await androidContext.addInitScript(({ origin, nearbyOrigin }) => {
+      const BrowserSocket = window.WebSocket;
+      window.qaNativeCalls = []; window.qaAndroidCaptures = []; window.qaAndroidGrants = [];
+      let ownedSocket = null, nativeQueue = Promise.resolve();
+      // Mirror the Android bridge's one socket and ordered main-thread queue.
+      // Delayed execution catches trusting Nearby before closeSocket was posted.
+      const nativeCall = (method, operation) => {
+        qaNativeCalls.push(method); const result = nativeQueue.then(async () => { await new Promise(resolve => setTimeout(resolve, 20)); return operation(); });
+        nativeQueue = result.catch(() => {}); return result;
+      };
+      const openSocket = address => {
+        if (ownedSocket) throw new Error('The native fixture still owns another socket');
+        const url = new URL(address), mapped = url.pathname === '/internet/ws' ? origin.replace(/^https:/, 'wss:') + '/internet/ws' : address;
+        const socket = new BrowserSocket(mapped); ownedSocket = socket; const close = socket.close.bind(socket);
+        socket.close = () => { void nativeCall('closeSocket', () => { if (ownedSocket === socket) ownedSocket = null; close(); }); };
+        return socket;
+      };
+      window.auralink = { platform: 'android', getInfo: async () => ({ platform: 'Android single-socket fixture' }), getPendingInvitation: async () => null,
+        trustInternetService: address => nativeCall('trustInternetService', () => { if (ownedSocket) throw new Error('Disconnect before selecting another service.'); }),
+        createInternetSocket: openSocket, createSocket: openSocket,
+        trustInvite: invitation => nativeCall('trustInvite', () => {
+          if (ownedSocket) throw new Error('Leave your room before checking another invitation.');
+          const value = new URL(invitation); if (value.origin !== nearbyOrigin) throw new Error('Unexpected Nearby fixture origin');
+          const parameters = new URLSearchParams(value.hash.slice(1));
+          return { url: value.origin, roomKey: parameters.get('key'), fingerprint: parameters.get('fp') };
+        }),
+        setAudioRoute: async () => ({ ok: true }), stopScreenShare: async () => ({ ok: true }), stopSharing: async () => {}, revokeControl: async () => {},
+        grantControl: async () => { qaAndroidGrants.push('control'); return { ok: true }; }, requestMedia: async () => ({ ok: true }) };
+      navigator.mediaDevices.getUserMedia = async () => { qaAndroidCaptures.push('microphone'); throw new Error('Transition must not request media'); };
+      navigator.mediaDevices.getDisplayMedia = async () => { qaAndroidCaptures.push('screen'); throw new Error('Transition must not request media'); };
+      localStorage.setItem('auralink.internet.identity:https://saved-private.example', JSON.stringify({ deviceId: 'preserved-device', deviceToken: 'preserved-private-token' }));
+    }, { origin: proxy.origin, nearbyOrigin: proxy.nearbyOrigin });
+    const android = await androidContext.newPage(); android.on('pageerror', error => errors.push(`${phase}: ${error.message}`)); await android.goto(proxy.origin);
+    await android.locator('#host-button').click(); await android.waitForFunction(() => !document.getElementById('mic-button').disabled);
+    assert.equal(await android.locator('#camera-button').count(), 0);
+    await android.locator('#end-button').click(); await android.waitForFunction(() => !document.getElementById('host-button').disabled);
+    assert.equal(await android.locator('#internet-status').textContent(), 'Online', 'Leaving the public room deliberately retains its idle directory');
+    assert.deepEqual(await android.evaluate(() => qaNativeCalls), ['trustInternetService'], 'Room exit alone must not close the directory');
+    await android.locator('#join-button').click(); await android.locator('#join-invite').fill(proxy.nearbyInvite); await android.locator('#join-submit').click();
+    await android.waitForFunction(() => !document.getElementById('mic-button').disabled);
+    assert.equal(proxy.nearbyApprovals(), 1, 'The actual Nearby broker must receive and approve exactly one guest request');
+    assert.deepEqual(await android.evaluate(() => qaNativeCalls.slice(0, 3)), ['trustInternetService', 'closeSocket', 'trustInvite'], 'Native closeSocket must precede Nearby certificate trust');
+    assert.equal(await android.locator('#internet-status').textContent(), 'Offline');
+    assert.equal(await android.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).internetOnline), false);
+    assert.equal(await android.evaluate(() => JSON.parse(localStorage.getItem('auralink.internet.identity:https://saved-private.example')).deviceToken), 'preserved-private-token');
+    assert.deepEqual(await android.evaluate(() => qaAndroidCaptures), []); assert.deepEqual(await android.evaluate(() => qaAndroidGrants), []);
+    proof.androidPublicExitToNearby = { passed: true, actualRendererUI: true, singleNativeSocketFixture: true, delayedOrderedNativeQueue: true,
+      nativeCallOrder: await android.evaluate(() => qaNativeCalls.slice(0, 3)), actualNearbyHostApprovals: proxy.nearbyApprovals(), internetDirectoryOffline: true,
+      savedPrivateIdentityPreserved: true, noCaptureOrControlGranted: true, physicalAndroidVerified: false };
+    await android.locator('#end-button').click(); await android.waitForFunction(() => !document.getElementById('host-button').disabled); await androidContext.close();
     phase = 'teardown'; await guest.locator('#end-button').click(); await guest.waitForFunction(() => document.getElementById('host-button').disabled === false); await host.locator('#end-button').click(); await host.waitForFunction(() => document.getElementById('host-button').disabled === false);
     for (const page of [host, guest, outsider]) {
       assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('auralink.internet.identity:')).length), 0);

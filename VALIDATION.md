@@ -12,6 +12,8 @@ The Mac package check now reads the actual signed app and audio helper entitleme
 
 Android 0.4.1 is included with its public invitation flow and separate native foreground room/call and projection services. The production audio route has JVM coverage for focus refusal/loss/recovery, rejected device selection and restoration after native exceptions. Its APK is checked for manifest, permissions, signature, DEX and renderer source parity, then exercised separately in the hosted native runtime workflow. Release assembly requires the actual APK's public relay media, Home/return, projection rotation, consented Accessibility input and owner revocation stages to pass. Physical iQOO sound and manufacturer battery restrictions remain unverified; Android capture does not promise desktop 1440p/30 fps.
 
+The native regression also exposed an Android transition failure: leaving an Internet room kept the directory socket online, preventing the separate Nearby invitation from being verified. Nearby submission now releases that idle connection before native pin verification. Active rooms still require leaving first; joining never grants capture or control.
+
 Cloudflare Realtime TURN remains disabled because the inspected activation form requires a payment method and billable overages. Its backend adapter has mocked-provider tests only. No paid subscription, card or overage option was enabled. The default retains finite Workers Free media allowances.
 
 ## Historical 0.4.0 desktop screen-sharing revision

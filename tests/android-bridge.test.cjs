@@ -54,6 +54,17 @@ test('Android bridge exposes attended screen/input RPCs without desktop room hos
   await assert.rejects(bridge.trustInvite('x'.repeat(4097)), /Invalid room invitation/);
 });
 
+test('closing the idle Internet socket posts native release before Nearby trust', async () => {
+  const { bridge, receive, messages } = setup();
+  const socket = bridge.createInternetSocket('wss://service.example/internet/ws'); await flush();
+  receive({ event: 'socket', socketId: socket.id, type: 'open' });
+  socket.close();
+  await bridge.trustInvite('https://192.168.1.2:4443/#key=fixture&fp=fixture');
+  assert.deepEqual(messages.map(message => message.method), ['openSocket', 'closeSocket', 'trustInvite'], 'Release and trust must reach the same native main-thread queue in order');
+  receive({ event: 'socket', socketId: socket.id, type: 'close', code: 1000 });
+  assert.equal(socket.readyState, 3); await flush();
+});
+
 test('Android capture events reject oversized, malformed and replayed frames and support unsubscribe', async () => {
   const { bridge, receive, messages } = setup();
   const frames = []; const stops = [];
