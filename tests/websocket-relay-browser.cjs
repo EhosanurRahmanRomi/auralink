@@ -49,18 +49,8 @@ async function electronEngine(spkiHash, wav) {
   fs.writeFileSync(mainPath, `
 const {app,BrowserWindow,session}=require('electron');
 app.setName('Auralink relay engine fixture');
-app.commandLine.appendSwitch('ignore-certificate-errors-spki-list',${JSON.stringify(spkiHash)});
-app.commandLine.appendSwitch('use-fake-device-for-media-stream');
-app.commandLine.appendSwitch('use-fake-ui-for-media-stream');
-app.commandLine.appendSwitch('use-file-for-fake-audio-capture',${JSON.stringify(wav)});
-// Keep the normal Chromium output/mixer clock with an explicit fake final OS
-// output stream. Hosted Mac runners do not provide physical speakers.
-app.commandLine.appendSwitch('disable-audio-output');
-app.commandLine.appendSwitch('autoplay-policy','no-user-gesture-required');
-app.commandLine.appendSwitch('disable-background-timer-throttling');
-app.commandLine.appendSwitch('disable-renderer-backgrounding');
-app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
-app.commandLine.appendSwitch('disable-features','WebRtcHideLocalIpsWithMdns');
+// Fixture switches are supplied at process launch before Chromium/native
+// AudioManager initialization, rather than appended by this JavaScript main.
 const windows=[];
 app.whenReady().then(async()=>{
   for(let index=0;index<3;index++){
@@ -83,12 +73,19 @@ app.on('window-all-closed',()=>app.quit());
     finally { verifyContained(generated); fs.rmSync(path.resolve(generated), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); }
   };
   try {
-    application = await _electron.launch({ args: [mainPath, `--user-data-dir=${profile}`], env, timeout: 60000 });
+    // Native AudioManager may initialize before the app's JavaScript main on
+    // macOS. Supply fake input/file/output flags in argv from process startup.
+    // Fake final OS output retains Chromium's normal mixer and audio clock on
+    // hosted runners without physical speakers.
+    const switches = ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`, '--disable-audio-output', '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=WebRtcHideLocalIpsWithMdns', `--ignore-certificate-errors-spki-list=${spkiHash}`, `--user-data-dir=${profile}`];
+    application = await _electron.launch({ args: [...switches, mainPath], env, timeout: 60000 });
     const deadline = Date.now() + 30000;
     while (application.windows().length < 3 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
     assert.equal(application.windows().length, 3, 'Electron fixture must create three isolated visible windows');
     const windows = application.windows(), context = application.context();
-    const runtime = await application.evaluate(() => ({ chromiumVersion: process.versions.chrome, electronVersion: process.versions.electron, platform: process.platform, arch: process.arch }));
+    const runtime = await application.evaluate(({ app }, expectedFile) => ({ chromiumVersion: process.versions.chrome, electronVersion: process.versions.electron, platform: process.platform, arch: process.arch,
+      fixtureCommandLine: { suppliedAtProcessLaunch: true, fakeDevice: app.commandLine.hasSwitch('use-fake-device-for-media-stream'), fakeUi: app.commandLine.hasSwitch('use-fake-ui-for-media-stream'), fakeAudioFile: app.commandLine.hasSwitch('use-file-for-fake-audio-capture'), fakeAudioFileMatchesExpected: app.commandLine.getSwitchValue('use-file-for-fake-audio-capture') === expectedFile, fakeFinalOutput: app.commandLine.hasSwitch('disable-audio-output') } }), wav);
+    assert.ok(Object.values(runtime.fixtureCommandLine).every(value => value === true), 'Every declared fake-media launch switch must be present with the expected file; private fixture paths are omitted from evidence');
     let next = 0, installed = false;
     return { runtime, version: () => runtime.chromiumVersion, close: cleanup, newContext: async () => {
       const page = windows[next++]; assert.ok(page, 'Each Electron fixture context must have its own window');
@@ -305,6 +302,8 @@ async function main() {
           const stream = await nativeCapture({ ...config, audio: fixtureAudio });
           request.completed = true;
           request.actualProcessing = stream.getAudioTracks().map(track => processing(track.getSettings()));
+          request.actualAudioTracks = stream.getAudioTracks().map(track => ({ label: track.label, sampleRate: track.getSettings().sampleRate, channelCount: track.getSettings().channelCount }));
+          request.audioInputDevices = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'audioinput').map(device => ({ label: device.label }));
           qaStreams.push(stream); return stream;
         };
         navigator.mediaDevices.getDisplayMedia = async () => {
