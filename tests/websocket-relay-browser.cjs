@@ -224,7 +224,7 @@ async function main() {
     runtime = live ? null : await createLocalCoordinator({ bindings: { PUBLIC_ROOMS: 'true', WEBSOCKET_RELAY: 'true' } });
     proxy = await localHTTPS(runtime || { url: 'https://auralink-private-coordinator.auralink-internet-service.workers.dev' });
     browser = electronMode ? await electronEngine(proxy.spkiHash, wav) : await chromium.launch({ executablePath: browserPath, headless: true, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', `--use-file-for-fake-audio-capture=${wav}`, '--disable-audio-output', '--autoplay-policy=no-user-gesture-required', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=WebRtcHideLocalIpsWithMdns', `--ignore-certificate-errors-spki-list=${proxy.spkiHash}`] });
-    proof.microphoneFixture = { source: 'Looping synthetic WAV through native getUserMedia fake device', sampleRate: 48000, channels: 1, frequencyHz: 440, durationSeconds: 2, outputDevice: 'Chromium fake final OS output stream; normal browser mixer and audio clock', measurement: 'Actual relay MediaStream output pulled through a silent analyzer branch', processing: 'Production getUserMedia constraints unchanged' };
+    proof.microphoneFixture = { source: 'Looping synthetic WAV through native getUserMedia fake device', sampleRate: 48000, channels: 1, frequencyHz: 440, durationSeconds: 2, outputDevice: 'Chromium fake final OS output stream; normal browser mixer and audio clock', measurement: 'Actual relay MediaStream output pulled through a silent analyzer branch', processing: 'Fixture-only raw capture: echoCancellation, noiseSuppression and autoGainControl disabled for the synthetic WAV as Chromium documents; production source unchanged', productionDefaultProcessingVerified: false, physicalMicrophoneVerified: false };
     proof.browser = { executable: electronMode ? path.basename(require('electron')) : path.basename(browserPath), version: browser.version() };
     proof.engine = electronMode ? { mode: 'visible-electron', description: 'Visible BrowserWindows using packaged Electron dependency with synthetic media/native fixtures', ...browser.runtime, electronDependencyVersion: require('electron/package.json').version } : { mode: 'headless-chromium', description: 'Headless installed Chromium browser with synthetic media/native fixtures', platform: process.platform, arch: process.arch, chromiumVersion: browser.version() };
     const contexts = [];
@@ -246,7 +246,7 @@ async function main() {
           }; return socket;
         } });
         window.qaSourcePaints = 0; window.qaEncodeRequests = 0; window.qaEncodedFrames = 0; window.qaDecodedFrames = 0; window.qaEncoderConfigurations = []; window.qaEncoderErrors = 0; window.qaStartupSettle = null;
-        window.qaAudioContexts = []; window.qaAudioProof = null; window.qaAudioWorklets = [];
+        window.qaAudioContexts = []; window.qaAudioProof = null; window.qaAudioWorklets = []; window.qaMicrophoneRequests = [];
         const NativeAudioContext = window.AudioContext;
         window.AudioContext = new Proxy(NativeAudioContext, { construct(target, args) {
           const context = Reflect.construct(target, args); qaAudioContexts.push(context); return context;
@@ -288,7 +288,25 @@ async function main() {
         if (typeof VideoDecoder === 'function') { const NativeDecoder = VideoDecoder; window.VideoDecoder = new Proxy(NativeDecoder, { construct(target, args) { const options = args[0]; return Reflect.construct(target, [{ ...options, output: (...values) => { qaDecodedFrames++; return options.output(...values); } }]); } }); }
         const NativeRTC = window.RTCPeerConnection; window.RTCPeerConnection = new Proxy(NativeRTC, { construct(target, args) { const pc = Reflect.construct(target, [{ ...args[0], iceServers: [], iceTransportPolicy: 'relay' }]); qaPCs.push(pc); return pc; } });
         const nativeCapture = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-        navigator.mediaDevices.getUserMedia = async config => { if (config.video) throw new Error('Camera capture is outside the screen/audio product'); qaCaptureCalls.push('microphone'); const stream = await nativeCapture(config); qaStreams.push(stream); return stream; };
+        navigator.mediaDevices.getUserMedia = async config => {
+          if (config.video) throw new Error('Camera capture is outside the screen/audio product');
+          qaCaptureCalls.push('microphone');
+          // Chromium documents raw audio processing for --use-file-for-fake-
+          // audio-capture. Identical continuous tones in both clients can be
+          // suppressed as noise/echo; that is not a receiver transport failure.
+          // Override only this fake device call, retaining native capture and
+          // the production microphone permission/request/restart lifecycle.
+          // https://chromium.googlesource.com/chromium/src/+/25a4d110be98f53dd4f9608740a283deed34fb6b/media/base/media_switches.cc
+          const productionAudio = typeof config.audio === 'object' ? config.audio : {};
+          const fixtureAudio = { ...productionAudio, echoCancellation: { exact: false }, noiseSuppression: { exact: false }, autoGainControl: { exact: false } };
+          const processing = audio => Object.fromEntries(['echoCancellation', 'noiseSuppression', 'autoGainControl'].map(key => [key, audio[key] ?? null]));
+          const request = { productionRequestedProcessing: processing(productionAudio), fixtureRequestedProcessing: processing(fixtureAudio), completed: false };
+          qaMicrophoneRequests.push(request);
+          const stream = await nativeCapture({ ...config, audio: fixtureAudio });
+          request.completed = true;
+          request.actualProcessing = stream.getAudioTracks().map(track => processing(track.getSettings()));
+          qaStreams.push(stream); return stream;
+        };
         navigator.mediaDevices.getDisplayMedia = async () => {
           qaCaptureCalls.push('screen');
           const canvas = new OffscreenCanvas(2560, 1440); const context = canvas.getContext('2d'); const track = new MediaStreamTrackGenerator({ kind: 'video' }); const writer = track.writable.getWriter();
@@ -326,6 +344,11 @@ async function main() {
     phase = 'bidirectional microphone and host screen'; for (const page of [host, guest]) { await page.locator('#mic-button').click(); assert.equal(await page.locator('#camera-button').count(), 0); }
     proof.screenAndMicrophoneOnly = true;
     await shareScreen(host); proof.guestReceiver = await mediaProof(guest, 'Invitation host', host);
+    proof.microphoneRequests = await Promise.all([host, guest].map(page => page.evaluate(() => qaMicrophoneRequests)));
+    for (const requests of proof.microphoneRequests) for (const request of requests) {
+      assert.equal(request.completed, true, 'Fixture microphone must use completed native getUserMedia capture');
+      for (const settings of request.actualProcessing) assert.deepEqual(settings, { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, 'Native fake microphone must honor exact raw-fixture processing constraints');
+    }
     const codecProof = async page => { await page.locator('#diagnostics-toggle').click(); await page.waitForFunction(() => document.getElementById('diagnostics').textContent.includes('Secure relay')); const codecText = await page.locator('#diagnostics').innerText(); assert.match(codecText, /AVC|VP8|H\.264|avc1/i, 'Diagnostics must name the actual encoded screen codec'); await page.locator('#diagnostics-close').click(); return codecText.match(/AVC|VP8|H\.264|avc1/i)[0]; };
     proof.guestCodec = await codecProof(guest);
     phase = 'reverse direction high-quality screen'; await host.locator('#share-button').click(); await guest.waitForFunction(() => document.getElementById('stage-video').hidden);
@@ -389,12 +412,12 @@ async function main() {
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     }
     assert.deepEqual(errors, []); proof.status = 'passed'; proof.coordinator = live ? 'Deployed public Cloudflare Worker via PKI-verified WSS' : 'Local workerd via TLS fixture';
-    proof.boundary = (electronMode ? 'Visible Electron dependency BrowserWindows with isolated synthetic/native bridge fixtures; this is not production preload/native WSS evidence. ' : '') + 'Actual renderer and TLS WebSocket; real RTC restricted to relay-only with no TURN. Continuous synthetic WAV microphone through native fake getUserMedia with unchanged production audio constraints, Chromium fake final OS output stream, OffscreenCanvas→generatedVideoFrame screen and native consent fixture. Receiver energy is measured from the actual decoded relay MediaStream, with real capture/playback PCM Worklet diagnostics. This measures one presenter at a time in both directions plus bidirectional voice over blocked-P2P fallback on two same-PC clients, not physical Mac audio/capture/input or different carriers/countries.';
+    proof.boundary = (electronMode ? 'Visible Electron dependency BrowserWindows with isolated synthetic/native bridge fixtures; this is not production preload/native WSS evidence. ' : '') + 'Actual renderer and TLS WebSocket; real RTC restricted to relay-only with no TURN. Continuous synthetic WAV microphone through native fake getUserMedia with fixture-only raw processing constraints, Chromium fake final OS output stream, OffscreenCanvas→generatedVideoFrame screen and native consent fixture. Production audio constraints remain unchanged in shipped source; this raw-tone check does not verify default echo cancellation, noise suppression, automatic gain control or a physical Mac microphone. Receiver energy is measured from the actual decoded relay MediaStream, with real capture/playback PCM Worklet diagnostics. This measures one presenter at a time in both directions plus bidirectional voice over blocked-P2P fallback on two same-PC clients, not physical Mac audio/capture/input or different carriers/countries.';
     proof.sourceHashes = Object.fromEntries(['src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/renderer/internet.js'].map(file => [file, createHash('sha256').update(fs.readFileSync(path.join(root, file))).digest('hex')]));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify(proof, null, 2)); console.log(JSON.stringify(proof, null, 2));
   } catch (error) {
     const diagnostics = await Promise.all(pages.map(page => page.evaluate(() => ({ inputs: qaInputs.map(({ event }) => event), grants: qaGrants.length, consentVisible: !document.getElementById('control-banner').hidden, toast: document.getElementById('toast-region').textContent, screen: { hidden: document.getElementById('stage-video').hidden, time: document.getElementById('stage-video').currentTime, width: document.getElementById('stage-video').videoWidth }, startup: qaStartupSettle, source: { paints: qaSourcePaints, encodes: qaEncodeRequests, encoded: qaEncodedFrames, decoded: qaDecodedFrames, encoderConfigurations: qaEncoderConfigurations.slice(), encoderErrors: qaEncoderErrors }, audioProof: qaAudioProof,
-      actualWorkletPcm: qaAudioWorklets.map(({ kind, packets, samples, lastMeanSquareEnergy, peakMeanSquareEnergy, lastPacketAt, context }) => ({ kind, packets, samples, lastMeanSquareEnergy, peakMeanSquareEnergy, packetAgeMs: lastPacketAt == null ? null : performance.now() - lastPacketAt, contextState: context.state, sampleRate: context.sampleRate })),
+      microphoneRequests: qaMicrophoneRequests, actualWorkletPcm: qaAudioWorklets.map(({ kind, packets, samples, lastMeanSquareEnergy, peakMeanSquareEnergy, lastPacketAt, context }) => ({ kind, packets, samples, lastMeanSquareEnergy, peakMeanSquareEnergy, packetAgeMs: lastPacketAt == null ? null : performance.now() - lastPacketAt, contextState: context.state, sampleRate: context.sampleRate })),
       audioContexts: qaAudioContexts.map(context => ({ state: context.state, sampleRate: context.sampleRate })), microphoneTracks: qaStreams.flatMap(stream => stream.getAudioTracks()).map(track => ({ readyState: track.readyState, enabled: track.enabled, muted: track.muted, sampleRate: track.getSettings().sampleRate, echoCancellation: track.getSettings().echoCancellation, noiseSuppression: track.getSettings().noiseSuppression, autoGainControl: track.getSettings().autoGainControl })), audio: [...document.querySelectorAll('audio[data-peer]')].map(audio => ({ hasStream: Boolean(audio.srcObject), paused: audio.paused, muted: audio.muted, time: audio.currentTime, readyState: audio.readyState, tracks: audio.srcObject?.getAudioTracks().map(track => ({ readyState: track.readyState, enabled: track.enabled, muted: track.muted })) || [] })), rtcStates: qaPCs.map(pc => pc.connectionState) })).catch(() => null)));
     fs.writeFileSync(path.join(output, live ? 'websocket-relay-live.json' : 'websocket-relay-browser.json'), JSON.stringify({ ...proof, status: 'failed', phase, error: error.message, pageErrors: errors, diagnostics }, null, 2)); throw error;
   } finally { await browser?.close(); await proxy?.close(); await runtime?.close(); fs.rmSync(wav, { force: true }); }
