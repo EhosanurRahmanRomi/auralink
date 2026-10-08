@@ -1,0 +1,48 @@
+name: Glance-Port live production runtime
+
+# Each manual run consumes the existing finite public-room/relay allowances.
+# No deployment, provider configuration, budget increase or retry is performed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: glance-port-live-production-runtime
+  cancel-in-progress: false
+
+jobs:
+  live-runtime:
+    name: Live production desktop and service
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        id: desktop_dependencies
+        run: npm ci
+      - name: Install locked internet coordinator tools
+        id: service_dependencies
+        run: npm ci --prefix internet-service
+      - name: Actual Electron through deployed public encrypted relay
+        run: node tests/invitation-electron-live.cjs --live
+      - name: Deployed service smoke from independent CI network
+        if: ${{ !cancelled() && steps.desktop_dependencies.outcome == 'success' && steps.service_dependencies.outcome == 'success' }}
+        run: npm run test:deployed --prefix internet-service
+      - name: Keep only public live verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Glance-Port-Live-runtime-evidence
+          path: |
+            test-results/invitation-electron-live.json
+            test-results/internet-deployed-smoke.json
+          if-no-files-found: ignore
+          retention-days: 7

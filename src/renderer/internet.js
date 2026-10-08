@@ -2,6 +2,14 @@
    pairing codes are sent once over TLS and never persisted or placed in URLs. */
 export const DEFAULT_PUBLIC_ORIGIN = 'https://auralink-private-coordinator.auralink-internet-service.workers.dev';
 
+function publicAuthenticationFailure(reason) {
+  // The coordinator shares one bounded refusal across several allowances. Do
+  // not guess its reset time or expose untrusted server text in a public error.
+  return new Error(reason === 'Public connection limit reached. Try again later.'
+    ? 'The free public service has reached its connection allowance. Try again later or use Nearby mode.'
+    : 'The public service refused this connection. Try again later or use Nearby mode.');
+}
+
 export function roomInvitation(value) {
   const supplied = String(value);
   if (supplied.length > 2048 || /[\x00-\x1f\x7f]/.test(supplied)) throw new Error('Paste the complete room code or link without extra lines.');
@@ -103,15 +111,23 @@ export class InternetDirectory extends EventTarget {
     try { socket = this.socketFactory(url.href); } catch (error) { this.failAuthentication(error); this.setStatus('offline'); return; }
     this.socket = socket;
     const current = () => generation === this.generation && this.socket === socket;
-    const lost = () => {
+    const lost = event => {
       if (!current()) return;
+      const policyFailure = this.mode === 'public' && event?.code === 1008 ? publicAuthenticationFailure(event.reason) : null;
       clearTimeout(this.authTimer); clearInterval(this.heartbeatTimer); clearTimeout(this.pongTimer); this.authTimer = null; this.heartbeatTimer = null; this.pongTimer = null; this.socket = null;
       this.devices = this.devices.map(device => ({ ...device, online: false, hosting: false, roomId: null }));
       this.emit('presence', { devices: this.devices }); this.emit('disconnected');
       if (generation !== this.generation) return;
-      if (this.roomWaiter) { this.roomWaiter.reject(new Error('The Internet connection ended.')); clearTimeout(this.roomWaiter.timer); this.roomWaiter = null; }
-      if (this.leaveWaiter) { this.leaveWaiter.reject(new Error('The Internet connection ended.')); clearTimeout(this.leaveWaiter.timer); this.leaveWaiter = null; }
+      if (this.roomWaiter) { this.roomWaiter.reject(policyFailure || new Error('The Internet connection ended.')); clearTimeout(this.roomWaiter.timer); this.roomWaiter = null; }
+      if (this.leaveWaiter) { this.leaveWaiter.reject(policyFailure || new Error('The Internet connection ended.')); clearTimeout(this.leaveWaiter.timer); this.leaveWaiter = null; }
       this.failForgetting(new Error('The connection ended before removal was confirmed. Your device credential is still saved; reconnect and try Forget again.'));
+      if (policyFailure) {
+        clearTimeout(this.reconnectTimer); this.reconnectTimer = null; this.deviceId = null;
+        const awaitingAuthentication = Boolean(this.authWaiter);
+        this.failAuthentication(policyFailure); this.setStatus('offline');
+        if (!awaitingAuthentication) this.emit('notice', { message: policyFailure.message });
+        return;
+      }
       const saved = this.mode === 'public' ? null : this.identity();
       if ((saved || this.mode === 'public') && this.attempt < this.reconnectDelays.length) {
         this.setStatus('retrying'); const delay = this.reconnectDelays[this.attempt++];
@@ -167,8 +183,14 @@ export class InternetDirectory extends EventTarget {
         this.roomWaiter?.resolve({ ...message, internet: true, url: this.origin, invite: `${this.origin}/#${new URLSearchParams({ internet: '1', room: message.roomId, key: message.roomKey })}` });
         if (this.roomWaiter) clearTimeout(this.roomWaiter.timer); this.roomWaiter = null;
       } else if (message.type === 'error') {
+        if (this.mode === 'public' && this.status !== 'online') {
+          const error = publicAuthenticationFailure(message.message), awaitingAuthentication = Boolean(this.authWaiter);
+          this.failAuthentication(error); this.close();
+          if (!awaitingAuthentication) this.emit('notice', { message: error.message });
+          return;
+        }
         const error = new Error(String(message.message || 'The Internet service could not complete that request.').slice(0, 260));
-        if (this.status !== 'online') { this.failAuthentication(new Error(this.mode === 'public' ? `${error.message} Try opening or joining your room again.` : `${error.message} Your saved credential is preserved. Check your service settings and try Go online again.`)); this.close(); }
+        if (this.status !== 'online') { this.failAuthentication(new Error(`${error.message} Your saved credential is preserved. Check your service settings and try Go online again.`)); this.close(); }
         else if (this.forgetWaiter) this.failForgetting(new Error(`${error.message} Your device credential is still saved.`));
         else if (this.roomWaiter) { this.roomWaiter.reject(error); clearTimeout(this.roomWaiter.timer); this.roomWaiter = null; }
         else this.emit('message', message);

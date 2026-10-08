@@ -11,10 +11,13 @@ const DEFAULT_ORIGIN = 'https://auralink-private-coordinator.auralink-internet-s
 
 class Endpoint {
   constructor(origin) {
-    this.messages = []; this.waiters = []; this.history = []; this.closed = false;
+    this.messages = []; this.waiters = []; this.history = []; this.closed = false; this.publicConnectionLimit = false;
     this.client = new NativeInternetClient(origin, randomBytes(12).toString('base64url'), event => {
       if (event.type === 'message') { const message = JSON.parse(event.data); this.history.push(message); this.deliver(message); }
-      else this.deliver({ type: 'transport-' + event.type });
+      else {
+        if (event.type === 'close' && event.code === 1008 && event.reason === 'Public connection limit reached. Try again later.') this.publicConnectionLimit = true;
+        this.deliver({ type: 'transport-' + event.type });
+      }
     }, () => {});
   }
   deliver(message) {
@@ -91,7 +94,11 @@ export async function runDeployedSmoke(origin = DEFAULT_ORIGIN) {
     check(host.client.membership.roomId === null && outsider.client.membership.roomId === null); proof.checks.ownerLeaveEndsRoom = true;
     ownerCipher.close(); guestCipher.close(); proof.status = 'passed';
     proof.boundary = 'Real public HTTPS/WSS packet and permission test. No physical media playback, native input injection or distinct-device/network claim.';
-  } catch { proof.status = 'failed'; proof.failedStage = stage; proof.error = 'Live service verification failed. No credentials or invitations are included in this report.'; }
+  } catch {
+    proof.status = 'failed'; proof.failedStage = stage;
+    proof.publicConnectionLimit = endpoints.some(endpoint => endpoint.publicConnectionLimit);
+    proof.error = 'Live service verification failed. No credentials or invitations are included in this report.';
+  }
   finally { for (const endpoint of endpoints) endpoint.close(); }
   return proof;
 }

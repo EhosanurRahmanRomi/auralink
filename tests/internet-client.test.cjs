@@ -10,7 +10,7 @@ class Socket extends EventTarget {
   constructor(url, server) { super(); this.url = url; this.server = server; this.readyState = 0; this.sent = []; queueMicrotask(() => { this.readyState = 1; this.dispatchEvent(new Event('open')); }); }
   send(value) { const packet = JSON.parse(value); this.sent.push(packet); this.server?.(this, packet); }
   receive(packet) { const event = new Event('message'); event.data = JSON.stringify(packet); this.dispatchEvent(event); }
-  close() { if (this.readyState === 3) return; this.readyState = 3; this.dispatchEvent(new Event('close')); }
+  close(code = 1000, reason = '') { if (this.readyState === 3) return; this.readyState = 3; const event = new Event('close'); event.code = code; event.reason = reason; this.dispatchEvent(event); }
 }
 const origin = 'https://private-qa.workers.dev';
 const token = 'qa-device-token-which-is-long-enough';
@@ -246,6 +246,101 @@ test('public bootstrap never sends or overwrites a saved private identity, and r
     await directory.forget(); assert.equal(directory.status, 'offline'); assert.equal(directory.deviceId, null);
     assert.equal(saved.getItem(`auralink.internet.identity:${origin}`), savedPrivate);
     assert.ok(!sockets.flatMap(socket => socket.sent).some(packet => ['pair', 'register', 'forget'].includes(packet.type)));
+  } finally { directory.close(); }
+});
+
+test('public policy close rejects bootstrap promptly and stops retries without exposing arbitrary reasons', async t => {
+  const { InternetDirectory } = await moduleReady;
+  for (const [reason, expected] of [
+    ['Public connection limit reached. Try again later.', /free public service.*connection allowance.*Nearby/],
+    ['private-token-room-capability-do-not-display', /public service refused this connection.*Nearby/]
+  ]) await t.test(reason.startsWith('Public') ? 'known allowance' : 'untrusted reason', async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const saved = storage(), sockets = [], statuses = [];
+    const privateIdentity = JSON.stringify({ deviceId: 'private-device', deviceToken: token });
+    saved.setItem(`auralink.internet.identity:${origin}`, privateIdentity);
+    const directory = new InternetDirectory({ storage: saved, timeout: 12000, reconnectDelays: [0, 100], socketFactory: url => {
+      const socket = new Socket(url, () => {}); sockets.push(socket); return socket;
+    } });
+    directory.addEventListener('status', ({ detail }) => statuses.push(detail.status));
+    let disconnects = 0; directory.addEventListener('disconnected', () => disconnects++);
+    try {
+      const opening = directory.openPublic(origin), rejected = assert.rejects(opening, error => {
+        assert.match(error.message, expected); assert.ok(!error.message.includes('private-token')); return true;
+      });
+      await tick(); assert.deepEqual(sockets[0].sent.map(packet => packet.type), ['bootstrap']);
+      sockets[0].close(1008, reason);
+      assert.equal(directory.authWaiter, null, 'Policy refusal settles authentication before its deadline');
+      assert.equal(directory.authTimer, null); assert.equal(directory.reconnectTimer, null);
+      assert.equal(directory.heartbeatTimer, null); assert.equal(directory.pongTimer, null);
+      assert.equal(directory.status, 'offline'); assert.equal(directory.socket, null); assert.equal(directory.deviceId, null);
+      await rejected; t.mock.timers.tick(60000); await tick();
+      assert.equal(sockets.length, 1); assert.equal(disconnects, 1); assert.ok(!statuses.includes('retrying'));
+      assert.equal(saved.getItem(`auralink.internet.identity:${origin}`), privateIdentity);
+    } finally { directory.close(); }
+  });
+});
+
+test('public auth errors are bounded, do not retry, and allow an explicit later attempt', async t => {
+  const { InternetDirectory } = await moduleReady;
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const sockets = [];
+  const directory = new InternetDirectory({ storage: storage(), reconnectDelays: [0], socketFactory: url => {
+    const socket = new Socket(url, () => {}); sockets.push(socket); return socket;
+  } });
+  try {
+    for (const [reason, expected] of [
+      ['Public connection limit reached. Try again later.', /connection allowance/],
+      ['secret-room-key-and-device-token', /public service refused this connection/]
+    ]) {
+      const opening = directory.openPublic(origin), rejected = assert.rejects(opening, error => {
+        assert.match(error.message, expected); assert.ok(!error.message.includes('secret-room')); return true;
+      });
+      await tick(); const socket = sockets.at(-1);
+      socket.receive({ type: 'error', message: reason }); socket.close(1008, reason);
+      assert.equal(directory.authWaiter, null); assert.equal(directory.status, 'offline'); assert.equal(directory.socket, null);
+      assert.equal(directory.authTimer, null); assert.equal(directory.reconnectTimer, null);
+      await rejected; const attempts = sockets.length; t.mock.timers.tick(60000); await tick(); assert.equal(sockets.length, attempts);
+      socket.receive({ type: 'registered', deviceId: 'late-stale-public', mode: 'public' });
+      assert.equal(directory.status, 'offline'); assert.equal(directory.deviceId, null);
+    }
+    const opening = directory.openPublic(origin); await tick();
+    sockets.at(-1).receive({ type: 'registered', deviceId: 'fresh-public', mode: 'public' }); await opening;
+    assert.equal(directory.status, 'online'); assert.equal(sockets.length, 3);
+  } finally { directory.close(); }
+});
+
+test('transient public bootstrap failure reconnects, but a refused reauthentication stops and reports the limit', async t => {
+  const { InternetDirectory } = await moduleReady;
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const sockets = [], notices = [];
+  const directory = new InternetDirectory({ storage: storage(), reconnectDelays: [10, 20], socketFactory: url => {
+    const socket = new Socket(url, () => {}); sockets.push(socket); return socket;
+  } });
+  let disconnects = 0; directory.addEventListener('disconnected', () => disconnects++);
+  directory.addEventListener('notice', ({ detail }) => notices.push(detail.message));
+  try {
+    const opening = directory.openPublic(origin); await tick();
+    sockets[0].close(1006, 'Network disappeared.'); assert.equal(directory.status, 'retrying'); assert.ok(directory.authWaiter);
+    t.mock.timers.tick(10); await tick();
+    assert.equal(sockets.length, 2); assert.deepEqual(sockets[1].sent.map(packet => packet.type), ['bootstrap']);
+    sockets[1].receive({ type: 'registered', deviceId: 'public-two', mode: 'public' }); await opening;
+    assert.equal(directory.status, 'online'); directory.joinRoom({ roomId: 'temporary-room', roomKey: 'capability' });
+    const creating = directory.createRoom('Pending room'), rejected = assert.rejects(creating, /connection allowance/);
+    sockets[1].close(1008, 'Public connection limit reached. Try again later.');
+    await rejected; assert.equal(directory.roomWaiter, null); assert.equal(directory.deviceId, null);
+    assert.equal(directory.status, 'offline'); assert.equal(disconnects, 2); assert.match(notices.at(-1), /connection allowance.*Nearby/);
+    t.mock.timers.tick(60000); await tick(); assert.equal(sockets.length, 2);
+    // A user can retry, but a terminal policy error on recovery also has no
+    // unresolved initial open() promise to display it: it needs a notice.
+    const retrying = directory.openPublic(origin); await tick();
+    sockets[2].receive({ type: 'registered', deviceId: 'public-three', mode: 'public' }); await retrying;
+    sockets[2].close(1006); t.mock.timers.tick(10); await tick();
+    sockets[3].receive({ type: 'error', message: 'Public connection limit reached. Try again later.' });
+    assert.equal(directory.status, 'offline'); assert.equal(directory.reconnectTimer, null);
+    assert.match(notices.at(-1), /connection allowance.*Nearby/);
+    t.mock.timers.tick(60000); await tick(); assert.equal(sockets.length, 4);
+    assert.ok(!sockets.slice(2).flatMap(socket => socket.sent).some(packet => ['join', 'create-room', 'control-response'].includes(packet.type)));
   } finally { directory.close(); }
 });
 
