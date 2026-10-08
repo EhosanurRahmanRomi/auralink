@@ -196,6 +196,47 @@ async function audioFailureDiagnosis(page) {
     };
   }).catch(() => ({ unavailable: 'Audio state snapshot failed.' }));
 }
+async function installNativePermissionFixture(app, expectedWav) {
+  return app.evaluate(({ app, systemPreferences }, expectedFile) => {
+    const original = systemPreferences.getMediaAccessStatus;
+    const observed = original.call(systemPreferences, 'microphone');
+    const originalStatus = ['granted', 'denied', 'restricted', 'not-determined', 'unknown'].includes(observed) ? observed : 'unknown';
+    const githubActions = process.env.GITHUB_ACTIONS === 'true';
+    const smokeTestProcess = app.commandLine.hasSwitch('smoke-test'), unpackagedProcess = app.isPackaged === false;
+    const fakeInputProcess = app.commandLine.hasSwitch('use-fake-device-for-media-stream') && app.commandLine.hasSwitch('use-fake-ui-for-media-stream') && app.commandLine.getSwitchValue('use-file-for-fake-audio-capture') === expectedFile;
+    const overrideApplied = githubActions && originalStatus === 'denied';
+    if (overrideApplied && (!smokeTestProcess || !unpackagedProcess || !fakeInputProcess)) throw new Error('Permission fixture requires the isolated unpackaged native fake-input test process.');
+    const proof = { mode: overrideApplied ? 'CI native microphone permission double' : 'Actual native microphone policy; no override',
+      originalStatus, effectiveStatus: overrideApplied ? 'granted' : originalStatus,
+      githubActions, smokeTestProcess, unpackagedProcess, fakeInputProcess, overrideApplied, nativeMicrophoneStatusCalls: 0,
+      originalRestored: !overrideApplied, physicalPolicyVerified: false,
+      boundary: 'CI-only in-process microphone permission-status double for synthetic capture; actual Windows privacy policy and physical microphone permission are not verified.' };
+    if (globalThis.__qaGlancePortNativePermissionFixture) throw new Error('Native permission fixture was already installed.');
+    const state = { original, proof };
+    if (overrideApplied) {
+      state.replacement = type => {
+        if (type === 'microphone') { proof.nativeMicrophoneStatusCalls++; return 'granted'; }
+        return original.call(systemPreferences, type);
+      };
+      systemPreferences.getMediaAccessStatus = state.replacement;
+      if (systemPreferences.getMediaAccessStatus !== state.replacement) throw new Error('Native permission fixture could not be installed.');
+    }
+    globalThis.__qaGlancePortNativePermissionFixture = state;
+    return { ...proof };
+  }, expectedWav);
+}
+async function restoreNativePermissionFixture(app) {
+  return app.evaluate(({ systemPreferences }) => {
+    const state = globalThis.__qaGlancePortNativePermissionFixture;
+    if (!state) return null;
+    if (state.proof.overrideApplied) {
+      if (systemPreferences.getMediaAccessStatus !== state.replacement) throw new Error('Native permission fixture changed unexpectedly.');
+      systemPreferences.getMediaAccessStatus = state.original;
+      state.proof.originalRestored = systemPreferences.getMediaAccessStatus === state.original;
+    }
+    const proof = { ...state.proof }; delete globalThis.__qaGlancePortNativePermissionFixture; return proof;
+  });
+}
 async function main() {
   fs.mkdirSync(results, { recursive: true }); const apps = [], profiles = [], windows = []; let phase = 'launch'; let errors = 0;
   const wav = path.join(results, 'invitation-electron-synthetic-microphone.wav'); writeTone(wav);
@@ -240,6 +281,11 @@ async function main() {
       await page.waitForFunction(() => document.getElementById('rtc-stats').textContent.includes('Secure relay'), undefined, { timeout: 30000 });
       await page.locator('#diagnostics-close').click();
     }
+    phase = 'declared native microphone permission fixture'; proof.nativePermissionFixture = [];
+    for (const windowProof of windows) {
+      windowProof.nativePermissionFixture = await installNativePermissionFixture(windowProof.app, wav);
+      proof.nativePermissionFixture.push({ role: windowProof.role, ...windowProof.nativePermissionFixture });
+    }
     phase = 'explicit synthetic microphones'; for (const page of [host, guest]) await page.locator('#mic-button').click();
     proof.audio = {}; phase = 'host receives guest native WSS audio'; proof.audio.hostReceiver = await receivedAudio(host);
     phase = 'guest receives host native WSS audio'; proof.audio.guestReceiver = await receivedAudio(guest);
@@ -282,7 +328,17 @@ async function main() {
         for (const settings of request.actualProcessing) for (const key of ['echoCancellation', 'noiseSuppression', 'autoGainControl']) assert.equal(settings[key], false, 'The native prerecorded WAV fixture must honor raw processing settings');
       }
     }
-    proof.passed = true; proof.boundary = 'Two same-PC production Electron apps and real public native WSS; synthetic 1440p screens and looping WAV microphones through native fake getUserMedia with fixture-only raw processing, real relay worklets and a Chromium fake final OS output stream. Strict decoded audio energy in both directions and microphone restart, forced direct-path failure. No production default audio processing, hardware microphone/speaker, physical Mac capture/control or different-carrier proof.';
+    proof.nativePermissionFixture = await Promise.all(windows.map(async ({ role, app }) => ({ role, ...await restoreNativePermissionFixture(app) })));
+    for (const fixture of proof.nativePermissionFixture) {
+      assert.equal(fixture.originalRestored, true); assert.equal(fixture.physicalPolicyVerified, false);
+      if (fixture.overrideApplied) {
+        assert.equal(fixture.mode, 'CI native microphone permission double'); assert.equal(fixture.githubActions, true);
+        assert.equal(fixture.originalStatus, 'denied'); assert.equal(fixture.effectiveStatus, 'granted');
+        assert.ok(fixture.smokeTestProcess && fixture.unpackagedProcess && fixture.fakeInputProcess);
+        assert.ok(fixture.nativeMicrophoneStatusCalls > 0, 'Production requestMedia must actually read the virtual CI microphone permission status');
+      }
+    }
+    proof.passed = true; proof.boundary = 'Two same-PC production Electron apps and real public native WSS; synthetic 1440p screens and looping WAV microphones through native fake getUserMedia with fixture-only raw processing, real relay worklets and a Chromium fake final OS output stream. A denied native microphone status may use a declared CI-only process permission double; production requestMedia IPC still executes, and real OS privacy policy is not verified. Strict decoded audio energy in both directions and microphone restart, forced direct-path failure. No production default audio processing, hardware microphone/speaker, physical Mac capture/control or different-carrier proof.';
   } catch (error) {
     proof.failedStage = phase; proof.failureType = ['TimeoutError', 'AssertionError', 'TypeError', 'Error'].includes(error.name) ? error.name : 'OtherError';
     proof.failureSummary = error.name === 'TimeoutError' ? 'A required live media or interface condition did not complete within its unchanged timeout.' : 'A required live runtime assertion failed; exception text omitted.';
@@ -299,6 +355,15 @@ async function main() {
     process.exitCode = 1;
   }
   finally {
+    for (const { app, role } of windows) {
+      const fixture = await restoreNativePermissionFixture(app).catch(() => ({ originalRestored: false, restorationError: 'Native permission fixture restoration failed.' }));
+      if (fixture) {
+        const entry = { role, ...fixture }, index = proof.nativePermissionFixture?.findIndex(value => value.role === role) ?? -1;
+        if (!proof.nativePermissionFixture) proof.nativePermissionFixture = [];
+        if (index >= 0) proof.nativePermissionFixture[index] = entry; else proof.nativePermissionFixture.push(entry);
+        if (!fixture.originalRestored) { proof.passed = false; process.exitCode = 1; }
+      }
+    }
     for (const app of apps.reverse()) await app.close().catch(() => {});
     for (const profile of profiles) { const resolved = fs.realpathSync(profile); if (resolved.startsWith(fs.realpathSync(results) + path.sep) && path.basename(resolved).startsWith('invitation-electron-profile-')) fs.rmSync(resolved, { recursive: true, force: true }); }
     fs.writeFileSync(path.join(results, 'invitation-electron-live.json'), JSON.stringify(proof, null, 2)); console.log(JSON.stringify(proof, null, 2));
