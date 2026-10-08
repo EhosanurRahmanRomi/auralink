@@ -27,6 +27,41 @@ test('ordinary browser and Electron retain their original transport and privileg
   assert.equal(setup({ existing: desktop }).bridge, desktop);
 });
 
+test('Android presentation fullscreen accepts only booleans and leaves media and control untouched', async () => {
+  const { bridge, messages } = setup({ response: message => ({ fullscreen: message.args }) });
+  for (const value of [undefined, null, 'true', 'false', 0, 1, {}, [], new Boolean(true)]) {
+    await assert.rejects(bridge.setPresentationFullscreen(value), /Invalid fullscreen state/);
+  }
+  assert.equal(messages.length, 0, 'Invalid fullscreen values never cross the native bridge');
+  assert.equal((await bridge.setPresentationFullscreen(true)).fullscreen, true);
+  assert.equal((await bridge.setPresentationFullscreen(false)).fullscreen, false);
+  assert.deepEqual(messages.map(({ method, args }) => ({ method, args })), [
+    { method: 'setPresentationFullscreen', args: true },
+    { method: 'setPresentationFullscreen', args: false },
+  ], 'Entering presentation cannot start screen capture, microphone routing or input consent');
+});
+
+test('Android presentation state rejects malformed native events and honors unsubscribe', () => {
+  const { bridge, receive, messages } = setup();
+  const states = [];
+  const removeThrowing = bridge.onPresentationFullscreenChanged(() => { throw new Error('Consumer failed'); });
+  const remove = bridge.onPresentationFullscreenChanged(state => {
+    assert.deepEqual(Object.keys(state), ['fullscreen'], 'Only the native boolean state is exposed');
+    states.push(state.fullscreen);
+  });
+  const removeInvalid = bridge.onPresentationFullscreenChanged(null); assert.equal(typeof removeInvalid, 'function'); removeInvalid();
+  for (const value of [undefined, null, 'true', 'false', 0, 1, {}, []]) receive({ event: 'presentation-fullscreen', fullscreen: value });
+  receive({ event: 'fullscreen', fullscreen: true });
+  assert.deepEqual(states, []);
+  receive({ event: 'presentation-fullscreen', fullscreen: true, unexpected: 'discarded' });
+  receive({ event: 'presentation-fullscreen', fullscreen: false });
+  assert.deepEqual(states, [true, false], 'One failing subscriber cannot swallow confirmed native transitions');
+  remove(); remove(); removeThrowing();
+  receive({ event: 'presentation-fullscreen', fullscreen: true });
+  assert.deepEqual(states, [true, false]);
+  assert.equal(messages.length, 0, 'Passive native state observation never triggers another fullscreen or media action');
+});
+
 test('Android invitations use an explicit one-shot RPC and bounded live callback without media actions', async () => {
   const code = `A1.89bf3734-2920-41c1-bbce-439085f9037e.${'A'.repeat(43)}`;
   const { bridge, receive, messages } = setup({ response: message => message.method === 'getPendingInvitation' ? code : { ok: true } });

@@ -10,22 +10,34 @@ const { EventEmitter } = require('node:events');
 const defer = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 async function fixture(options = {}) {
   const handlers = new Map(); let window; let permissionRequest, permissionCheck, displayRequest; let revocations = 0;
+  const sentEvents = [], fullscreenCalls = [], powerStarts = [], powerStops = [];
+  let windowOptions, fullscreen = false, pendingFullscreen = null, destroyed = false, adapterDisposals = 0;
   const displayEvents = new EventEmitter();
   class Window extends EventEmitter {
-    constructor() { super(); window = this; this.webContents = new EventEmitter(); this.webContents.mainFrame = { url: pathToFileURL(path.resolve(__dirname, '../src/renderer/index.html')).href }; this.webContents.getURL = () => this.webContents.mainFrame.url; this.webContents.setWindowOpenHandler = () => {}; this.webContents.send = () => {}; }
-    isDestroyed() { return false; } show() {} async loadFile() {}
+    constructor(settings) { super(); window = this; windowOptions = settings; this.webContents = new EventEmitter(); this.webContents.mainFrame = { url: pathToFileURL(path.resolve(__dirname, '../src/renderer/index.html')).href }; this.webContents.getURL = () => this.webContents.mainFrame.url; this.webContents.setWindowOpenHandler = () => {}; this.webContents.send = (name, value) => sentEvents.push({ name, value }); }
+    isDestroyed() { return destroyed; }
+    setFullScreen(active) {
+      fullscreenCalls.push(active);
+      if (!options.delayedFullscreen) { fullscreen = active; return; }
+      // Model macOS finishing its current animation before accepting another
+      // state change. Requesting the opposite during that animation is lost.
+      if (pendingFullscreen === null && active !== fullscreen) pendingFullscreen = active;
+    }
+    isFullScreen() { return fullscreen; }
+    show() {} async loadFile() {}
   }
   const app = new EventEmitter(); app.setName = () => {}; app.whenReady = () => Promise.resolve(); app.getVersion = () => '0.3.0';
   const session = { defaultSession: { setCertificateVerifyProc() {}, setPermissionRequestHandler(handler) { permissionRequest = handler; }, setPermissionCheckHandler(handler) { permissionCheck = handler; }, setDisplayMediaRequestHandler(handler) { displayRequest = handler; } } };
   const electron = { app, BrowserWindow: Window, ipcMain: { handle(name, handler) { handlers.set(name, handler); } }, session,
-    desktopCapturer: { getSources: options.sources || (async () => []) }, screen: displayEvents, dialog: {}, globalShortcut: { register() {}, unregisterAll() {} }, clipboard: {}, systemPreferences: { getMediaAccessStatus: () => 'granted', ...options.systemPreferences }, shell: {} };
+    desktopCapturer: { getSources: options.sources || (async () => []) }, screen: displayEvents, dialog: {}, globalShortcut: { register() {}, unregisterAll() {} }, clipboard: {}, systemPreferences: { getMediaAccessStatus: () => 'granted', ...options.systemPreferences }, shell: {},
+    powerSaveBlocker: { start(type) { powerStarts.push(type); return powerStarts.length; }, stop(id) { powerStops.push(id); } } };
   class Gate { async revoke() { revocations++; } }
   const mainFile = path.resolve(__dirname, '../src/main.cjs');
   const dependencies = {
     electron, selfsigned: { generate: options.generate || (async () => ({ private: 'fixture-key', cert: 'fixture-cert' })) },
     './core/invite.cjs': { fingerprint: () => 'a'.repeat(64) },
     './core/broker.cjs': { createBroker: options.createBroker || (async () => ({ port: 4459, roomKey: 'k'.repeat(32), hostToken: 'h'.repeat(32), async stop() {} })) },
-    './native/control.cjs': { ControlGate: Gate, createAdapter: () => ({ available: false }) },
+    './native/control.cjs': { ControlGate: Gate, createAdapter: () => ({ available: false, dispose() { adapterDisposals++; } }) },
     './core/internet-client.cjs': {},
     './core/app-invitation.cjs': require('../src/core/app-invitation.cjs'),
   };
@@ -34,9 +46,20 @@ async function fixture(options = {}) {
   assert.ok(window, 'Production native IPC registered');
   return {
     invoke(name, args) { return handlers.get(`auralink:${name}`)({ sender: window.webContents, senderFrame: window.webContents.mainFrame }, args); },
+    invokeAs(name, args, event) { return handlers.get(`auralink:${name}`)(event, args); },
     permission(mediaTypes, isMainFrame=true) { return new Promise(resolve => permissionRequest(window.webContents, 'media', resolve, { mediaTypes, isMainFrame })); },
+    permissionFor(name, contents = window.webContents, details = { isMainFrame: true }) { return new Promise(resolve => permissionRequest(contents, name, resolve, details)); },
+    checkPermission(name, contents = window.webContents, details = { isMainFrame: true }) { return permissionCheck(contents, name, '', details); },
     capture() { return new Promise(resolve => displayRequest({frame:window.webContents.mainFrame},resolve)); },
     checkCamera() { return permissionCheck(window.webContents, 'media', '', { mediaType: 'video', isMainFrame: true }); },
+    app, window, windowOptions, sentEvents, fullscreenCalls, powerStarts, powerStops,
+    pendingFullscreen: () => pendingFullscreen,
+    finishFullscreenTransition() {
+      assert.ok(options.delayedFullscreen && pendingFullscreen !== null, 'An OS fullscreen animation must be pending');
+      fullscreen = pendingFullscreen; pendingFullscreen = null;
+      window.emit(fullscreen ? 'enter-full-screen' : 'leave-full-screen');
+    },
+    markDestroyed() { destroyed = true; }, adapterDisposals: () => adapterDisposals,
     displayEvents, revocations: () => revocations
   };
 }
@@ -156,4 +179,144 @@ test('a failed source refresh invalidates the earlier chooser selection', async 
   await assert.rejects(native.invoke('sources'),/enumeration refused/);
   assert.equal(await native.permission([]),false);
   await assert.rejects(native.invoke('choose-screen',source.id),/available screen/);
+});
+
+test('fullscreen permission belongs only to the bundled main page and leaves unrelated permissions denied', async () => {
+  const native = await fixture();
+  assert.equal(await native.permissionFor('fullscreen'), true);
+  assert.equal(native.checkPermission('fullscreen'), true);
+  assert.equal(await native.permissionFor('fullscreen', native.window.webContents, { isMainFrame: false }), false);
+  assert.equal(native.checkPermission('fullscreen', native.window.webContents, { isMainFrame: false }), false);
+  const otherContents = { getURL: () => native.window.webContents.getURL() };
+  assert.equal(await native.permissionFor('fullscreen', otherContents), false, 'A different WebContents cannot borrow the bundled URL');
+  assert.equal(native.checkPermission('fullscreen', otherContents), false);
+  for (const permission of ['notifications', 'geolocation', 'local-network-access']) {
+    assert.equal(await native.permissionFor(permission), false, `${permission} stays denied on the trusted main page`);
+    assert.equal(native.checkPermission(permission), false);
+  }
+  native.window.webContents.mainFrame.url = 'https://untrusted.example/';
+  assert.equal(await native.permissionFor('fullscreen'), false);
+  assert.equal(native.checkPermission('fullscreen'), false);
+  assert.equal(await native.permissionFor('notifications'), false);
+  assert.equal(native.checkPermission('notifications'), false);
+});
+
+test('native presentation fullscreen validates booleans and reports actual enter and leave events', async () => {
+  const native = await fixture({ platform: 'win32' });
+  assert.equal(native.windowOptions.titleBarStyle, 'hidden');
+  assert.equal(native.windowOptions.titleBarOverlay.color, '#00000000');
+  assert.equal(native.windowOptions.titleBarOverlay.height, 44);
+  assert.equal(native.windowOptions.webPreferences.backgroundThrottling, false);
+  for (const value of [undefined, null, 'true', 'false', 1, 0, {}, []]) {
+    await assert.rejects(native.invoke('presentation-fullscreen', value), /Invalid fullscreen state/);
+  }
+  assert.deepEqual(native.fullscreenCalls, []);
+  assert.equal((await native.invoke('presentation-fullscreen', true)).fullscreen, true);
+  assert.deepEqual(native.fullscreenCalls, [true]);
+  assert.equal(native.sentEvents.length, 0, 'The asynchronous OS event confirms the native transition');
+  native.window.emit('enter-full-screen');
+  assert.equal((await native.invoke('presentation-fullscreen', false)).fullscreen, false);
+  native.window.emit('leave-full-screen');
+  assert.deepEqual(native.fullscreenCalls, [true, false]);
+  assert.deepEqual(native.sentEvents.map(({ name, value }) => ({ name, fullscreen: value.fullscreen })), [
+    { name: 'auralink:presentation-fullscreen', fullscreen: true },
+    { name: 'auralink:presentation-fullscreen', fullscreen: false },
+  ]);
+  native.markDestroyed(); native.window.emit('enter-full-screen');
+  assert.equal(native.sentEvents.length, 2, 'A destroyed view receives no native fullscreen event');
+});
+
+test('presentation and activity IPC cannot be called by other content or a subframe', async () => {
+  const native = await fixture();
+  const trusted = native.window.webContents;
+  const main = trusted.mainFrame;
+  for (const name of ['presentation-fullscreen', 'session-active']) {
+    for (const event of [
+      { sender: new EventEmitter(), senderFrame: main },
+      { sender: trusted, senderFrame: { url: main.url } },
+      { sender: trusted, senderFrame: undefined },
+    ]) await assert.rejects(native.invokeAs(name, true, event), /untrusted content/);
+  }
+  assert.deepEqual(native.fullscreenCalls, []);
+  assert.deepEqual(native.powerStarts, []);
+});
+
+test('a delayed Mac fullscreen entry cannot overrule an immediate request to exit', async () => {
+  const native = await fixture({ platform: 'darwin', delayedFullscreen: true });
+  await native.invoke('presentation-fullscreen', true);
+  assert.equal(native.pendingFullscreen(), true);
+  assert.equal(native.window.isFullScreen(), false, 'Entry has not finished natively');
+  await native.invoke('presentation-fullscreen', false);
+  assert.equal(native.pendingFullscreen(), true, 'The OS ignored exit while its entry animation was pending');
+  native.finishFullscreenTransition();
+  assert.equal(native.window.isFullScreen(), true);
+  assert.equal(native.pendingFullscreen(), false, 'Production reconciles the latest exit request after the late entry');
+  assert.deepEqual(native.fullscreenCalls, [true, false, false]);
+  assert.equal(native.sentEvents.length, 0, 'The stale enter event cannot reopen presentation in the renderer');
+  native.finishFullscreenTransition();
+  assert.equal(native.window.isFullScreen(), false);
+  assert.equal(native.pendingFullscreen(), null);
+  assert.deepEqual(native.sentEvents.map(({ name, value }) => ({ name, fullscreen: value.fullscreen })), [
+    { name: 'auralink:presentation-fullscreen', fullscreen: false },
+  ]);
+});
+
+test('a new Mac fullscreen entry request survives a delayed exit confirmation', async () => {
+  const native = await fixture({ platform: 'darwin', delayedFullscreen: true });
+  await native.invoke('presentation-fullscreen', true); native.finishFullscreenTransition();
+  assert.equal(native.window.isFullScreen(), true);
+  await native.invoke('presentation-fullscreen', false);
+  assert.equal(native.pendingFullscreen(), false);
+  await native.invoke('presentation-fullscreen', true);
+  assert.equal(native.pendingFullscreen(), false, 'The OS ignored re-entry while its exit animation was pending');
+  native.finishFullscreenTransition();
+  assert.equal(native.window.isFullScreen(), false);
+  assert.equal(native.pendingFullscreen(), true, 'Production re-applies the newest entry intent after the stale exit');
+  assert.deepEqual(native.fullscreenCalls, [true, false, true, true]);
+  assert.deepEqual(native.sentEvents.map(({ value }) => value.fullscreen), [true], 'No stale exit is published to collapse the reopened presentation');
+  native.finishFullscreenTransition();
+  assert.equal(native.window.isFullScreen(), true);
+  assert.equal(native.pendingFullscreen(), null);
+  assert.deepEqual(native.sentEvents.map(({ name, value }) => ({ name, fullscreen: value.fullscreen })), [
+    { name: 'auralink:presentation-fullscreen', fullscreen: true },
+    { name: 'auralink:presentation-fullscreen', fullscreen: true },
+  ]);
+  // Once the latest requested state is confirmed, subsequent native changes
+  // (for example the Mac window control) must still reach the renderer.
+  native.window.setFullScreen(false); native.finishFullscreenTransition();
+  assert.equal(native.sentEvents.at(-1).value.fullscreen, false);
+  assert.equal(native.pendingFullscreen(), null);
+});
+
+test('desktop sleep prevention starts only for explicit active room state and stops once on leave', async () => {
+  const native = await fixture();
+  assert.deepEqual(native.powerStarts, [], 'Opening the app alone cannot retain a power blocker');
+  await native.invoke('host', { name: 'Waiting for admission' });
+  assert.deepEqual(native.powerStarts, [], 'Preparing a room alone cannot retain a power blocker');
+  for (const value of [undefined, null, 'true', 1, 0, {}, []]) await assert.rejects(native.invoke('session-active', value), /Invalid room activity state/);
+  assert.equal((await native.invoke('session-active', false)).active, false);
+  assert.deepEqual(native.powerStarts, []);
+  assert.equal((await native.invoke('session-active', true)).active, true);
+  assert.equal((await native.invoke('session-active', true)).active, true);
+  assert.deepEqual(native.powerStarts, ['prevent-app-suspension']);
+  assert.equal((await native.invoke('session-active', false)).active, false);
+  assert.equal((await native.invoke('session-active', false)).active, false);
+  assert.deepEqual(native.powerStops, [1]);
+  assert.equal((await native.invoke('session-active', true)).active, true);
+  assert.deepEqual(native.powerStarts, ['prevent-app-suspension', 'prevent-app-suspension']);
+  await native.invoke('stop');
+  assert.deepEqual(native.powerStops, [1, 2], 'Native room teardown also releases the active blocker');
+});
+
+test('window close, renderer failure and app quit release active room sleep prevention', async () => {
+  for (const reason of ['closed', 'render-process-gone', 'before-quit']) {
+    const native = await fixture();
+    await native.invoke('session-active', true);
+    const target = reason === 'closed' ? native.window : reason === 'render-process-gone' ? native.window.webContents : native.app;
+    target.emit(reason); target.emit(reason);
+    assert.deepEqual(native.powerStops, [1], `${reason} releases the blocker exactly once`);
+    if (reason === 'before-quit') assert.ok(native.adapterDisposals() >= 1, 'Normal quit continues native adapter cleanup');
+    if (reason !== 'closed') assert.equal((await native.invoke('session-active', false)).active, false);
+    else await assert.rejects(native.invoke('session-active', true), /untrusted content/);
+  }
 });

@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.IBinder;
+import android.os.PowerManager;
 
 /** Keeps an explicitly opened remote-device room visible; never restarts a session. */
 public final class CallSessionService extends Service {
@@ -21,6 +22,7 @@ public final class CallSessionService extends Service {
     private Listener listener;
     private int types;
     private boolean running, stopping;
+    private PowerManager.WakeLock roomWakeLock;
 
     static synchronized void prepare(String id, Listener next) { ownership.prepare(id); pendingListener = next; }
     static synchronized void cancelPreparation(String id) { if (ownership.cancelPending(id)) pendingListener = null; }
@@ -57,7 +59,7 @@ public final class CallSessionService extends Service {
                 waiting = ownership.pendingMatches(id) ? pendingListener : null;
                 cancelPreparation(id);
             }
-            if (waiting != null) waiting.stopped("Previous session is still stopping. Return to Auralink and reconnect.");
+            if (waiting != null) waiting.stopped("Previous session is still stopping. Return to Glance-Port and reconnect.");
             stopSelfResult(startId); return START_NOT_STICKY;
         }
         synchronized (CallSessionService.class) {
@@ -68,8 +70,15 @@ public final class CallSessionService extends Service {
             ticket = id; listener = pendingListener; pendingListener = null;
         }
         types = intent.getIntExtra("types", ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-        try { startForeground(NOTIFICATION, notification(), types); running = true; listener.started(); }
-        catch (RuntimeException denied) { end("Android could not keep this call active. Return to Auralink and reconnect."); }
+        try {
+            startForeground(NOTIFICATION, notification(), types);
+            // Keep the admitted connection's CPU available during ordinary app
+            // switches. Never hold a lock for an idle page or restart a room.
+            roomWakeLock = ((PowerManager)getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, getPackageName() + ":active-room");
+            roomWakeLock.setReferenceCounted(false); roomWakeLock.acquire(65L * 60 * 1000);
+            running = true; listener.started();
+        }
+        catch (RuntimeException denied) { end("Android could not keep this call active. Return to Glance-Port and reconnect."); }
         return START_NOT_STICKY;
     }
     private Notification notification() {
@@ -77,18 +86,19 @@ public final class CallSessionService extends Service {
         PendingIntent stop = PendingIntent.getService(this, 1042, new Intent(this, CallSessionService.class).setAction(STOP).putExtra("ticket", ticket), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         boolean media = (types & (ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK | ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)) != 0;
         return new Notification.Builder(this, "active-call").setSmallIcon(getApplicationInfo().icon)
-            .setContentTitle(media ? "Auralink call in progress" : "Auralink room is open").setContentText("Return to your room or end the session here.")
+            .setContentTitle(media ? "Glance-Port call in progress" : "Glance-Port room is open").setContentText("Return to your room or end the session here.")
             .setOngoing(true).setCategory(media ? Notification.CATEGORY_CALL : Notification.CATEGORY_SERVICE).setContentIntent(open)
             .addAction(new Notification.Action.Builder(null, media ? "End call" : "End session", stop).build()).build();
     }
     private void end(String reason) {
         if (stopping) return; stopping = true; running = false;
+        if (roomWakeLock != null) { if (roomWakeLock.isHeld()) roomWakeLock.release(); roomWakeLock = null; }
         cancelPreparation(ticket); ownership.release(ticket);
         Listener previous = listener; listener = null;
         stopForeground(STOP_FOREGROUND_REMOVE); stopSelf();
         if (previous != null) previous.stopped(reason);
     }
-    @Override public void onTaskRemoved(Intent rootIntent) { end("Call ended because Auralink was closed."); super.onTaskRemoved(rootIntent); }
+    @Override public void onTaskRemoved(Intent rootIntent) { end("Call ended because Glance-Port was closed."); super.onTaskRemoved(rootIntent); }
     @Override public void onDestroy() { end("Android stopped the active call service."); if (instance == this) instance = null; super.onDestroy(); }
     @Override public IBinder onBind(Intent intent) { return null; }
 }

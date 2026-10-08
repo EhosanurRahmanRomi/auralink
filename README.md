@@ -1,6 +1,8 @@
 <div align="center">
 
-![Auralink — Your screen. A helping hand.](docs/assets/auralink-banner.svg)
+<img src="build/icon.png" width="144" alt="Glance-Port logo">
+
+# Glance-Port
 
 [![Build & checks](https://github.com/EhosanurRahmanRomi/auralink/actions/workflows/ci.yml/badge.svg)](https://github.com/EhosanurRahmanRomi/auralink/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/EhosanurRahmanRomi/auralink?color=9ba7ff)](https://github.com/EhosanurRahmanRomi/auralink/releases/latest)
@@ -12,11 +14,11 @@
 
 </div>
 
-Auralink is an open-source screen-sharing and attended remote-control app for **Windows 11, Apple Silicon macOS and Android 10+**, with optional microphone audio. Camera calls, messaging, files and recording are outside the current scope.
+Glance-Port is an open-source screen-sharing and attended remote-control app for **Windows 11, Apple Silicon macOS and Android 10+**, with optional microphone audio. Camera calls, messaging, files and recording are outside the current scope.
 
 The room flow is **Open a room → copy its invitation → join from the other device**. Invitation holders enter automatically while invitations are open. Screen capture and remote control remain separate, deliberate actions.
 
-**0.4.1 repairs screen and microphone recovery on Windows, Apple Silicon macOS and Android.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
+**0.5.0 introduces the Glance-Port name and supplied logo, fullscreen presentation with reachable call controls, and bounded Android background retention.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
 
 ## Download and connect
 
@@ -24,21 +26,27 @@ Expand **Assets** on the release page and choose a matching version:
 
 | Device | Package |
 |---|---|
-| Windows 11 / x64 | Auralink-Setup-VERSION-Windows-x64.exe |
-| MacBook Air M4 / Apple Silicon, macOS 13+ | Auralink-VERSION-Mac-arm64.dmg |
-| Android 10+, including iQOO | Auralink-VERSION-Android.apk |
+| Windows 11 / x64 | Glance-Port-Setup-VERSION-Windows-x64.exe |
+| MacBook Air M4 / Apple Silicon, macOS 13+ | Glance-Port-VERSION-Mac-arm64.dmg |
+| Android 10+, including iQOO | Glance-Port-VERSION-Android.apk |
 
 Releases include checksums, source and a report describing the exact build and completed checks. Windows test installers are unsigned; Mac test builds are ad-hoc signed and unnotarized. Android uses the project's stable local development signing identity.
 
-1. Launch Auralink and click **Open a room**. Its built-in coordinator supplies the address; guests need no domain, account or pairing form.
-2. Share **Copy link** or **Copy code** privately. Open the link in Auralink or paste it into **Join room**. Native links depend on the installed package's protocol registration.
+Glance-Port was previously named Auralink. The internal app IDs, `auralink://` invitation links and existing Auralink profile directories remain compatible. The local Android signing key is retained for updates; do not delete its private key. A separately generated CI test APK may have a different signing identity.
+
+1. Launch Glance-Port and click **Open a room**. Its built-in coordinator supplies the address; guests need no domain, account or pairing form.
+2. Share **Copy link** or **Copy code** privately. Open the link in Glance-Port or paste it into **Join room**. Native links depend on the installed package's protocol registration.
 3. Select **Share screen** and choose a display/window. Microphone audio is optional and starts off; use **Check sound** before enabling it.
 4. For remote help, view the other person's full-display share and **Request control**. The screen owner separately approves it. macOS requires Accessibility permission; Android requires its separately enabled attended Accessibility service and native owner confirmation.
 5. Stop with **Stop control**, **Stop sharing** or **Leave room**. Emergency stop: **Ctrl+Alt+Shift+Q** on Windows; **Command+Option+Shift+Q** on Mac.
 
 If a participant joins but screen or audio does not arrive, open **Connection → Retry through secure relay**. This reconnects the existing capture using the free fallback; control must be approved again. **Check sound** verifies your local microphone and speaker, while Connection details show actual packet counts and processing state. Use **Enable sound** when audio processing is paused after a native permission prompt.
 
-On Android, approve the system screen-sharing dialog and notification permission for visible Stop/End actions. Ordinary Home/return keeps the existing room and WebView; manufacturers can still stop apps under battery restrictions. Phone capture uses a selectable maximum 1280/1920-pixel long edge at up to 12 fps, rather than the desktop 1440p ceiling. A recent Android System WebView is required. Read the [Android guide](android/README.md) for capture, consent and battery/device boundaries.
+Use **Full screen** while watching a shared screen. The presentation fills the available viewport and keeps call, sharing and control-stop actions reachable. Exit with the onscreen button or Escape on desktop; leaving the room also exits. If browser fullscreen is unavailable or refused, the app uses an in-page presentation mode. Desktop titlebar controls remain native, with a transparent titlebar over the app's gradient; the main window stays opaque.
+
+Minimizing the desktop app retains the existing room and capture. Renderer background throttling is disabled, and an active session requests prevention of app suspension until the room ends. Closing the app, suspending the computer, disconnecting its network or locking a protected screen can still interrupt media or control.
+
+On Android, approve the system screen-sharing dialog and notification permission for visible Stop/End actions. Ordinary Home/return keeps the existing room and WebView. A visible session service and a partial wake lock bounded to 65 minutes reduce CPU suspension during an active session; public rooms still expire within 60 minutes. This does not keep the display on or guarantee survival of manufacturer battery restrictions, process reclamation or screen-lock capture rules. Phone capture uses a selectable maximum 1280/1920-pixel long edge at up to 12 fps, rather than the desktop 1440p ceiling. A recent Android System WebView is required. Read the [Android guide](android/README.md) for capture, consent and battery/device boundaries.
 
 Hosts can remove participants, lock invitations and create new invitations. **Remove & close invite** removes that connection and invalidates the old code. A fresh anonymous app cannot be permanently identified as the same person; share new invitations only with people you trust.
 
@@ -46,11 +54,11 @@ For a same-Wi-Fi test without hosted coordination, use **Other connection option
 
 ## Gallery
 
-| One-click workspace | Screen-sharing room |
+| Desktop workspace | Android layout |
 |---|---|
-| ![Auralink desktop workspace](docs/assets/desktop-ui.png) | ![Auralink screen and microphone controls](docs/assets/desktop-room.png) |
+| ![Glance-Port desktop workspace](docs/assets/glance-port-desktop.png) | ![Glance-Port Android layout](docs/assets/glance-port-mobile.png) |
 
-These captures show the bundled interface. Validation identifies actual-app and browser-fixture evidence separately.
+Glance-Port 0.5.0 uses warm plum, rose, coral and gold gradients with the supplied logo. These gallery captures show the actual renderer at desktop and phone viewport sizes in a browser; the release report distinguishes native-app and emulator checks.
 
 ## Features and limits
 
@@ -80,7 +88,7 @@ npm run dist:win:setup -- --publish never
 npm run dist:mac -- --publish never
 ```
 
-If install scripts are suppressed, run `node node_modules/electron/install.js`. Outputs go to `release/`. Deferred Android instructions remain in [android/README.md](android/README.md). Never upload `.private/`, credentials, invitations or signing keys.
+If install scripts are suppressed, run `node node_modules/electron/install.js`. Outputs go to `release/`. The Android build uses `scripts/build-android.ps1` with Java 21, Android SDK platform 36 and build tools 36.0.0; see [CI setup](.github/CI-NOTES.md) and [Android use](android/README.md). `scripts/make-icon.ps1` converts the supplied canonical PNG into a Windows ICO without replacing the PNG. Never upload `.private/`, credentials, invitations or signing keys.
 
 ## Verification and contribution
 

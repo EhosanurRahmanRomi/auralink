@@ -2,6 +2,14 @@ const {contextBridge, ipcRenderer} = require('electron');
 const invoke = (name, args) => ipcRenderer.invoke(`auralink:${name}`, args);
 contextBridge.exposeInMainWorld('auralink', {
   platform: process.platform,
+  setSessionActive: active => invoke('session-active', active),
+  setPresentationFullscreen: active => invoke('presentation-fullscreen', active),
+  onPresentationFullscreenChanged: listener => {
+    if (typeof listener !== 'function') return;
+    const handler = (_event, state) => listener(state);
+    ipcRenderer.on('auralink:presentation-fullscreen', handler);
+    return () => ipcRenderer.removeListener('auralink:presentation-fullscreen', handler);
+  },
   getPendingInvitation: () => invoke('pending-invitation'),
   onInvitation: listener => {
     if (typeof listener !== 'function') return;

@@ -1,7 +1,10 @@
 param([string]$AndroidSdkRoot, [string]$JdkDirectory)
 $ErrorActionPreference = 'Stop'
 $projectPath = Split-Path -Parent $PSScriptRoot
-$projectVersion = (Get-Content -LiteralPath (Join-Path $projectPath 'package.json') -Raw | ConvertFrom-Json).version
+$projectConfig = Get-Content -LiteralPath (Join-Path $projectPath 'package.json') -Raw | ConvertFrom-Json
+$projectVersion = $projectConfig.version
+$productName = $projectConfig.build.productName
+if ($productName -notmatch '^[A-Za-z0-9-]{1,60}$') { throw 'Invalid product name for Android artifact.' }
 if (-not $AndroidSdkRoot) { $AndroidSdkRoot = $env:ANDROID_SDK_ROOT }
 if (-not $AndroidSdkRoot) { $AndroidSdkRoot = $env:ANDROID_HOME }
 if (-not $AndroidSdkRoot) { $AndroidSdkRoot = Join-Path $projectPath '.tools/android-sdk' }
@@ -37,11 +40,11 @@ foreach ($generatedPath in @($classesPath, $dexPath)) {
 }
 foreach ($directory in @($assetsPath, $classesPath, $dexPath, $privatePath, $releasePath, (Join-Path $androidPath 'res/drawable'))) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
 # All source copies are explicit; toolchains, keys and arbitrary PC files are not packaged.
-foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js')) { Copy-Item -LiteralPath (Join-Path $projectPath "src/renderer/$file") -Destination (Join-Path $assetsPath $file) -Force }
+foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js','brand-mark.png')) { Copy-Item -LiteralPath (Join-Path $projectPath "src/renderer/$file") -Destination (Join-Path $assetsPath $file) -Force }
 $legalAssets = Join-Path $outPath 'assets/legal'
 New-Item -ItemType Directory -Path $legalAssets -Force | Out-Null
 foreach ($file in @('Java-WebSocket-LICENSE.txt','SLF4J-LICENSE.txt')) { Copy-Item -LiteralPath (Join-Path $androidPath "legal/$file") -Destination (Join-Path $legalAssets $file) -Force }
-Copy-Item -LiteralPath (Join-Path $projectPath 'LICENSE') -Destination (Join-Path $legalAssets 'Auralink-LICENSE.txt') -Force
+Copy-Item -LiteralPath (Join-Path $projectPath 'LICENSE') -Destination (Join-Path $legalAssets "$productName-LICENSE.txt") -Force
 Copy-Item -LiteralPath (Join-Path $projectPath 'build/icon.png') -Destination (Join-Path $androidPath 'res/drawable/icon.png') -Force
 function Invoke-BuildTool([string]$Tool, [string[]]$Arguments) {
     & $Tool @Arguments
@@ -64,10 +67,10 @@ $archive = [System.IO.Compression.ZipFile]::Open($unsigned, [System.IO.Compressi
 try {
     # Windows aapt2 can emit backslashes for assets. Android AssetManager
     # requires slash names, so create these fixed entries explicitly.
-    foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js')) {
+    foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js','brand-mark.png')) {
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $assetsPath $file), "assets/renderer/$file", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
     }
-    foreach ($file in @('Java-WebSocket-LICENSE.txt','SLF4J-LICENSE.txt','Auralink-LICENSE.txt')) {
+    foreach ($file in @('Java-WebSocket-LICENSE.txt','SLF4J-LICENSE.txt',"$productName-LICENSE.txt")) {
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $legalAssets $file), "assets/legal/$file", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
     }
     foreach ($dex in Get-ChildItem -LiteralPath $dexPath -Filter '*.dex' -File) {
@@ -88,7 +91,7 @@ if (-not (Test-Path -LiteralPath $keyStore)) {
     $env:AURALINK_SIGNING_PASSWORD = $password
     Invoke-BuildTool (Join-Path $JdkDirectory 'bin/keytool.exe') @('-genkeypair','-keystore',$keyStore,'-alias','auralink-local','-keyalg','RSA','-keysize','3072','-validity','3650','-storepass:env','AURALINK_SIGNING_PASSWORD','-keypass:env','AURALINK_SIGNING_PASSWORD','-dname','CN=Auralink local development, O=Local project, C=BD')
 } else { $env:AURALINK_SIGNING_PASSWORD = [IO.File]::ReadAllText($passwordPath).Trim() }
-$artifact = Join-Path $releasePath "Auralink-$projectVersion-Android.apk"
+$artifact = Join-Path $releasePath "$productName-$projectVersion-Android.apk"
 try {
     Invoke-BuildTool (Join-Path $buildTools 'apksigner.bat') @('sign','--ks',$keyStore,'--ks-key-alias','auralink-local','--ks-pass','env:AURALINK_SIGNING_PASSWORD','--key-pass','env:AURALINK_SIGNING_PASSWORD','--out',$artifact,$aligned)
     Invoke-BuildTool (Join-Path $buildTools 'apksigner.bat') @('verify','--verbose','--print-certs',$artifact)

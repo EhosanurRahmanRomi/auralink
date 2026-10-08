@@ -1,6 +1,6 @@
 {
-  "name": "auralink",
-  "version": "0.4.1",
+  "name": "glance-port",
+  "version": "0.5.0",
   "description": "One-click screen sharing and attended remote control",
   "private": true,
   "main": "src/main.cjs",
@@ -29,9 +29,14 @@
   },
   "build": {
     "appId": "local.auralink.desktop",
-    "productName": "Auralink",
+    "productName": "Glance-Port",
     "protocols": [
-      { "name": "Auralink room invitation", "schemes": ["auralink"] }
+      {
+        "name": "Glance-Port room invitation",
+        "schemes": [
+          "auralink"
+        ]
+      }
     ],
     "compression": "normal",
     "directories": {
@@ -42,8 +47,7 @@
       "build/icon.png",
       "package.json",
       "README.md",
-      "LICENSE",
-      "build/icon.svg"
+      "LICENSE"
     ],
     "asarUnpack": [
       "src/native/**/*"
@@ -53,16 +57,16 @@
         "portable",
         "nsis"
       ],
-      "artifactName": "Auralink-${version}-Windows-x64.exe",
+      "artifactName": "Glance-Port-${version}-Windows-x64.exe",
       "signExecutable": false,
       "icon": "build/icon.ico"
     },
     "portable": {
-      "artifactName": "Auralink-${version}-Windows-x64.exe",
+      "artifactName": "Glance-Port-${version}-Windows-x64.exe",
       "requestExecutionLevel": "user"
     },
     "nsis": {
-      "artifactName": "Auralink-Setup-${version}-Windows-x64.exe",
+      "artifactName": "Glance-Port-Setup-${version}-Windows-x64.exe",
       "oneClick": false,
       "perMachine": false,
       "allowElevation": false,
@@ -73,16 +77,16 @@
       "createStartMenuShortcut": true,
       "deleteAppDataOnUninstall": false,
       "differentialPackage": false,
-      "uninstallDisplayName": "Auralink ${version}",
+      "uninstallDisplayName": "Glance-Port ${version}",
       "include": "build/installer.nsh",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico"
     },
     "mac": {
       "target": "dmg",
-      "artifactName": "Auralink-${version}-Mac-arm64.dmg",
+      "artifactName": "Glance-Port-${version}-Mac-arm64.dmg",
       "category": "public.app-category.productivity",
-      "icon": "build/icon.svg",
+      "icon": "build/icon.png",
       "extendInfo": {
         "NSCameraUsageDescription": null,
         "NSMicrophoneUsageDescription": "Use your microphone only when you enable audio in a room.",

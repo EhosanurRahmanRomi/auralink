@@ -12,6 +12,7 @@
   const emergencyListeners = new Set();
   const mediaErrorListeners = new Set();
   const invitationListeners = new Set();
+  const fullscreenListeners = new Set();
   let screenSequence = -1;
   let screenCaptureId = null;
   let captureRequestNumber = 0;
@@ -115,6 +116,11 @@
     let message;
     try { message = typeof payload === 'string' ? JSON.parse(payload) : payload; } catch { return; }
     if (!message || typeof message !== 'object' || Array.isArray(message)) return;
+    if (message.event === 'presentation-fullscreen') {
+      if (typeof message.fullscreen !== 'boolean') return;
+      for (const listener of fullscreenListeners) { try { listener({fullscreen:message.fullscreen}); } catch { /* Native view state remains authoritative. */ } }
+      return;
+    }
     if (message.event === 'socket') {
       sockets.get(message.socketId)?.nativeEvent(message); return;
     }
@@ -171,6 +177,12 @@
   Object.defineProperty(window, 'auralink', {
     value: Object.freeze({
       platform: 'android',
+      setSessionActive: () => Promise.resolve({active:false}), // Admission owns the foreground service natively.
+      setPresentationFullscreen: (active) => typeof active === 'boolean' ? invoke('setPresentationFullscreen', active) : Promise.reject(new TypeError('Invalid fullscreen state.')),
+      onPresentationFullscreenChanged: (listener) => {
+        if (typeof listener !== 'function') return () => {};
+        fullscreenListeners.add(listener); return () => fullscreenListeners.delete(listener);
+      },
       getInfo: () => invoke('getInfo'),
       getPendingInvitation: () => invoke('getPendingInvitation'),
       trustInvite: (invite) => {

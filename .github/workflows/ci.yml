@@ -1,4 +1,4 @@
-name: Auralink checks and installers
+name: Glance-Port checks and installers
 
 on:
   push:
@@ -51,6 +51,10 @@ jobs:
         run: node tests/audio-browser.cjs
       - name: Approved phone-style desktop controls
         run: node tests/mobile-control.cjs
+      - name: Fullscreen presentation, mobile fallback and safe control exit
+        run: node tests/fullscreen-browser.cjs
+      - name: Native Electron fullscreen and minimize recovery
+        run: node tests/fullscreen-browser.cjs --electron
       - name: Android capture bridge, decoded portrait video and consent
         run: node tests/phone-share-browser.cjs
       - name: Internet pairing, consent and real WebRTC through coordinator
@@ -99,9 +103,9 @@ jobs:
       - name: Keep installer and verification
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Auralink-Windows-setup
+          name: Glance-Port-Windows-setup
           path: |
-            release/Auralink-Setup-*-Windows-x64.exe
+            release/Glance-Port-Setup-*-Windows-x64.exe
             test-results/windows-installer-smoke.json
           if-no-files-found: error
           retention-days: 7
@@ -130,6 +134,8 @@ jobs:
         run: npm ci --prefix internet-service
       - name: Visible Apple Silicon Electron relay with synthetic media and input
         run: node tests/websocket-relay-browser.cjs --electron
+      - name: Native Apple Silicon fullscreen and minimize recovery
+        run: node tests/fullscreen-browser.cjs --electron
       - name: JavaScript syntax and protocol permissions
         run: |
           npm run check
@@ -142,13 +148,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Auralink-Mac-arm64
+          name: Glance-Port-Mac-arm64
           path: |
-            release/Auralink-*-Mac-arm64.dmg
+            release/Glance-Port-*-Mac-arm64.dmg
             test-results/mac-helper-build.json
             test-results/mac-bundle-smoke.json
             test-results/mac-lobby.png
             test-results/websocket-relay-browser.json
+            test-results/fullscreen-electron.json
           if-no-files-found: error
           retention-days: 7
 
@@ -197,9 +204,9 @@ jobs:
       - name: Keep APK and public verification evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Auralink-Android-companion
+          name: Glance-Port-Android-companion
           path: |
-            release/Auralink-*-Android.apk
+            release/Glance-Port-*-Android.apk
             release/Android-build.json
             test-results/android-security.json
             test-results/android-apk-validation.json

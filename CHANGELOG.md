@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 — Glance-Port presentation update
+
+- Renamed the visible app and release packages to Glance-Port and used the supplied logo for desktop, Android and the interface. Existing application IDs, profiles, invitation scheme and local Android signing identity remain compatible.
+- Added fullscreen screen presentation with reachable call and remote-control tools, an explicit exit action and an in-page fallback when native fullscreen is unavailable. Exiting releases held remote inputs without ending the room.
+- Added a transparent native desktop titlebar over the app gradient while retaining native window controls and an opaque main window.
+- Retained the active desktop room and capture across minimize/restore, with background throttling disabled and a session-bound app-suspension blocker released on leave.
+- Added a session-bound Android partial wake lock with a 65-minute ceiling alongside visible foreground services. The public room's 60-minute limit remains; manufacturer process kills and protected screen-lock behavior are still device limits.
+- Updated package/source verification to include the supplied PNG, all ten Android renderer assets, and the twelve reviewed Android permissions. Added real decoded-media fullscreen and native minimize/restore regression checks.
+
 ## 0.4.1 — Screen and microphone recovery
 
 - Kept relay media-state messages reliable under video/audio load, so a receiver does not remain unaware of an enabled screen or microphone.

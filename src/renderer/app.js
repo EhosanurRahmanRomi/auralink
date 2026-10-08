@@ -24,6 +24,7 @@ const icons = {
   copy: '<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
   maximize: '<path d="M8 3H3v5m13-5h5v5m0 8v5h-5m-8 0H3v-5"/>',
   minimize: '<path d="M3 8h5V3m8 0v5h5m0 8h-5v5m-8 0v-5H3"/>',
+  volume: '<path d="M11 4 6 8H3v8h3l5 4Zm4 4a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/>',
   refresh: '<path d="M20 7a9 9 0 0 0-15-2L3 8m0-5v5h5m-4 9a9 9 0 0 0 15 2l2-3m0 5v-5h-5"/>',
   keyboard: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M7 16h10"/>',
   globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a17 17 0 0 1 0 18 17 17 0 0 1 0-18Z"/>',
@@ -194,7 +195,7 @@ function updateHostMode() {
   const globalRoom = $('host-mode').value === 'internet';
   $('host-port-field').hidden = globalRoom; $('host-port').required = !globalRoom;
   $('create-room').disabled = !globalRoom && !bridge?.hostRoom;
-  $('host-mode-help').textContent = globalRoom ? 'Connect through your private Internet service. Keep this device online; you approve every guest. Relay availability depends on the free allowance.' : 'Nearby rooms use the same Wi-Fi or private network. Windows may ask you to allow Auralink on your private network.';
+  $('host-mode-help').textContent = globalRoom ? 'Connect through your private Internet service. Keep this device online; you approve every guest. Relay availability depends on the free allowance.' : 'Nearby rooms use the same Wi-Fi or private network. Windows may ask you to allow Glance-Port on your private network.';
 }
 $('host-mode').addEventListener('change', updateHostMode);
 function showInternetSettings(message = '', focus = 'internet-service') {
@@ -314,13 +315,125 @@ $('copy-diagnostics').addEventListener('click', async () => {
     toast('Connection details copied.');
   } catch (error) { if (roomCurrent(epoch, rtc)) toast(`Could not copy connection details: ${cleanError(error)}`, true); }
 });
-$('fullscreen-button').addEventListener('click', async () => {
-  try { if (document.fullscreenElement) await document.exitFullscreen(); else await $('stage').requestFullscreen(); }
-  catch (error) { toast(`Fullscreen: ${cleanError(error)}`, true); }
+// A native fullscreen permission denial must never make the viewing action a
+// no-op. Expand the stage synchronously, then ask the host to remove its chrome.
+// The same live video element and approved input path are kept in every mode.
+const presentation = { active: false, native: false, browser: false, epoch: 0, focus: null, toolsHome: null, toastHome: null, toolsOpen: false };
+function renderPresentationControls() {
+  const fullscreen = $('fullscreen-button'), title = presentation.active ? 'Exit fullscreen' : 'Enter fullscreen';
+  fullscreen.innerHTML = icon(presentation.active ? 'minimize' : 'maximize'); fullscreen.title = title;
+  fullscreen.setAttribute('aria-label', title); fullscreen.setAttribute('aria-pressed', String(presentation.active));
+  const toolsToggle = $('presentation-tools-toggle');
+  if (toolsToggle) {
+    if (!inputAllowed()) presentation.toolsOpen = false;
+    toolsToggle.hidden = !presentation.active || !inputAllowed();
+    const toolsLabel = presentation.toolsOpen ? 'Hide control tools' : 'Show control tools';
+    toolsToggle.setAttribute('aria-expanded', String(presentation.toolsOpen)); toolsToggle.setAttribute('aria-label', toolsLabel); toolsToggle.title = toolsLabel;
+  }
+  const toolbar = $('presentation-toolbar'); if (!toolbar) return;
+  toolbar.hidden = !presentation.active;
+  for (const [targetId, sourceId] of [['presentation-mic-button', 'mic-button'], ['presentation-share-button', 'share-button']]) {
+    const target = $(targetId), source = $(sourceId); if (!target || !source) continue;
+    target.disabled = source.disabled; target.classList.toggle('enabled', source.classList.contains('enabled'));
+    target.innerHTML = source.querySelector('[data-icon]').outerHTML + `<span>${source.querySelector('small').textContent}</span>`;
+    target.setAttribute('aria-label', source.getAttribute('aria-label')); target.title = source.title;
+  }
+  const control = $('presentation-control-button');
+  const controlLabel = state.grant ? 'Stop control' : state.controlling ? 'Release control' : state.pendingControl ? 'Request pending' : 'Request control';
+  control.disabled = !state.grant && !state.controlling && $('request-control').disabled;
+  control.classList.toggle('enabled', Boolean(state.grant || state.controlling));
+  control.innerHTML = icon('pointer') + `<span>${controlLabel}</span>`; control.setAttribute('aria-label', controlLabel);
+  const sound = $('presentation-speaker-button');
+  const soundLabel = state.relayPlaybackBlocked || !$('audio-banner').hidden ? 'Enable sound' : bridge?.setAudioRoute ? state.speaker ? 'Speaker on' : 'Earpiece' : 'Check sound';
+  sound.disabled = !state.joined; sound.innerHTML = icon('volume') + `<span>${soundLabel}</span>`; sound.setAttribute('aria-label', soundLabel);
+  $('presentation-leave-button').disabled = !state.joined;
+  $('presentation-control-status').textContent = state.grant ? $('control-banner-text').textContent : state.controlling ? 'Control approved · click the screen to use it · Esc exits fullscreen' : state.pendingControl ? 'Waiting for the screen owner to approve control' : 'Viewing only · the screen owner must approve control';
+}
+function setPresentationLayout(active) {
+  releaseKeys(); clearRemoteText();
+  presentation.active = active; presentation.toolsOpen = false;
+  document.body.classList.toggle('presentation-mode', active); $('stage').classList.toggle('presentation-active', active);
+  $('stage').dataset.presentation = active ? presentation.native ? 'native' : presentation.browser ? 'browser' : 'expanded' : 'off';
+  if (active) {
+    const tools = $('remote-tools');
+    if (!presentation.toolsHome && tools?.parentNode) { presentation.toolsHome = document.createComment('remote controls'); tools.before(presentation.toolsHome); }
+    if (tools) $('stage').insertBefore(tools, $('presentation-toolbar'));
+    // Browser fullscreen only paints descendants of its top-layer element.
+    // Keep consent/media notices visible there without duplicating their state.
+    const notices = $('toast-region');
+    if (!presentation.toastHome && notices?.parentNode) { presentation.toastHome = document.createComment('room notices'); notices.before(presentation.toastHome); }
+    if (notices) $('stage').append(notices);
+    $('remote-keyboard-wrap').hidden = true; $('remote-keyboard-toggle').setAttribute('aria-expanded', 'false');
+    $('fullscreen-button').focus({ preventScroll: true });
+  } else {
+    if (presentation.toolsHome) { presentation.toolsHome.replaceWith($('remote-tools')); presentation.toolsHome = null; }
+    if (presentation.toastHome) { presentation.toastHome.replaceWith($('toast-region')); presentation.toastHome = null; }
+    $('stage-video').blur();
+    if (presentation.focus?.isConnected) presentation.focus.focus({ preventScroll: true });
+    presentation.focus = null;
+  }
+  renderRemoteTools();
+  renderPresentationControls();
+}
+async function exitPresentation({ nativeAlreadyExited = false, browserAlreadyExited = false } = {}) {
+  if (!presentation.active && !presentation.native && !presentation.browser) return;
+  ++presentation.epoch; presentation.native = false; presentation.browser = false; setPresentationLayout(false);
+  const exits = [];
+  if (!browserAlreadyExited && document.fullscreenElement === $('stage')) { try { exits.push(document.exitFullscreen()); } catch {} }
+  if (!nativeAlreadyExited && bridge?.setPresentationFullscreen) { try { exits.push(bridge.setPresentationFullscreen(false)); } catch {} }
+  await Promise.allSettled(exits);
+}
+function enterPresentation() {
+  if (presentation.active) return;
+  const epoch = ++presentation.epoch; presentation.focus = document.activeElement;
+  setPresentationLayout(true);
+  if (bridge?.setPresentationFullscreen) {
+    let request;
+    try { request = bridge.setPresentationFullscreen(true); } catch { return; }
+    void Promise.resolve(request).then(result => {
+      if (presentation.epoch !== epoch || !presentation.active) { if (!presentation.active && (result === true || result?.fullscreen)) void Promise.resolve(bridge.setPresentationFullscreen(false)).catch(() => {}); return; }
+      presentation.native = result === true || result?.fullscreen === true; $('stage').dataset.presentation = presentation.native ? 'native' : 'expanded';
+    }).catch(() => { /* The expanded stage remains usable if native chrome cannot hide. */ });
+    return;
+  }
+  if (typeof $('stage').requestFullscreen !== 'function') return;
+  // Call before any await: browser fullscreen requires the click's activation.
+  let request;
+  try { request = $('stage').requestFullscreen(); } catch { return; }
+  void Promise.resolve(request).then(() => {
+    if (presentation.epoch !== epoch || !presentation.active) { if (!presentation.active && document.fullscreenElement === $('stage')) void document.exitFullscreen().catch(() => {}); return; }
+    presentation.browser = document.fullscreenElement === $('stage'); $('stage').dataset.presentation = presentation.browser ? 'browser' : 'expanded';
+  }).catch(() => { /* Policy denial still leaves a full-window presentation. */ });
+}
+$('fullscreen-button').addEventListener('click', () => presentation.active ? void exitPresentation() : enterPresentation());
+$('presentation-fullscreen-exit')?.addEventListener('click', () => void exitPresentation());
+$('presentation-tools-toggle')?.addEventListener('click', () => {
+  if (!presentation.active || !inputAllowed()) return;
+  releaseKeys(); clearRemoteText(); presentation.toolsOpen = !presentation.toolsOpen;
+  renderRemoteTools(); renderPresentationControls();
 });
+for (const [targetId, sourceId] of [['presentation-mic-button', 'mic-button'], ['presentation-share-button', 'share-button'], ['presentation-leave-button', 'end-button']]) {
+  $(targetId)?.addEventListener('click', () => { releaseKeys(); clearRemoteText(); $(sourceId).click(); });
+}
+$('presentation-control-button')?.addEventListener('click', () => { releaseKeys(); clearRemoteText(); $(state.grant || state.controlling ? 'stop-control' : 'request-control').click(); });
+$('presentation-speaker-button')?.addEventListener('click', () => {
+  releaseKeys(); clearRemoteText();
+  $(state.relayPlaybackBlocked || !$('audio-banner').hidden ? 'hear-room' : bridge?.setAudioRoute ? 'phone-speaker-toggle' : 'audio-check-open').click();
+});
+document.addEventListener('keydown', event => {
+  if (presentation.active && event.code === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); void exitPresentation(); }
+}, true);
 document.addEventListener('fullscreenchange', () => {
-  const active = document.fullscreenElement === $('stage'); const title = active ? 'Exit fullscreen' : 'Enter fullscreen';
-  $('fullscreen-button').innerHTML = icon(active ? 'minimize' : 'maximize'); $('fullscreen-button').title = title; $('fullscreen-button').setAttribute('aria-label', title);
+  if (document.fullscreenElement === $('stage')) {
+    presentation.browser = true;
+    if (!presentation.active) { presentation.focus = document.activeElement; setPresentationLayout(true); }
+    $('stage').dataset.presentation = 'browser';
+  } else if (presentation.browser) void exitPresentation({ browserAlreadyExited: true });
+});
+bridge?.onPresentationFullscreenChanged?.(value => {
+  const active = typeof value === 'boolean' ? value : value?.fullscreen === true;
+  if (active && presentation.active) { presentation.native = true; $('stage').dataset.presentation = 'native'; }
+  else if (!active && presentation.native) void exitPresentation({ nativeAlreadyExited: true });
 });
 
 function makeAudioOutput() { const audio = document.createElement('audio'); audio.autoplay = true; audio.playsInline = true; audio.volume = 1; audio.className = 'mobile-audio'; return audio; }
@@ -357,6 +470,7 @@ function updateAudioBanner() {
   $('audio-banner').hidden = !blocked;
   $('audio-banner-title').textContent = state.relayCaptureSuspended ? 'Microphone processing needs a tap' : 'Room audio needs a tap';
   $('audio-banner-text').textContent = state.relayCaptureSuspended ? 'Resume audio processing so the other person can hear your microphone.' : 'Enable playback to hear the other participants.';
+  renderPresentationControls();
 }
 async function playRemoteAudio(audio) {
   try { await audio.play(); audio.dataset.blocked = 'false'; }
@@ -372,10 +486,11 @@ $('phone-speaker-toggle').addEventListener('click', async () => {
   state.speaker = !state.speaker;
   $('phone-speaker-toggle').textContent = state.speaker ? 'Speaker on' : 'Earpiece';
   $('phone-speaker-toggle').setAttribute('aria-pressed', String(state.speaker));
+  renderPresentationControls();
   try { await updatePhoneAudioRoute(); } catch (error) { toast(`Audio route: ${cleanError(error)}`, true); }
 });
 function microphoneError(error) {
-  if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) return bridge?.platform === 'darwin' ? 'Allow Auralink in System Settings → Privacy & Security → Microphone, then quit and reopen the app if macOS requests it.' : 'Allow microphone access in your device privacy settings, then try again. Windows: Settings → Privacy & security → Microphone, including desktop apps.';
+  if (['NotAllowedError', 'PermissionDeniedError'].includes(error?.name)) return bridge?.platform === 'darwin' ? 'Allow Glance-Port in System Settings → Privacy & Security → Microphone, then quit and reopen the app if macOS requests it.' : 'Allow microphone access in your device privacy settings, then try again. Windows: Settings → Privacy & security → Microphone, including desktop apps.';
   if (['NotReadableError', 'TrackStartError'].includes(error?.name)) return 'Your microphone could not start. Close another app using it, check the device connection, or select System default in Preferences.';
   if (error?.name === 'NotFoundError') return 'No microphone was found. Connect one and check the selected device in Preferences.';
   return cleanError(error);
@@ -637,6 +752,7 @@ async function handleMessage(message) {
       if (state.room?.internet && state.room.roomId && message.room?.id !== state.room.roomId) return;
       if (state.room?.pendingSelfId && message.selfId !== state.room.pendingSelfId) return;
       state.selfId = message.selfId; state.hostId = message.hostId; state.joined = true; state.joining = false;
+      if (bridge?.setSessionActive) void Promise.resolve(bridge.setSessionActive(true)).catch(() => {});
       if (message.room) state.room = { ...state.room, roomId: message.room.id, access: message.room.access || state.room.access, inviteEnabled: message.room.inviteEnabled };
       $('stage-empty-text').textContent = 'Turn on your microphone to talk, or share your screen to show what you are working on.';
       void updatePhoneAudioRoute().catch(error => toast(`Audio output: ${cleanError(error)}`, true));
@@ -849,7 +965,7 @@ function renderParticipants() {
     const label = document.createElement('span'); label.className = 'participant-label'; const name = document.createElement('span'); name.textContent = peer.name;
     const badge = document.createElement('span'); badge.className = 'participant-icons'; badge.innerHTML = icon(peer.media?.audio ? 'mic' : 'mic-off') + (getTrack(peer.id, 'screen') ? icon('monitor') : '');
     label.append(name, badge); item.append(label);
-    item.addEventListener('click', () => { state.selected = getTrack(peer.id, 'screen') ? { peerId: peer.id, kind: 'screen' } : null; renderStage(); renderParticipants(); updateButtons(); });
+    item.addEventListener('click', () => { releaseKeys(); clearRemoteText(); state.selected = getTrack(peer.id, 'screen') ? { peerId: peer.id, kind: 'screen' } : null; renderStage(); renderParticipants(); updateButtons(); });
     $('participants').append(item);
   }
 }
@@ -940,6 +1056,7 @@ function updateButtons() {
   const relayAvailable = Boolean(ready && state.rtc?.websocketRelayEnabled && state.peers.size);
   $('retry-relay').hidden = !relayAvailable; $('retry-relay-help').hidden = !relayAvailable;
   $('retry-relay').disabled = !relayAvailable;
+  renderPresentationControls();
 }
 
 $('mic-button').addEventListener('click', () => toggleMicrophone());
@@ -1107,7 +1224,7 @@ async function beginPhoneSharing() {
   if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
   state.selected = { peerId: state.selfId, kind: 'screen' }; track.addEventListener('ended', () => { if (state.phoneScreen === capture) void stopSharing(); });
   updateButtons(); renderParticipants(); renderStage();
-  toast(screen.notificationAvailable === false ? 'Your phone screen is shared. Notifications are disabled: return to Auralink to stop sharing, or use Android’s capture control.' : 'Your phone screen is shared. Use the Android sharing notification or return here to stop.');
+  toast(screen.notificationAvailable === false ? 'Your phone screen is shared. Notifications are disabled: return to Glance-Port to stop sharing, or use Android’s capture control.' : 'Your phone screen is shared. Use the Android sharing notification or return here to stop.');
   } catch (error) {
     // Native permission can complete after a room has been replaced. Cleanup
     // may only address that projection, never whichever projection is newest.
@@ -1287,7 +1404,7 @@ stageVideo.addEventListener('pointerdown', (event) => {
   state.lastPoint = point; state.pressedButtons.add(event.button); sendInput({ type: 'move', ...point }); sendInput({ type: 'down', button: event.button, ...point });
 });
 stageVideo.addEventListener('pointerup', (event) => {
-  if (!inputAllowed() || event.button > 2) return;
+  if (!inputAllowed() || event.button > 2 || !state.pressedButtons.has(event.button)) return;
   const point = videoPoint(event, true) || state.lastPoint; event.preventDefault(); state.pressedButtons.delete(event.button); state.lastPoint = point; sendInput({ type: 'up', button: event.button, ...point });
   if (stageVideo.hasPointerCapture(event.pointerId)) stageVideo.releasePointerCapture(event.pointerId);
 });
@@ -1333,8 +1450,8 @@ function clearRemoteText() {
   $('remote-text-input').value = ''; remoteIME.composing = false; remoteIME.lastComposition = null; clearTimeout(remoteIME.timer);
 }
 function renderRemoteTools() {
-  const enabled = Boolean(inputAllowed()); $('remote-tools').hidden = !enabled;
-  if (!enabled) {
+  const enabled = Boolean(inputAllowed()); $('remote-tools').hidden = !enabled || presentation.active && !presentation.toolsOpen;
+  if ($('remote-tools').hidden) {
     $('remote-keyboard-wrap').hidden = true; $('remote-keyboard-toggle').setAttribute('aria-expanded', 'false');
     clearRemoteText();
   }
@@ -1459,6 +1576,7 @@ function updateDuration() {
 $('end-button').addEventListener('click', () => leaveRoom());
 async function leaveRoom(stopHost = true) {
   if (state.leaving) return;
+  const exitFullscreen = exitPresentation();
   const globalRoom = state.room?.internet === true || state.preparingInternet;
   const stopNearbyHost = stopHost && !globalRoom && (state.isHost || state.preparingHost);
   let stoppingHost;
@@ -1470,6 +1588,7 @@ async function leaveRoom(stopHost = true) {
   state.preparingHost = false; state.preparingInternet = false;
   const leavingInternetRoom = globalRoom && (state.joined || state.joining);
   state.joined = false; state.joining = false;
+  if (bridge?.setSessionActive) void Promise.resolve(bridge.setSessionActive(false)).catch(() => {});
   if (cancelPublicSetup) internet.close();
   updateButtons(); setStatus('Closing room…', 'waiting');
   // Stop outgoing media immediately, before native cleanup awaits. A lost
@@ -1491,7 +1610,7 @@ async function leaveRoom(stopHost = true) {
   for (const item of state.local.values()) item.stream.getTracks().forEach((track) => track.stop());
   for (const audio of state.audioElements.values()) { audio.srcObject = null; audio.remove(); state.speakerPool.push(audio); }
   state.audioElements.clear(); state.local.clear(); state.peers.clear(); state.tracks.clear(); state.requests.clear();
-  if (document.fullscreenElement) { try { await document.exitFullscreen(); } catch {} }
+  await exitFullscreen;
   try { await stoppingHost; } catch { /* Broker may already be stopped. */ }
   state.isHost = false; state.joined = false; state.joining = false; state.selfId = null; state.hostId = null; state.selected = null; state.sourceId = null; state.controlRequest = null; state.room = null;
   state.relayPlaybackBlocked = false; state.relayCaptureSuspended = false; state.relayCompatibilityNotified = false; $('audio-banner').hidden = true; await updatePhoneAudioRoute().catch(() => {});
@@ -1505,6 +1624,7 @@ window.addEventListener('beforeunload', () => { state.rtc?.close(); bridge?.revo
 
 async function initialize() {
   savePreferences();
+  document.body.dataset.platform = bridge?.platform || 'browser';
   try { state.nativeInfo = await bridge?.getInfo?.(); } catch { /* Browser clients do not expose native information. */ }
   const browserPlatform = /Android/i.test(navigator.userAgent) ? 'Android browser' : /Macintosh/i.test(navigator.userAgent) ? 'Mac browser' : /Windows/i.test(navigator.userAgent) ? 'Windows browser' : 'Browser client';
   $('profile-platform').textContent = state.nativeInfo?.platform || bridge?.platform || browserPlatform;
@@ -1523,7 +1643,6 @@ async function initialize() {
   }
   renderDevices();
   await refreshDevices();
-  if (!$('stage').requestFullscreen) { $('fullscreen-button').disabled = true; $('fullscreen-button').title = 'Fullscreen is unavailable in this browser'; }
   if (!bridge?.hostRoom) { $('host-mode').value = 'internet'; $('advanced-host-button').title = 'Create a private-group Internet room'; }
   updateHostMode(); renderInternet();
   consumeInvitation();

@@ -15,7 +15,7 @@ const critical = ['src/main.cjs', 'src/preload.cjs', 'src/core/broker.cjs', 'src
   'src/native/control.cjs', 'src/native/windows-input.ps1', 'src/renderer/index.html',
   'src/renderer/styles.css', 'src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/android-bridge.js',
   'src/renderer/internet.js', 'src/renderer/desktop-internet.js', 'src/core/internet-client.cjs',
-  'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/core/app-invitation.cjs'];
+  'src/renderer/relay-media.js', 'src/renderer/audio-worklet.js', 'src/core/app-invitation.cjs', 'src/renderer/brand-mark.png', 'build/icon.png'];
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
 function execute(command, args, options = {}) {
@@ -34,9 +34,10 @@ function findSevenZip() {
   throw new Error('electron-builder bundled 7za tool is unavailable');
 }
 
-function appProcesses() {
+function appProcesses(productName) {
+  assert.match(productName, /^[A-Za-z0-9-]{1,60}$/, 'Product name must be safe for process checks');
   const json = execute('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-    "@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Auralink.exe' -or $_.Name -like 'Auralink-*-Windows-x64.exe' } | Select-Object ProcessId, ParentProcessId, ExecutablePath) | ConvertTo-Json -Compress"]);
+    `@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq '${productName}.exe' -or $_.Name -like '${productName}-*-Windows-x64.exe' -or $_.Name -eq 'Auralink.exe' -or $_.Name -like 'Auralink-*-Windows-x64.exe' } | Select-Object ProcessId, ParentProcessId, ExecutablePath) | ConvertTo-Json -Compress`]);
   const parsed = JSON.parse(json || '[]');
   return Array.isArray(parsed) ? parsed : [parsed];
 }
@@ -56,7 +57,9 @@ async function run() {
   fs.mkdirSync(qa, { recursive: true });
   const payload = fs.mkdtempSync(path.join(qa, 'windows-setup-payload-'));
   const config = JSON.parse(fs.readFileSync(path.join(project, 'package.json'), 'utf8'));
-  const installer = path.join(project, 'release', `Auralink-Setup-${config.version}-Windows-x64.exe`);
+  const productName = config.build.productName;
+  assert.match(productName, /^[A-Za-z0-9-]{1,60}$/, 'Product name must be safe for artifact paths');
+  const installer = path.join(project, 'release', `${productName}-Setup-${config.version}-Windows-x64.exe`);
   const output = path.join(qa, 'windows-installer-smoke.json');
   const evidence = { startedAt: new Date().toISOString(), passed: false, installationExecuted: false,
     nativeInputInjected: false, checks: [], errors: [] };
@@ -86,14 +89,14 @@ async function run() {
       requestElevation: false, autoLaunch: false, createsDesktopAndStartMenuShortcuts: true,
       preservesAppDataOnUninstall: true, portableTargetRetained: config.build.win.target.includes('portable') };
     evidence.checks.push('Setup configuration forces current-user assisted install, preserves app data and retains portable target');
-    evidence.processesBefore = appProcesses();
+    evidence.processesBefore = appProcesses(productName);
     const tool = findSevenZip();
     const archiveCheck = execute(tool, ['t', '-y', installer]);
     assert.match(archiveCheck, /Everything is Ok/);
     evidence.archive = { integrityPassed: true, embeddedPayloadTailWarning: /data after the end of archive/.test(archiveCheck) };
     execute(tool, ['x', '-y', `-o${payload}`, installer]);
     evidence.checks.push('Embedded application archive passes CRC integrity and extracts without running setup');
-    const applicationExe = path.join(payload, 'Auralink.exe');
+    const applicationExe = path.join(payload, `${productName}.exe`);
     const executableBytes = fs.readFileSync(applicationExe);
     assert.equal(pe.NtExecutable.from(executableBytes, { ignoreCert: true }).newHeader.fileHeader.machine, 0x8664);
     evidence.payloadArchitecture = 'AMD64/x64';
@@ -140,7 +143,7 @@ async function run() {
     evidence.checks.push('Extracted installed-layout app launches with workspace-isolated preferences, HTTPS room and native helper protocol; no native input sent');
     await application.close();
     application = null;
-    evidence.processesAfter = appProcesses();
+    evidence.processesAfter = appProcesses(productName);
     evidence.preExistingProcessesPreserved = evidence.processesBefore.every((before) => evidence.processesAfter.some((after) => after.ProcessId === before.ProcessId && after.ExecutablePath === before.ExecutablePath));
     evidence.noQAProcessesRemaining = evidence.processesAfter.every((process) => !String(process.ExecutablePath).startsWith(payload));
     assert.equal(evidence.preExistingProcessesPreserved, true);

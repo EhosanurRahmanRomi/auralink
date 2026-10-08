@@ -20,6 +20,8 @@ import android.content.pm.ServiceInfo;
 import android.provider.Settings;
 import android.view.View;
 import android.view.WindowManager;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
@@ -47,12 +49,15 @@ import javax.net.ssl.HttpsURLConnection;
 public final class MainActivity extends Activity {
     private static final String PAGE = "https://appassets.androidplatform.net/assets/index.html";
     private static final String HOST = "appassets.androidplatform.net";
-    private static final Set<String> ASSETS = new HashSet<>(Arrays.asList("index.html", "styles.css", "app.js", "rtc.js", "android-bridge.js", "internet.js", "desktop-internet.js", "relay-media.js", "audio-worklet.js"));
+    private static final Set<String> ASSETS = new HashSet<>(Arrays.asList("index.html", "styles.css", "app.js", "rtc.js", "android-bridge.js", "internet.js", "desktop-internet.js", "relay-media.js", "audio-worklet.js", "brand-mark.png"));
     private final ExecutorService workers = Executors.newSingleThreadExecutor();
     private WebView webView;
     private FrameLayout root;
     private View fullscreen;
     private WebChromeClient.CustomViewCallback fullscreenCallback;
+    private boolean presentationFullscreen;
+    private android.window.OnBackInvokedCallback presentationBack;
+    private boolean presentationBackRegistered;
     private volatile boolean foreground, destroyed;
     private long generation = 0;
     private Invitation invitation;
@@ -130,6 +135,7 @@ public final class MainActivity extends Activity {
                 clearProjectionRequest(); closeSocket(); revokeControl("Android display process stopped.");
                 stopCallService("Android display process stopped."); if (callAudio != null) callAudio.stop();
                 if (fullscreen != null) { root.removeView(fullscreen); fullscreen = null; fullscreenCallback = null; }
+                setPresentationFullscreen(false);
                 root.removeView(failed); failed.destroy();
                 lastSessionEnd = "Android stopped the display process. Your call, screen share and control approval ended.";
                 displayRecoveryPending = true;
@@ -147,7 +153,7 @@ public final class MainActivity extends Activity {
                 String name = path.substring(8);
                 if (!ASSETS.contains(name)) return blocked();
                 try {
-                    String mime = name.endsWith(".js") ? "application/javascript" : name.endsWith(".css") ? "text/css" : "text/html";
+                    String mime = name.endsWith(".js") ? "application/javascript" : name.endsWith(".css") ? "text/css" : name.endsWith(".png") ? "image/png" : "text/html";
                     WebResourceResponse result = new WebResourceResponse(mime, "UTF-8", getAssets().open("renderer/" + name));
                     java.util.Map<String,String> headers = new java.util.HashMap<>();
                     headers.put("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'");
@@ -161,6 +167,7 @@ public final class MainActivity extends Activity {
             @Override public void onShowCustomView(View view, CustomViewCallback callback) {
                 if (fullscreen != null || !trustedPage()) { callback.onCustomViewHidden(); return; }
                 fullscreen = view; fullscreenCallback = callback; root.addView(view, new FrameLayout.LayoutParams(-1, -1)); webView.setVisibility(View.INVISIBLE);
+                setPresentationFullscreen(true);
             }
             @Override public void onHideCustomView() { exitFullscreen(); }
         });
@@ -206,7 +213,7 @@ public final class MainActivity extends Activity {
     private int newPermissionCode() {
         // Activity result codes are 16-bit. Keep separate codes for each owned
         // prompt so an old result can never complete a replacement request.
-        if (nextPermissionCode > 65535) throw new IllegalStateException("Reopen Auralink before requesting another permission.");
+        if (nextPermissionCode > 65535) throw new IllegalStateException("Reopen Glance-Port before requesting another permission.");
         return nextPermissionCode++;
     }
     private boolean projectionSession() { return localDocument() && (ScreenShareService.active() || projectionStarting); }
@@ -258,6 +265,10 @@ public final class MainActivity extends Activity {
                     "lastSessionEnd", lastSessionEnd,
                     "capabilities", json("hostRoom", false, "screenShare", true, "remoteInputHost", true, "accessibilityEnabled", enabled, "screenMaxEdge", 1920, "screenMaxFps", 12, "foregroundCallService", true, "foregroundRoomService", true)));
                 lastSessionEnd = "";
+            } else if ("setPresentationFullscreen".equals(method)) {
+                if (!(args instanceof Boolean)) throw new IllegalArgumentException("Invalid fullscreen state.");
+                if ((Boolean)args) setPresentationFullscreen(true); else exitFullscreen();
+                reply(id, json("fullscreen", presentationFullscreen));
             } else if ("getPendingInvitation".equals(method)) {
                 invitationListenerReady = true;
                 String code = consumePendingInvitation(); reply(id, code == null ? JSONObject.NULL : code);
@@ -270,7 +281,7 @@ public final class MainActivity extends Activity {
                     !java.util.Objects.equals(projectionId, ((JSONObject)args).optString("captureId"))) {
                     reply(id, json("ok", false, "reason", "That screen share has already ended.")); return;
                 }
-                reply(id, json("ok", true)); clearProjectionRequest(); ScreenShareService.stopCurrent("Stopped in Auralink."); revokeControl("Screen sharing stopped.");
+                reply(id, json("ok", true)); clearProjectionRequest(); ScreenShareService.stopCurrent("Stopped in Glance-Port."); revokeControl("Screen sharing stopped.");
             } else if ("ackScreenFrame".equals(method)) {
                 if (((JSONObject)args).has("captureId") &&
                     !java.util.Objects.equals(projectionId, ((JSONObject)args).optString("captureId"))) {
@@ -280,7 +291,7 @@ public final class MainActivity extends Activity {
             } else if ("grantControl".equals(method)) {
                 grantControl(id, (JSONObject)args);
             } else if ("revokeControl".equals(method)) {
-                revokeControl("Permission revoked in Auralink."); reply(id, json("ok", true));
+                revokeControl("Permission revoked in Glance-Port."); reply(id, json("ok", true));
             } else if ("applyInput".equals(method)) {
                 JSONObject input = (JSONObject)args; AttendedAccessibilityService service = AttendedAccessibilityService.current();
                 String peer = input.getString("peerId"), session = input.getString("sessionId");
@@ -296,7 +307,7 @@ public final class MainActivity extends Activity {
                 Runnable update = () -> {
                     boolean ok = callAudio.update(active && (foreground || callSession() || projectionSession()), speaker);
                     reply(requestId, json("ok", ok, "speaker", speaker, "reason", ok ? "" : callAudio.lastError()));
-                    if (!foreground && !transportPage()) stopSession("Call media ended while Auralink was in the background.");
+                    if (!foreground && !transportPage()) stopSession("Call media ended while Glance-Port was in the background.");
                 };
                 if (active && roomMembership.hasRoom()) {
                     // An explicitly admitted device room keeps its network
@@ -304,14 +315,14 @@ public final class MainActivity extends Activity {
                     int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
                     if (route.optBoolean("playback", false)) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
                     ensureCallService(types, update,
-                        () -> reject(requestId, "Android could not keep the call active. Return to Auralink and reconnect."));
+                        () -> reject(requestId, "Android could not keep the call active. Return to Glance-Port and reconnect."));
                 } else {
                     if (!roomMembership.hasRoom()) stopCallService("Room ended.");
                     update.run();
                 }
             } else if ("copyText".equals(method)) {
                 if (!(args instanceof String) || ((String)args).length() > 4096) throw new IllegalArgumentException("Invalid clipboard text.");
-                ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Auralink", (String)args)); reply(id, json("ok", true));
+                ((ClipboardManager)getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("Glance-Port", (String)args)); reply(id, json("ok", true));
             } else if ("trustInvite".equals(method)) {
                 if (!(args instanceof String)) throw new IllegalArgumentException("Invalid invitation.");
                 final Invitation candidate = Invitation.parse((String)args);
@@ -385,7 +396,7 @@ public final class MainActivity extends Activity {
                     }
                 }
                 socket.send(data); reply(id, json("ok", true));
-                if (!foreground && !transportPage()) stopSession("Room ended while Auralink was in the background.");
+                if (!foreground && !transportPage()) stopSession("Room ended while Glance-Port was in the background.");
             } else if ("closeSocket".equals(method)) {
                 JSONObject options = (JSONObject)args;
                 if (socketId != null && socketId.equals(options.getString("socketId"))) closeSocket();
@@ -398,7 +409,7 @@ public final class MainActivity extends Activity {
             if (destroyed || generation != serial || !id.equals(socketId)) return;
             // A disconnected background session cannot retain WebView media or
             // projection consent, even while an approved projection was active.
-            if (!foreground && ("close".equals(type) || "error".equals(type))) { stopSession("Connection ended while Auralink was in the background."); return; }
+            if (!foreground && ("close".equals(type) || "error".equals(type))) { stopSession("Connection ended while Glance-Port was in the background."); return; }
             if (!foreground && ownPermissionPause() && !projectionSession() && !callSession()) {
                 int bytes = data == null ? 0 : data.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
                 if (pausedEvents.size() >= 64 || pausedEventBytes + bytes > 1048576) { stopSession(); return; }
@@ -408,7 +419,7 @@ public final class MainActivity extends Activity {
             if (!transportPage()) return;
             if ("message".equals(type) && !validSocketMessage(data, false)) { stopSession("The service sent an invalid room message."); return; }
             if ("message".equals(type) && !observeBroker(data)) return;
-            if (!foreground && !transportPage()) { stopSession("Room ended while Auralink was in the background."); return; }
+            if (!foreground && !transportPage()) { stopSession("Room ended while Glance-Port was in the background."); return; }
             deliver(json("event", "socket", "socketId", id, "type", type, "data", data == null ? JSONObject.NULL : data,
                 "code", code, "reason", reason == null ? "" : reason, "message", reason == null ? "" : reason));
             if ("close".equals(type)) { closeSocket(); }
@@ -477,7 +488,7 @@ public final class MainActivity extends Activity {
         try { startForegroundService(new Intent(this, CallSessionService.class).putExtra("ticket", ticket).putExtra("types", callRequiredTypes)); }
         catch (RuntimeException denied) {
             stopCallService("Android could not start an active call service.");
-            deliver(json("event", "media-error", "reason", "Android could not keep this call active. Return to Auralink and reconnect."));
+            deliver(json("event", "media-error", "reason", "Android could not keep this call active. Return to Glance-Port and reconnect."));
         }
     }
     private void stopCallService(String reason) {
@@ -498,7 +509,7 @@ public final class MainActivity extends Activity {
                 websocketRelayEnabled = internetService != null && roomMembership.hasRoom() && message.optBoolean("websocketRelayEnabled", false) &&
                     message.opt("relayKey") instanceof String && RelayMediaPolicy.validKey((String)message.opt("relayKey"));
                 if (roomMembership.hasRoom()) ensureCallService(ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE, () -> {},
-                    () -> stopSession("Android could not keep the room open. Return to Auralink and reconnect."));
+                    () -> stopSession("Android could not keep the room open. Return to Glance-Port and reconnect."));
             } else if ("pending".equals(type) && internetService != null) {
                 if (!roomMembership.observePending(message.optString("selfId"), message.optJSONObject("room") == null ? "" : message.optJSONObject("room").optString("id"))) return false;
             } else if ("peer-joined".equals(type)) roomMembership.add(message.getJSONObject("peer").getString("id"));
@@ -585,7 +596,7 @@ public final class MainActivity extends Activity {
                 String pending = projectionRequest; clearProjectionRequest();
                 if (pending != null) reject(pending, reason);
                 if (foreground || callSession()) deliver(json("event", "screen", "type", "stopped", "captureId", ticket, "reason", reason));
-                else stopSession("Screen sharing ended while Auralink was in the background.");
+                else stopSession("Screen sharing ended while Glance-Port was in the background.");
             }
         });
         Intent service = new Intent(this, ScreenShareService.class).putExtra("ticket", ticket).putExtra("consent", data)
@@ -608,8 +619,8 @@ public final class MainActivity extends Activity {
         final AttendedAccessibilityService service = AttendedAccessibilityService.current();
         if (service == null) {
             controlDialog = new AlertDialog.Builder(this).setTitle("Enable attended phone control")
-                .setMessage("Android requires the Auralink attended control accessibility service. Enable it in Settings, return to Auralink, then approve a new control request. The service can tap, swipe and edit ordinary text fields only while you share your screen and approve a controller. For a sideloaded APK, Android may first require Allow restricted settings in App info.")
-                .setPositiveButton("Open Settings", (dialog, which) -> { reply(requestId, json("ok", false, "reason", "Enable Auralink attended control in Accessibility Settings, return, and approve again.")); startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); })
+                .setMessage("Android requires the Glance-Port attended control accessibility service. Enable it in Settings, return to Glance-Port, then approve a new control request. The service can tap, swipe and edit ordinary text fields only while you share your screen and approve a controller. For a sideloaded APK, Android may first require Allow restricted settings in App info.")
+                .setPositiveButton("Open Settings", (dialog, which) -> { reply(requestId, json("ok", false, "reason", "Enable Glance-Port attended control in Accessibility Settings, return, and approve again.")); startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); })
                 .setNegativeButton("Keep view only", (dialog, which) -> reply(requestId, json("ok", false, "reason", "Phone remains view only.")))
                 .setOnCancelListener(dialog -> reply(requestId, json("ok", false, "reason", "Phone remains view only."))).create();
             controlDialog.show(); return;
@@ -689,20 +700,58 @@ public final class MainActivity extends Activity {
             if (foreground) launchScreenConsent(); else notificationLaunchDeferred = true;
         }
     }
-    private void exitFullscreen() {
-        if (fullscreen == null) return; root.removeView(fullscreen); fullscreen = null; webView.setVisibility(View.VISIBLE);
-        if (fullscreenCallback != null) fullscreenCallback.onCustomViewHidden(); fullscreenCallback = null;
+    private void applyPresentationBars() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                if (presentationFullscreen) controller.hide(WindowInsets.Type.systemBars());
+                else controller.show(WindowInsets.Type.systemBars());
+            }
+        } else {
+            getWindow().getDecorView().setSystemUiVisibility(presentationFullscreen ?
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY : View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+        }
+        if (root != null) root.requestApplyInsets();
     }
-    @Override public void onBackPressed() { if (fullscreen != null) exitFullscreen(); else super.onBackPressed(); }
+    private void setPresentationFullscreen(boolean active) {
+        boolean changed = presentationFullscreen != active;
+        presentationFullscreen = active; applyPresentationBars();
+        // Android 16 no longer dispatches legacy onBackPressed for target 36.
+        // Intercept Back only while presentation is open, preserving the
+        // normal system back-to-home gesture everywhere else in the app.
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (active && !presentationBackRegistered) {
+                if (presentationBack == null) presentationBack = () -> exitFullscreen();
+                getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, presentationBack);
+                presentationBackRegistered = true;
+            } else if (!active && presentationBackRegistered) {
+                getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(presentationBack);
+                presentationBackRegistered = false;
+            }
+        }
+        if (changed) deliver(json("event", "presentation-fullscreen", "fullscreen", active));
+    }
+    private void exitFullscreen() {
+        if (fullscreen != null) {
+            root.removeView(fullscreen); fullscreen = null;
+            if (webView != null) webView.setVisibility(View.VISIBLE);
+            WebChromeClient.CustomViewCallback callback = fullscreenCallback; fullscreenCallback = null;
+            if (callback != null) callback.onCustomViewHidden();
+        }
+        setPresentationFullscreen(false);
+    }
+    @Override public void onBackPressed() { if (fullscreen != null || presentationFullscreen) exitFullscreen(); else super.onBackPressed(); }
     private void showDisplayRecovery() {
         if (!displayRecoveryPending || isFinishing() || isDestroyed()) return;
         displayRecoveryPending = false;
         new AlertDialog.Builder(this).setTitle("Call display stopped")
-            .setMessage("Android stopped the display process. Your room, screen share and control approval have ended. Reopen Auralink to connect again.")
+            .setMessage("Android stopped the display process. Your room, screen share and control approval have ended. Reopen Glance-Port to connect again.")
             .setPositiveButton("Reopen", (dialog, which) -> recreate())
             .setNegativeButton("Close", (dialog, which) -> finish()).setOnCancelListener(dialog -> finish()).show();
     }
-    private void stopSession() { stopSession("Android ended this session. Return to Auralink and reconnect."); }
+    private void stopSession() { stopSession("Android ended this session. Return to Glance-Port and reconnect."); }
     private void stopSession(String reason) {
         // Actual loss of the native session destroys media tracks/channels.
         // Ordinary Activity pause uses pauseIdleSession and retains the page.
@@ -720,7 +769,7 @@ public final class MainActivity extends Activity {
         // Do not navigate away from the document for an ordinary app switch.
         // An unadmitted directory/pending connection has no room foreground
         // service. Close it while retaining the selected page on return.
-        if (socket != null || roomMembership.hasRoom()) deliver(json("event", "session-stop", "reason", "The inactive room closed while Auralink was in the background."));
+        if (socket != null || roomMembership.hasRoom()) deliver(json("event", "session-stop", "reason", "The inactive room closed while Glance-Port was in the background."));
         generation++; invitation = null; internetService = null; closeSocket();
         runtimePermissionsPending = false; permissionResultDeferred = false; pausedEvents.clear(); pausedEventBytes = 0;
         foreground = false; if (webView != null) webView.onPause();
@@ -733,6 +782,7 @@ public final class MainActivity extends Activity {
     @Override protected void onStop() { super.onStop(); }
     @Override protected void onResume() {
         super.onResume(); foreground = true;
+        applyPresentationBars();
         if (callAudio != null && !callAudio.resume()) deliver(json("event", "media-error", "reason", callAudio.lastError()));
         if (webView != null) {
             webView.onResume();
@@ -753,6 +803,7 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onDestroy() {
         destroyed = true; foreground = false; generation++; closeSocket(); workers.shutdownNow();
+        exitFullscreen();
         clearProjectionRequest(); revokeControl("Android app closed."); if (callAudio != null) callAudio.stop();
         main.removeCallbacksAndMessages(null);
         if (webView != null) { webView.removeJavascriptInterface("AuralinkNative"); webView.destroy(); webView = null; }

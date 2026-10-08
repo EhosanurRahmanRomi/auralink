@@ -14,6 +14,8 @@ const crypto = require('node:crypto');
 const asar = require('@electron/asar');
 const project = path.resolve(__dirname,'..');
 const pkg = require(path.join(project,'package.json'));
+const productName = pkg.build.productName;
+assert.match(productName, /^[A-Za-z0-9-]{1,60}$/, 'Product name must be safe for artifact and bundle paths');
 const evidence = path.join(project,'test-results');
 
 function command(file,args,input) {
@@ -50,17 +52,17 @@ async function main() {
   assert.equal(process.platform,'darwin','Run this check on macOS');
   assert.equal(process.arch,'arm64','This test artifact targets Apple Silicon');
   fs.mkdirSync(evidence,{recursive:true});
-  const dmg=path.join(project,'release',`Auralink-${pkg.version}-Mac-arm64.dmg`);
+  const dmg=path.join(project,'release',`${productName}-${pkg.version}-Mac-arm64.dmg`);
   assert.ok(fs.existsSync(dmg),'Build the DMG before bundle verification');
   command('hdiutil',['verify',dmg]);
   const mounted=plistJSON(command('hdiutil',['attach','-readonly','-nobrowse','-plist',dmg]));
-  const volume=mounted['system-entities'].map(entry=>entry['mount-point']).find(point=>point && fs.existsSync(path.join(point,'Auralink.app')));
-  assert.ok(volume,'DMG must contain the Auralink application');
+  const volume=mounted['system-entities'].map(entry=>entry['mount-point']).find(point=>point && fs.existsSync(path.join(point,`${productName}.app`)));
+  assert.ok(volume,`DMG must contain the ${productName} application`);
   const profile=fs.mkdtempSync(path.join(os.tmpdir(),'auralink-mac-ci-'));
   let application;
   try {
-    const appBundle=path.join(volume,'Auralink.app');
-    const binary=path.join(appBundle,'Contents','MacOS','Auralink');
+    const appBundle=path.join(volume,`${productName}.app`);
+    const binary=path.join(appBundle,'Contents','MacOS',productName);
     const resources=path.join(appBundle,'Contents','Resources');
     const helper=path.join(resources,'app.asar.unpacked','src','native','macos-input');
     const metadata=JSON.parse(command('plutil',['-convert','json','-o','-',path.join(appBundle,'Contents','Info.plist')]));
@@ -73,7 +75,7 @@ async function main() {
     command('codesign',['--verify','--deep','--strict',appBundle]);
     // The capture/audio service can run in the generic Electron helper. Check
     // both actual signatures, rather than only the intended build plist.
-    const microphoneEntitlements=[appBundle,path.join(appBundle,'Contents','Frameworks','Auralink Helper.app')].map(bundle=>{
+    const microphoneEntitlements=[appBundle,path.join(appBundle,'Contents','Frameworks',`${productName} Helper.app`)].map(bundle=>{
       assert.ok(fs.existsSync(bundle),'The signed audio service helper must be bundled');
       const entitlements=signedEntitlements(bundle);
       assert.equal(entitlements['com.apple.security.device.audio-input'],true,'Signed app and audio helper must permit microphone input under hardened runtime');
@@ -88,7 +90,7 @@ async function main() {
     const archive=path.join(resources,'app.asar');
     const sourceFiles=['src/main.cjs','src/preload.cjs','src/core/broker.cjs','src/core/invite.cjs','src/native/control.cjs','src/native/macos-input.swift',
       'src/renderer/index.html','src/renderer/styles.css','src/renderer/app.js','src/renderer/rtc.js','src/renderer/android-bridge.js',
-      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs','src/core/app-invitation.cjs','src/renderer/relay-media.js','src/renderer/audio-worklet.js'];
+      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs','src/core/app-invitation.cjs','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/brand-mark.png','build/icon.png'];
     const sourceParity=sourceFiles.map(file=>{const packagedSha256=hash(asar.extractFile(archive,file)),sourceSha256=hash(fs.readFileSync(path.join(project,file)));assert.equal(packagedSha256,sourceSha256,`${file} must match the tested source`);return {path:file,packagedSha256,sourceSha256,matches:true};});
     const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
     const coldCode=`A1.${crypto.randomUUID()}.${crypto.randomBytes(32).toString('base64url')}`;

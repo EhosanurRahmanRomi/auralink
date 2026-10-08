@@ -1,6 +1,6 @@
-# Auralink internet coordinator
+# Glance-Port internet coordinator
 
-Auralink 0.4 adds invitation rooms: the host opens a room, copies its code, and guests enter automatically with that code. No account, private pairing key or service-address entry is needed for the app's default public mode. Four people can join a room. Remote control still needs a separate permission from the actual screen owner.
+Glance-Port 0.5.0 uses invitation rooms: the host opens a room, copies its code, and guests enter automatically with that code. No account, private pairing key or service-address entry is needed for the app's default public mode. Four people can join a room. Remote control still needs a separate permission from the actual screen owner. The earlier Auralink service identifiers, invitation protocol and deployed address stay compatible with the renamed app.
 
 This Worker supplies signaling and bounded, client-encrypted media forwarding when direct WebRTC cannot connect through the participants' routers. It also retains the optional private paired-device directory from 0.3. Nearby rooms remain independent of this service. The service uses Cloudflare infrastructure; it is not fully decentralized or unlimited.
 
@@ -124,4 +124,4 @@ Policy tests cover public/private isolation, automatic invitation admission, mod
 
 After deployment, `npm run test:deployed` creates and cleans up one disposable public room using production native HTTPS/WSS clients. It verifies automatic entry, actual AES-GCM encrypted packets in both directions, outsider refusal, independent consent/revoke, invitation rotation, blocking and host-leave cleanup. Its JSON report contains no invitation, key, device credential or raw packet. This explicit live test consumes a small amount of the free allowance; it is not part of ordinary unit tests and does not deploy anything.
 
-These checks do not establish physical cross-network playback on the user's Windows PC and MacBook. Test the two desktops on separate networks, verify actual decoded screen frames and audible microphone audio in both directions, and test native capture/control/revoke separately. A forced-fallback browser test exercises the fallback engine but is distinct from two physical devices. Android remains outside the current desktop release's real-device acceptance gate.
+These checks do not establish physical cross-network playback on the user's Windows PC, MacBook or iQOO. Test devices on separate networks, verify actual decoded screen frames and audible microphone audio in both directions, and test native capture/control/revoke separately. A forced-fallback browser test exercises the fallback engine but is distinct from two physical devices. Android emulator checks do not establish the iQOO's capture, microphone or battery-management behavior. The Glance-Port fullscreen and background-retention changes do not expand the free quotas above.

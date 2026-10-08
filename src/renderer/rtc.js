@@ -225,7 +225,7 @@ export class RoomRTC extends EventTarget {
               if (!['audio', 'screen'].includes(kind) || entry.senders.has(kind)) continue;
               transceiver.direction = 'sendrecv'; entry.senders.set(kind, transceiver.sender);
             }
-            if (entry.senders.size !== 2) throw new Error('Use matching Auralink versions for this media connection.');
+            if (entry.senders.size !== 2) throw new Error('Use matching Glance-Port versions for this media connection.');
             await this.syncSenders(entry);
             if (this.closed || this.peers.get(peerId) !== entry) return;
           }

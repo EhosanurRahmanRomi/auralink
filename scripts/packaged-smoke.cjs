@@ -8,7 +8,7 @@ const path = require('node:path');
 async function run() {
   if (process.platform !== 'win32') throw new Error('Packaged desktop verification supports Windows only');
   const project = path.resolve(__dirname, '..');
-  const executablePath = path.join(project, 'release', 'win-unpacked', 'Auralink.exe');
+  const executablePath = path.join(project, 'release', 'win-unpacked', 'Glance-Port.exe');
   const output = path.join(project, 'test-results', 'packaged-smoke.json');
   assert.ok(fs.existsSync(executablePath), 'Build the Windows release before running packaged verification');
   fs.mkdirSync(path.dirname(output), { recursive: true });

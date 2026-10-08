@@ -52,7 +52,7 @@ async function prepare(page, forceRTC) {
 }
 async function share(page) {
   await page.locator('#diagnostics-toggle').click(); await page.locator('#quality-select').selectOption('1440'); await page.locator('#diagnostics-close').click(); await page.locator('#share-button').click();
-  await page.locator('.screen-source').filter({ hasText: 'Auralink' }).first().click();
+  await page.locator('.screen-source').filter({ hasText: 'Glance-Port' }).first().click();
 }
 async function received(page, name, proof, sender) {
   await page.getByRole('button', { name: `View ${name}`, exact: true }).click();

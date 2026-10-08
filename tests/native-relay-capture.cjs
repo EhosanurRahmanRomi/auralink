@@ -37,7 +37,7 @@ async function main() {
     await page.locator('#host-mode').selectOption('nearby'); await page.locator('#host-name').fill('Native capture relay regression'); await page.locator('#host-port').fill(String(await availablePort()));
     await page.locator('#create-room').click(); await page.locator('#invite-dialog').waitFor({ state: 'visible' }); await page.locator('#invite-dialog [data-close]').click();
     phase = 'native app-window selection'; await page.locator('#share-button').click(); await page.locator('#screen-dialog').waitFor({ state: 'visible' });
-    await page.locator('.screen-source').filter({ hasText: 'Auralink' }).first().click();
+    await page.locator('.screen-source').filter({ hasText: 'Glance-Port' }).first().click();
     await page.waitForFunction(() => document.getElementById('stage-video').videoWidth > 0, null, { timeout: 25000 });
     phase = 'native track encrypted codec relay';
     await page.evaluate(async forcedReaderFailure => {

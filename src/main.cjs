@@ -1,4 +1,4 @@
-const {app, BrowserWindow, ipcMain, session, desktopCapturer, screen, dialog, globalShortcut, clipboard, systemPreferences, shell} = require('electron');
+const {app, BrowserWindow, ipcMain, session, desktopCapturer, screen, dialog, globalShortcut, clipboard, systemPreferences, shell, powerSaveBlocker} = require('electron');
 const path = require('node:path');
 const os = require('node:os');
 const https = require('node:https');
@@ -10,8 +10,9 @@ const {ControlGate, createAdapter} = require('./native/control.cjs');
 const {probeInternetService, NativeInternetClient} = require('./core/internet-client.cjs');
 const {parseAppInvitation} = require('./core/app-invitation.cjs');
 
-app.setName('Auralink');
+app.setName('Glance-Port');
 let win, broker, adapter, gate, selectedSource, currentSource;
+let requestedPresentationFullscreen = null;
 let grantGeneration=0;
 let roomOperation=0, sourceOperation=0;
 let internetService = null, internetClient = null, roomContext = 'nearby';
@@ -20,6 +21,25 @@ const pins = new Map();
 const sources = new Map();
 const localPage = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
 const testing = process.argv.includes('--smoke-test');
+// Keep existing room credentials and preferences when upgrading the renamed
+// product. Explicit QA profiles remain isolated from the installed app.
+if (app.isPackaged && !testing && !app.commandLine.hasSwitch('user-data-dir')) {
+  const profile = path.join(app.getPath('appData'), 'Auralink');
+  require('node:fs').mkdirSync(profile, {recursive:true});
+  app.setPath('userData', profile);
+}
+let sessionPowerBlocker = null;
+function setSessionActive(active) {
+  if (typeof active !== 'boolean') throw new Error('Invalid room activity state.');
+  if (active && sessionPowerBlocker === null) {
+    // Scope this to an admitted room; minimize/restore never reloads its page.
+    // The display may sleep. Quitting or ending the room releases the blocker.
+    try { sessionPowerBlocker = powerSaveBlocker.start('prevent-app-suspension'); } catch { return {active:false}; }
+  } else if (!active && sessionPowerBlocker !== null) {
+    try { powerSaveBlocker.stop(sessionPowerBlocker); } finally { sessionPowerBlocker = null; }
+  }
+  return {active:sessionPowerBlocker !== null};
+}
 let ownsInstance = true;
 let pendingInvitation = process.argv.map(parseAppInvitation).find(Boolean) || null;
 function deliverInvitation(value) {
@@ -45,7 +65,7 @@ function supportedPermission(permission) {
   // Electron 44 forwards Chromium's newer local/loopback network permissions.
   // Only the bundled main page can request them, after a local room or a pinned
   // invitation has been explicitly prepared by the native main process.
-  return mediaPermissions.has(permission) || (networkPermissions.has(permission) && pins.size > 0);
+  return permission === 'fullscreen' || mediaPermissions.has(permission) || (networkPermissions.has(permission) && pins.size > 0);
 }
 
 function trustedContent(contents, details = {}) {
@@ -75,7 +95,7 @@ async function requestMedia(type) {
     status=granted ? 'granted' : 'denied';
   }
   const ok=process.platform === 'darwin' ? status === 'granted' : !['denied','restricted'].includes(status);
-  return {ok,status,reason:ok ? null : `Allow Auralink ${type} access in ${process.platform === 'darwin' ? 'System Settings → Privacy & Security' : 'Windows Settings → Privacy & security'}. Restart Auralink after changing access.`};
+  return {ok,status,reason:ok ? null : `Allow Glance-Port ${type} access in ${process.platform === 'darwin' ? 'System Settings → Privacy & Security' : 'Windows Settings → Privacy & security'}. Restart Glance-Port after changing access.`};
 }
 const settingsLinks = {
   darwin:{microphone:'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',screen:'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',accessibility:'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility',network:'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork'},
@@ -119,7 +139,7 @@ function probeCertificate(origin, expected) {
 }
 function internetAuthorizationLost(details) {
   if (roomContext !== 'internet') return;
-  if (details.kind === 'room' && roomContext === 'internet') resetRoomSources();
+  if (details.kind === 'room' && roomContext === 'internet') { resetRoomSources(); setSessionActive(false); }
   void revoke();
 }
 function acceptedForControl(peerId) {
@@ -186,7 +206,7 @@ app.whenReady().then(async () => {
     assertRoomOperation(operation);
     roomContext = 'nearby';
     const name = String(args?.name || 'My room').trim().slice(0,48) || 'My room';
-    const pems = await selfsigned.generate([{name:'commonName',value:'Auralink private room'}], {keyType:'ec',curve:'P-256',notAfterDate:new Date(Date.now()+30*86400000),algorithm:'sha256'});
+    const pems = await selfsigned.generate([{name:'commonName',value:'Glance-Port private room'}], {keyType:'ec',curve:'P-256',notAfterDate:new Date(Date.now()+30*86400000),algorithm:'sha256'});
     assertRoomOperation(operation);
     const certPin = fingerprint(pems.cert);
     const requestedPort=Number(args?.port || 0);
@@ -202,7 +222,7 @@ app.whenReady().then(async () => {
     const invite = invites[0]?.invite || `${url}/#key=${created.roomKey}&fp=${certPin}`;
     return {name,url,roomKey:created.roomKey,hostToken:created.hostToken,port:created.port,fingerprint:certPin,invite,invites};
   });
-  handle('stop', async () => {resetRoomSources(); const previous=broker; broker=null; await revoke(); if(previous) await previous.stop(); return {ok:true};});
+  handle('stop', async () => {setSessionActive(false); resetRoomSources(); const previous=broker; broker=null; await revoke(); if(previous) await previous.stop(); return {ok:true};});
   handle('trust-invite', async value => {
     resetRoomSources(); const operation=roomOperation;
     const invite = parseInvite(value);
@@ -253,7 +273,7 @@ app.whenReady().then(async () => {
     const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:320,height:180},fetchWindowIcons:false});
     if(operation !== roomOperation || request !== sourceOperation) throw new Error('Screen selection was canceled.');
     if (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') {
-      throw new Error('Allow Auralink Screen & System Audio Recording in System Settings → Privacy & Security, then restart Auralink before sharing.');
+      throw new Error('Allow Glance-Port Screen & System Audio Recording in System Settings → Privacy & Security, then restart Glance-Port before sharing.');
     }
     sources.clear();
     for(const source of available) sources.set(source.id,source);
@@ -277,7 +297,7 @@ app.whenReady().then(async () => {
     if(currentSource !== approvedSource || grantGeneration !== approvalGeneration) return {ok:false,reason:'Session changed while approval was open.'};
     if(!acceptedForControl(args.peerId)) return {ok:false,reason:'Participant disconnected during approval.'};
     if(process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
-      return {ok:false,reason:'Enable Auralink in System Settings → Privacy & Security → Accessibility, then approve this request again. The Mac owner must grant this system permission.'};
+      return {ok:false,reason:'Enable Glance-Port in System Settings → Privacy & Security → Accessibility, then approve this request again. The Mac owner must grant this system permission.'};
     }
     const display=screen.getAllDisplays().find(d=>String(d.id)===currentSource.display_id);
     if(!display) return {ok:false,reason:'The shared display could not be matched to a native input surface.'};
@@ -299,15 +319,33 @@ app.whenReady().then(async () => {
     await shell.openExternal(url);return {ok:true};
   });
   handle('info',()=>({version:app.getVersion(),platform:process.platform,hostname:os.hostname(),addresses:localAddresses(),nativeControl:Boolean(adapter.available),nativeSupports:adapter.supports,permissions:permissionInfo(),emergencyShortcut:process.platform==='darwin'?'Command+Option+Shift+Q':'Ctrl+Alt+Shift+Q',testing}));
+  handle('session-active',setSessionActive);
+  handle('presentation-fullscreen',active=>{
+    if(typeof active !== 'boolean') throw new Error('Invalid fullscreen state.');
+    requestedPresentationFullscreen = active;
+    try { win.setFullScreen(active); } catch(error) { requestedPresentationFullscreen=null; throw error; }
+    // macOS transitions asynchronously. The window events below confirm the
+    // actual state; presentation layout remains usable during the transition.
+    return {fullscreen:active};
+  });
 
-  win=new BrowserWindow({width:1380,height:880,minWidth:900,minHeight:650,show:false,icon:path.join(__dirname,'..','build','icon.png'),backgroundColor:'#090e19',title:'Auralink',autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,spellcheck:false,backgroundThrottling:false}});
+  win=new BrowserWindow({width:1380,height:880,minWidth:900,minHeight:650,show:false,icon:path.join(__dirname,'..','build','icon.png'),backgroundColor:'#110f23',title:'Glance-Port',titleBarStyle:'hidden',titleBarOverlay:{color:'#00000000',symbolColor:'#f8f5ff',height:44},...(process.platform==='darwin'?{trafficLightPosition:{x:16,y:16}}:{}),autoHideMenuBar:true,webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,spellcheck:false,backgroundThrottling:false}});
+  for(const [event,fullscreen] of [['enter-full-screen',true],['leave-full-screen',false]]) win.on(event,()=>{
+    if(win.isDestroyed()) return;
+    // A Mac transition may finish after the user has already requested its
+    // opposite. Reconcile that latest intent without publishing a stale exit
+    // that would collapse a newly opened presentation.
+    if(requestedPresentationFullscreen !== null && requestedPresentationFullscreen !== fullscreen) { win.setFullScreen(requestedPresentationFullscreen); return; }
+    requestedPresentationFullscreen=null;
+    win.webContents.send('auralink:presentation-fullscreen',{fullscreen});
+  });
   win.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   win.webContents.on('will-navigate',event=>event.preventDefault());
-  win.webContents.on('render-process-gone',()=>{internetClient?.close();emergencyStop();});
-  win.on('closed',()=>{internetClient?.close();emergencyStop();win=null;});
+  win.webContents.on('render-process-gone',()=>{setSessionActive(false);internetClient?.close();emergencyStop();});
+  win.on('closed',()=>{requestedPresentationFullscreen=null;setSessionActive(false);internetClient?.close();emergencyStop();win=null;});
   win.once('ready-to-show',()=>win.show());
   await win.loadFile(path.join(__dirname,'renderer','index.html'));
   globalShortcut.register(process.platform==='darwin'?'Command+Alt+Shift+Q':'Control+Alt+Shift+Q',emergencyStop);
 });
-app.on('before-quit',()=>{internetClient?.close();if(gate)gate.revoke();if(adapter)adapter.dispose();if(broker)broker.stop();globalShortcut.unregisterAll();});
+app.on('before-quit',()=>{setSessionActive(false);internetClient?.close();if(gate)gate.revoke();if(adapter)adapter.dispose();if(broker)broker.stop();globalShortcut.unregisterAll();});
 app.on('window-all-closed',()=>app.quit());

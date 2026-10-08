@@ -5,7 +5,7 @@ The active milestone is **Windows, Apple Silicon macOS and Android screen sharin
 ## Room and invitation
 
 1. Click **Open a room**. No service-address/pairing form should appear. Screen and microphone remain off.
-2. Share **Copy link** privately and open it on the other device. The landing page offers **Open Auralink** and code-copy fallback. Paste the invitation into **Join room** if OS link handling is unavailable.
+2. Share **Copy link** privately and open it on the other device. The landing page offers **Open Glance-Port** and code-copy fallback. Paste the invitation into **Join room** if OS link handling is unavailable.
 3. Guest entry is automatic. Entry alone must never activate capture or input.
 4. In **Manage people**, test **Remove**: guest media/input stop, but deliberate rejoin remains possible. **Remove & close invite** must invalidate that old code.
 5. Test **Lock room** and **New invitation**. Existing guests stay when the invitation closes; old codes cannot admit newcomers.
@@ -61,3 +61,9 @@ Report release, OS, host direction, networks, route/codec/resolution/fps, permis
 Install the matching APK as an update; it retains the project's local signing identity. On a recent Android System WebView, open a public room, use its invitation on Windows, enable microphones and test speech in both directions. Approve the separate Android screen-sharing prompt and notification permission, then switch to Home for a minute and return. The room, enabled microphone and selected share should remain; received motion/audio should advance while Home is foreground. A room without media should also survive Home/return without recreating its code.
 
 Test sharing/control both directions. Phone input requires the attended Accessibility service, native confirmation and active full-display projection; turning on Accessibility alone must not grant control. Use Stop control, the sharing notification and End session to verify revocation. Test rotation and Bluetooth only after built-in audio and portrait capture work. Review iQOO's battery/background settings if the operating system stops the app; forced process termination cannot preserve WebView media. The [Android guide](../android/README.md) lists the supported gestures and capture ceilings. Automated emulator proof does not establish physical iQOO performance.
+
+## Fullscreen and background acceptance
+
+Open a shared screen using **Enter fullscreen**. The same video must fill the viewport with its aspect ratio preserved. The fullscreen toolbar provides microphone, sharing, control stop, sound, leave and exit actions. The keyboard drawer is optional and stays collapsed until opened. Approve control separately, test pointer mapping inside the displayed image, and check that empty image margins do not send clicks. Escape must exit locally and release held keys; Android Back must exit presentation and retain the current room. Leaving must exit presentation and release its keep-awake protection.
+
+Minimize Windows or macOS for several minutes, then restore: the invitation, participant and live stream must be retained without a page reload. On Android, test Home/return with and without screen sharing and check ongoing notification controls. Test screen-off and iQOO battery management separately; an ordinary app switch is different from a force stop or process termination.

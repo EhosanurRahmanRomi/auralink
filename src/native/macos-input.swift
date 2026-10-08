@@ -300,7 +300,7 @@ if CommandLine.arguments.contains("--check-permissions") {
 }
 
 guard AXIsProcessTrusted() else {
-    output(["type": "ready", "available": false, "reason": "Grant Accessibility access to Auralink in macOS System Settings, then approve the request again"])
+    output(["type": "ready", "available": false, "reason": "Grant Accessibility access to Glance-Port in macOS System Settings, then approve the request again"])
     exit(1)
 }
 

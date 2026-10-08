@@ -5,6 +5,8 @@ const assert=require('node:assert/strict');
 const {createHash}=require('node:crypto');
 async function main(){
   const root=path.resolve(__dirname,'..');
+  const productName=require(path.join(root,'package.json')).build.productName;
+  assert.match(productName,/^[A-Za-z0-9-]{1,60}$/,'Product name must be safe for app-source matching');
   const out=path.join(root,'test-results');fs.mkdirSync(out,{recursive:true});
   const profile=fs.mkdtempSync(path.join(out,'desktop-smoke-profile-'));
   const relativeProfile=path.relative(out,profile);
@@ -55,7 +57,7 @@ async function main(){
     phase='native app-window capture';
     await page.locator('#share-button').click();
     await page.locator('#screen-dialog').waitFor({state:'visible'});
-    const appSource=page.locator('.screen-source').filter({hasText:'Auralink'}).first();
+    const appSource=page.locator('.screen-source').filter({hasText:productName}).first();
     await appSource.click();
     await page.waitForFunction(()=>{
       const v=document.querySelector('#stage-video');
@@ -68,7 +70,7 @@ async function main(){
     await page.locator('#end-button').click();
     await page.waitForFunction(()=>document.querySelector('#session').hidden);
     assert.equal(errors.length,0,errors.join('\n'));
-    const sourceHashes=Object.fromEntries(['src/main.cjs','src/preload.cjs','src/renderer/app.js','src/renderer/rtc.js','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/internet.js'].map(file=>[file,createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex')]));
+    const sourceHashes=Object.fromEntries(['src/main.cjs','src/preload.cjs','src/renderer/app.js','src/renderer/rtc.js','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/internet.js','src/renderer/brand-mark.png','build/icon.png'].map(file=>[file,createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex')]));
     fs.writeFileSync(path.join(out,'desktop-smoke.json'),JSON.stringify({passed:true,isolatedUserData:true,cameraDeviceFixture:'Synthetic device; production permission handlers unchanged',checks:['Electron loads isolated renderer and test profile','settings persist within the test profile','real HTTPS room starts','pinned invitation generated','room diagnostics render','native camera capture denied','actual native app-window capture','capture stops','room teardown'],cameraPermission,capture,errors,sourceHashes},null,2));
     console.log('Desktop smoke passed: window, preferences, HTTPS room, invitation, native app-window capture and teardown.');
   }catch(error){

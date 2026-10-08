@@ -1,4 +1,4 @@
-name: Android production APK runtime
+name: Glance-Port Android production APK runtime
 
 on:
   workflow_dispatch:
@@ -59,10 +59,10 @@ jobs:
           fs.writeFileSync('.tools/runtime-source-check.json',JSON.stringify(source,null,2));
           console.log(JSON.stringify(source));
           JS
-          gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name Auralink-Android-companion --dir .tools/runtime-build
+          gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name Glance-Port-Android-companion --dir .tools/runtime-build
           node - <<'JS'
           const fs=require('node:fs');const path=require('node:path');const pkg=require('./package.json');
-          const name=`Auralink-${pkg.version}-Android.apk`;
+          const name=`${pkg.build.productName}-${pkg.version}-Android.apk`;
           const source=[path.join('.tools/runtime-build/release',name),path.join('.tools/runtime-build',name)].find(file=>fs.existsSync(file));
           if(!source)throw new Error('Production APK was absent from the build artifact');
           fs.mkdirSync('release',{recursive:true});fs.copyFileSync(source,path.join('release',name));
@@ -96,7 +96,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: Auralink-Android-runtime-evidence
+          name: Glance-Port-Android-runtime-evidence
           path: |
             test-results/android-emulator.json
             test-results/android-emulator-lobby.png

@@ -42,7 +42,7 @@ function probeInternetService(value, transport = https) {
     // Standard certificate-chain and hostname checks apply. No redirects or
     // LAN certificate pins are used for the separately configured service.
     const request = transport.get(`${origin}/internet/health`, { timeout: 10000, agent: false, rejectUnauthorized: true }, response => {
-      if (response.statusCode !== 200) { response.resume(); reject(new Error('This address is not an available Auralink internet service.')); return; }
+      if (response.statusCode !== 200) { response.resume(); reject(new Error('This address is not an available Glance-Port internet service.')); return; }
       const chunks = []; let bytes = 0;
       response.on('data', chunk => {
         bytes += chunk.length;
@@ -51,7 +51,7 @@ function probeInternetService(value, transport = https) {
       });
       response.once('end', () => {
         let health;
-        try { health = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { reject(new Error('This address is not an Auralink internet service.')); return; }
+        try { health = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { reject(new Error('This address is not a Glance-Port internet service.')); return; }
         if (health?.service !== 'auralink-internet' || health.protocol !== 1 || health.status !== 'ok') { reject(new Error('This internet service uses an unsupported protocol.')); return; }
         resolve({ url: origin, socketUrl: origin.replace(/^https:/, 'wss:') + '/internet/ws', mode: 'internet' });
       });

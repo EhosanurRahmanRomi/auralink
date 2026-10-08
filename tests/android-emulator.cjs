@@ -27,7 +27,7 @@ const freshSetupRegression=testedMajor>0 || testedMinor>3 || testedMinor===3 && 
 const publicLifecycleRegression=testedMajor>0 || testedMinor>=4;
 const output=path.join(project,'test-results');
 const fixtureDir=path.join(project,'.tools','android-runtime-fixture');
-const apk=process.env.AURALINK_TEST_APK ? path.resolve(process.env.AURALINK_TEST_APK) : path.join(project,'release',`Auralink-${pkg.version}-Android.apk`);
+const apk=process.env.AURALINK_TEST_APK ? path.resolve(process.env.AURALINK_TEST_APK) : path.join(project,'release',`Glance-Port-${pkg.version}-Android.apk`);
 const receiverAssets=process.env.AURALINK_TEST_RENDERER_DIR ? path.resolve(process.env.AURALINK_TEST_RENDERER_DIR) : path.join(project,'src','renderer');
 const browserPath=[process.env.AURALINK_TEST_BROWSER,'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Google/Chrome/Application/chrome.exe','/usr/bin/chromium','/usr/bin/google-chrome'].filter(Boolean).find(file=>fs.existsSync(file));
 const delay=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
@@ -381,11 +381,11 @@ async function accessibilityBound(timeout=30000) {
   do {
     const dump=await adb(['shell','dumpsys','accessibility']);
     const bound=dump.match(/Bound services:\{([\s\S]*?)\n\s*Enabled services:/i)?.[1];
-    if(bound?.includes('label=Auralink attended control'))return true;
+    if(bound?.includes('label=Glance-Port attended control'))return true;
     await delay(500);
   }while(Date.now()<deadline);
   const dump=await adb(['shell','dumpsys','accessibility']);
-  runtimeDiagnostics.accessibility={boundAuralinkService:/Bound services:\{[\s\S]*?label=Auralink attended control[^\n]*\n\s*Enabled services:/i.test(dump),
+  runtimeDiagnostics.accessibility={boundAuralinkService:/Bound services:\{[\s\S]*?label=Glance-Port attended control[^\n]*\n\s*Enabled services:/i.test(dump),
     enabledSetting:(await adb(['shell','settings','get','secure','enabled_accessibility_services'])).trim().includes('local.auralink.mobile'),
     safeSystemState:dump.split('\n').filter(line=>/Bound services:|Enabled services:|Binding services:|Crashed services:|UiAutomation|suppress/i.test(line)).map(line=>safeError(line)).join('\n').slice(0,3000)};
   throw new Error('Android must actually bind the isolated emulator Accessibility service before testing attended control');
@@ -659,6 +659,26 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     do {media=await relayStats();if(media.row?.route==='Secure relay' && media.row.receivedAudioPackets>5 && media.row.sentAudioPackets>5 && media.allDirectClosed)break;await delay(300);}while(Date.now()<deadline);
     await recordPublicProgress('screenAndBidirectionalPcmGate');
     assert.equal(media?.row?.route,'Secure relay');assert.ok(media.row.receivedAudioPackets>5 && media.row.sentAudioPackets>5 && media.allDirectClosed && media.noTurnServers);
+    let fullscreenProof;
+    if(testedMajor>0 || testedMinor>=5) {
+      publicPhase('native Android fullscreen presentation');
+      const fullscreenProcess=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
+      await tapRoomAction(node=>node['resource-id']==='fullscreen-button');
+      await findNode(node=>node['resource-id']==='presentation-fullscreen-exit' && visible(node));
+      await screenshot('android-emulator-fullscreen.png');
+      const beforeFullscreenFrames=(await relayStats()).frames;
+      await page.waitForFunction(first=>document.getElementById('public-screen')?.getVideoPlaybackQuality().totalVideoFrames>first,beforeFullscreenFrames,{timeout:20000});
+      publicPhase('Android Back exits fullscreen without leaving room');
+      await adb(['shell','input','keyevent','4']);
+      await findNativeRoomAction(node=>node['resource-id']==='fullscreen-button');
+      await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+      assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),fullscreenProcess);
+      const resumed=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
+      assert.ok(resumed?.includes('local.auralink.mobile'),'Native Back must exit presentation instead of closing the Activity');
+      assert.match(await adb(['shell','dumpsys','power']),/PARTIAL_WAKE_LOCK[^\n]*local\.auralink\.mobile:active-room/,'The admitted foreground room must hold its scoped CPU wake lock');
+      fullscreenProof={passed:true,visibleExitControl:true,nativeBackRetainsActivityAndRoom:true,screenFramesAdvanced:true,scopedRoomCpuWakeLock:true};
+      checkpoint('nativeFullscreen',fullscreenProof);
+    }
     publicPhase('open native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-toggle');
     publicPhase('confirm native secure-relay route diagnostics');
@@ -728,7 +748,7 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:reversePacketsWhenStopped,actualAndroidPcmPacketsDecoded:Number(returnedAudio[1]),
         actualAndroidPcmPacketsBeforeHome:Number(nativeAudio[1]),actualAndroidPcmPacketsAfterHomeReturn:Number(returnedAudio[1]),reversePcmDeliveredAcrossHomeReturn:true,
         reverseSenderStoppedWhileHomeForeground:true,playbackProcessingAfterReturn:returnedProcessing[1],exactHiddenDecoderTimingVerified:false,physicalMicrophoneAndSpeakerVerified:false},
-      encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,encryptedSent:wire.sent,encryptedReceived:wire.received,homeMediaAdvanced:true,sameProcessAndRoomOnReturn:true,newCaptureAndControlRemainConsentRequired:true};
+      encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,encryptedSent:wire.sent,encryptedReceived:wire.received,homeMediaAdvanced:true,sameProcessAndRoomOnReturn:true,newCaptureAndControlRemainConsentRequired:true,...(fullscreenProof?{fullscreen:fullscreenProof}:{})};
     assert.equal(wire.encryptedEnvelopesOnly,true);assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>publicErrors),[]);
     checkpoint('nativePublicRelayMedia',summary);
     publicPhase('owner stops public screen share');
@@ -888,6 +908,12 @@ async function runUI(fixture) {
   await fixture.page.waitForFunction(id=>rtc.peers.get(id)?.remoteState.audio===false,fixture.peerId,{timeout:15000});
   await tapRoomAction(label('Leave room'));
   await findNativeRoomAction(node=>node['resource-id']==='join-button' && node.enabled==='true');
+  if(testedMajor>0 || testedMinor>=5) {
+    const deadline=Date.now()+10000;let power;
+    do { power=await adb(['shell','dumpsys','power']);if(!/PARTIAL_WAKE_LOCK[^\n]*local\.auralink\.mobile:active-room/.test(power))break;await delay(300); }while(Date.now()<deadline);
+    assert.doesNotMatch(power,/PARTIAL_WAKE_LOCK[^\n]*local\.auralink\.mobile:active-room/,'Leaving the room must release its CPU wake lock');
+    checkpoint('roomWakeLockReleasedOnLeave',{passed:true});
+  }
   await audioMode('MODE_NORMAL');
   audio.checks.push('Owner microphone stop updates receiver media state','Leaving the room releases Android communication audio mode');
   checkpoint('ownerAudioStopAndRouteCleanup');

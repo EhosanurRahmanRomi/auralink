@@ -114,13 +114,13 @@ public final class ScreenShareService extends Service {
             Intent consent = intent.getParcelableExtra("consent");
             if (consent == null) throw new IllegalStateException("Screen permission result is missing.");
             projection = ((MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE)).getMediaProjection(Activity.RESULT_OK, consent);
-            captureThread = new HandlerThread("Auralink screen capture"); captureThread.start(); capture = new Handler(captureThread.getLooper());
+            captureThread = new HandlerThread("Glance-Port screen capture"); captureThread.start(); capture = new Handler(captureThread.getLooper());
             projection.registerCallback(new MediaProjection.Callback() {
                 @Override public void onStop() { main.post(() -> stopSharing("Android stopped screen sharing.")); }
                 @Override public void onCapturedContentResize(int w, int h) { if (capture != null) capture.post(() -> resize(w, h)); }
             }, main);
             Rect bounds = realBounds(); contentWidth = bounds.width(); contentHeight = bounds.height(); configureReader(contentWidth, contentHeight);
-            display = projection.createVirtualDisplay("Auralink attended screen", width, height, getResources().getConfiguration().densityDpi,
+            display = projection.createVirtualDisplay("Glance-Port attended screen", width, height, getResources().getConfiguration().densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, capture);
             running = true; fullDisplay = true;
             ((DisplayManager)getSystemService(DISPLAY_SERVICE)).registerDisplayListener(rotationListener, main);
@@ -158,7 +158,7 @@ public final class ScreenShareService extends Service {
         try {
             image = source.acquireLatestImage(); if (image == null || !running || stopping || source != reader) return;
             long now = SystemClock.elapsedRealtime();
-            if (inFlight != 0 && now - sentAt > 3000) { main.post(() -> stopSharing("Screen delivery stalled. Return to Auralink and restart sharing.")); return; }
+            if (inFlight != 0 && now - sentAt > 3000) { main.post(() -> stopSharing("Screen delivery stalled. Return to Glance-Port and restart sharing.")); return; }
             if (inFlight != 0 || now - lastFrame < 83) return; // At most 12fps and one frame awaiting canvas acknowledgement.
             Image.Plane plane = image.getPlanes()[0]; int stride = plane.getRowStride(), pixelStride = plane.getPixelStride();
             if (pixelStride != 4 || stride < width * 4) return;
@@ -185,7 +185,7 @@ public final class ScreenShareService extends Service {
         PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         PendingIntent stop = PendingIntent.getService(this, 1, new Intent(this, ScreenShareService.class).setAction(STOP), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, "screen-sharing").setSmallIcon(getApplicationInfo().icon)
-            .setContentTitle("Auralink is sharing your screen").setContentText("Return to the app to manage consent. Stop ends sharing and control.")
+            .setContentTitle("Glance-Port is sharing your screen").setContentText("Return to the app to manage consent. Stop ends sharing and control.")
             .setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).setContentIntent(open).addAction(new Notification.Action.Builder(null, "Stop sharing", stop).build()).build();
     }
     private void stopSharing(String reason) {

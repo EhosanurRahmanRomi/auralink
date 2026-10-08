@@ -34,8 +34,8 @@ final class CallAudio {
                     // original bridge request. Never crash the Activity here.
                     try {
                         manager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                        if (!route()) fail("Android could not restore the call speaker. Return to Auralink and retry audio.");
-                    } catch (RuntimeException denied) { fail("Android could not restore call audio. Return to Auralink and retry."); }
+                        if (!route()) fail("Android could not restore the call speaker. Return to Glance-Port and retry audio.");
+                    } catch (RuntimeException denied) { fail("Android could not restore call audio. Return to Glance-Port and retry."); }
                 }
             }).build();
     }
