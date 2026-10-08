@@ -84,6 +84,7 @@
       "category": "public.app-category.productivity",
       "icon": "build/icon.svg",
       "extendInfo": {
+        "NSCameraUsageDescription": null,
         "NSMicrophoneUsageDescription": "Use your microphone only when you enable audio in a room.",
         "NSScreenCaptureUsageDescription": "Share a screen you select with the people joining your invitation room.",
         "NSLocalNetworkUsageDescription": "Connect directly to devices you invite for private calls, screen sharing and attended remote assistance."
