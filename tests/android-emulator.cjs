@@ -15,7 +15,7 @@ const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
 const {findRoomAction}=require('./android-room-action.cjs');
-const {visibleInWebView}=require('./android-hierarchy.cjs');
+const {visibleInWebView,createImmersiveTutorialHandler}=require('./android-hierarchy.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
 const sdk=process.env.ANDROID_SDK_ROOT || path.join(project,'.tools','android-sdk');
@@ -64,10 +64,24 @@ function coordinates(node) {
   return [Math.round((+match[1]+ +match[3])/2),Math.round((+match[2]+ +match[4])/2)];
 }
 async function tap(node) {const [x,y]=coordinates(node);await adb(['shell','input','tap',String(x),String(y)]);}
+const dismissImmersiveTutorial=createImmersiveTutorialHandler({tap,onDismissed:()=>{
+  runtimeDiagnostics.immersiveTutorial={dismissed:true,phase,observedResourceId:'com.android.systemui:id/ok',once:true};
+  checkpoint('systemFullscreenTutorialDismissed',runtimeDiagnostics.immersiveTutorial);
+  console.log(JSON.stringify({androidFullscreenTutorial:runtimeDiagnostics.immersiveTutorial}));
+}});
+async function roomHierarchy() {
+  let nodes=await hierarchy();
+  if (await dismissImmersiveTutorial(nodes)) {
+    await delay(300);nodes=await hierarchy();
+    await dismissImmersiveTutorial(nodes); // A persistent tutorial fails; never retry the tap or scroll it.
+  }
+  return nodes;
+}
 async function findNode(predicate,timeout=30000) {
   let deadline=Date.now()+timeout;
   do {
     let nodes=[];try{nodes=await hierarchy();}catch{}
+    if(await dismissImmersiveTutorial(nodes)){await delay(300);continue;}
     const wait=nodes.find(node=>node['resource-id']==='android:id/aerr_wait');
     if(wait) {
       const recovered=Boolean(runtimeDiagnostics.anrs?.length);
@@ -133,7 +147,7 @@ async function tapRoomAction(predicate,timeout=30000) {
 }
 async function findNativeRoomAction(predicate,timeout=30000,observe) {
   try {
-    return await findRoomAction(predicate,{read:hierarchy,swipe:(x1,y1,x2,y2)=>adb(['shell','input','swipe',...[x1,y1,x2,y2].map(String),'450']),wait:delay,timeout,observe});
+    return await findRoomAction(predicate,{read:roomHierarchy,swipe:(x1,y1,x2,y2)=>adb(['shell','input','swipe',...[x1,y1,x2,y2].map(String),'450']),wait:delay,timeout,observe});
   } catch(error) { throw new Error(`${error.message} during ${phase}`); }
 }
 async function keyboardShown() {

@@ -20,4 +20,34 @@ function visibleInWebView(node, nodes) {
     box[2] <= viewport[2] && box[3] <= viewport[3]);
 }
 
-module.exports = {visibleInWebView};
+function immersiveTutorialButton(nodes) {
+  const systemUI = 'com.android.systemui';
+  const titles = nodes.filter(node => node.package === systemUI && node.class === 'android.widget.TextView' &&
+    node['resource-id'] === `${systemUI}:id/immersive_cling_title` && node.text === 'Viewing full screen' &&
+    node.enabled === 'true' && node['visible-to-user'] === 'true');
+  const buttons = nodes.filter(node => node.package === systemUI && node.class === 'android.widget.Button' &&
+    node['resource-id'] === `${systemUI}:id/ok` && node.text === 'Got it' && node.enabled === 'true' &&
+    node.clickable === 'true' && node['visible-to-user'] === 'true');
+  if (titles.length !== 1 || buttons.length !== 1) return null;
+  const title = bounds(titles[0]), button = bounds(buttons[0]);
+  if (!title || !button || [...title,...button].some(value => value < 0)) return null;
+  const contains = (frame, box) => box[0] >= frame[0] && box[1] >= frame[1] && box[2] <= frame[2] && box[3] <= frame[3];
+  const frame = nodes.find(node => node.package === systemUI && node.class === 'android.widget.FrameLayout' &&
+    node['visible-to-user'] === 'true' && bounds(node) && contains(bounds(node),title) && contains(bounds(node),button));
+  return frame ? buttons[0] : null;
+}
+
+function createImmersiveTutorialHandler({tap,onDismissed}) {
+  let attempted = false;
+  return async nodes => {
+    const button = immersiveTutorialButton(nodes);
+    if (!button) return false;
+    if (attempted) throw new Error('Android fullscreen tutorial remained after its single observed dismissal');
+    attempted = true;
+    await tap(button);
+    onDismissed();
+    return true;
+  };
+}
+
+module.exports = {visibleInWebView,immersiveTutorialButton,createImmersiveTutorialHandler};
