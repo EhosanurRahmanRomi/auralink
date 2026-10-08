@@ -25,8 +25,10 @@ function plistJSON(value) { return JSON.parse(command('plutil',['-convert','json
 function signedEntitlements(bundle) {
   const result=spawnSync('codesign',['--display','--entitlements','-',bundle],{encoding:'utf8',timeout:120000});
   if(result.error || result.status!==0) throw new Error(`Read signed bundle entitlements failed: ${result.error?.message || result.stderr}`);
-  const xml=`${result.stdout}\n${result.stderr}`.match(/<\?xml[\s\S]*<\/plist>/)?.[0];
-  assert.ok(xml,'Signed bundle must expose its actual entitlements');
+  // Current codesign can omit the optional XML declaration. The plist itself,
+  // including its closing tag, is required; an absent entitlement still fails.
+  const xml=`${result.stdout}\n${result.stderr}`.match(/<plist\b[\s\S]*?<\/plist>/)?.[0];
+  assert.ok(xml,`Signed bundle must expose its actual entitlements: ${path.basename(bundle)}; ${`${result.stdout}\n${result.stderr}`.slice(0,400)}`);
   return plistJSON(xml);
 }
 function hash(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
