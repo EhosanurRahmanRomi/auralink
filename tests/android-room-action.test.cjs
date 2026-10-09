@@ -116,3 +116,36 @@ test('native playback states use a visible same-row value without converting fai
     assert.equal(diagnosticValue(label,[view,nav,label,statNode(state,'[480,700][654,721]')],/^(running|suspended|interrupted|off)$/),state);
   }
 });
+
+test('captured WebView diagnostic values use their actual noninteractive View class and three-pixel row alignment', () => {
+  // API 36 observer evidence: labels are TextView nodes, while the HTML stat
+  // values are android.view.View nodes with slightly different font bounds.
+  const received=statNode('Audio received','[55,415][145,433]');
+  const packets={...statNode('442 packets','[588,413][664,434]'),class:'android.view.View',clickable:'false','long-clickable':'false',checkable:'false'};
+  assert.equal(diagnosticValue(received,[view,nav,received,packets],/^\d+ packets$/),'442 packets');
+  const returned=statNode('Audio received','[55,545][145,563]');
+  const returnedPackets={...packets,text:'453 packets',bounds:'[588,544][664,565]'};
+  assert.equal(diagnosticValue(returned,[view,nav,returned,returnedPackets],/^\d+ packets$/),'453 packets');
+  const processing=statNode('Audio playback processing','[55,712][219,730]');
+  for(const state of ['running','suspended','interrupted','off']) {
+    const value={...packets,text:state,bounds:'[616,710][664,733]'};
+    assert.equal(diagnosticValue(processing,[view,nav,processing,value],/^(running|suspended|interrupted|off)$/),state);
+  }
+});
+
+test('a View statistic still rejects interactive, foreign, hidden, clipped, wrong-row or ambiguous candidates', () => {
+  const label=statNode('Audio received','[55,415][145,433]');
+  const value={...statNode('442 packets','[588,413][664,434]'),class:'android.view.View',clickable:'false','long-clickable':'false',checkable:'false'};
+  for(const invalid of [{...value,clickable:'true'},{...value,'long-clickable':'true'},{...value,checkable:'true'},
+    {...value,class:'android.widget.Button'},{...value,package:'com.android.systemui'},
+    {...value,'visible-to-user':'false'},{...value,bounds:'[588,413][721,434]'},
+    {...value,bounds:'[588,411][664,434]'},{...value,bounds:'[588,413][664,437]'},
+    {...value,text:'442 packets extra'},{...value,text:'9999999999999999999999 packets'}]) {
+    assert.equal(diagnosticValue(label,[view,nav,label,invalid],/^\d+ packets$/),null);
+  }
+  assert.equal(diagnosticValue(label,[view,nav,label,value,{...value}],/^\d+ packets$/),null);
+  assert.equal(diagnosticValue(label,[label,value],/^\d+ packets$/),null);
+  assert.equal(diagnosticValue(label,[view,nav,label,{...value,text:'0 packets'}],/^\d+ packets$/),'0 packets',
+    'A real zero remains zero for the unchanged media threshold');
+  assert.equal(diagnosticValue(label,[view,nav,label,{...value,class:'android.widget.TextView',clickable:'true'}],/^\d+ packets$/),null);
+});

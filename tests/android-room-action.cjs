@@ -48,7 +48,8 @@ function diagnosticValue(label, nodes, valuePattern) {
   const values = nodes.filter(node => {
     const box = rect(node), text = node.text || node['content-desc'] || '';
     const packetCount = /^(\d+) packets$/.exec(text);
-    return node !== label && node.package === appPackage && node.class === 'android.widget.TextView' && fits(node,area) &&
+    return node !== label && node.package === appPackage && ['android.widget.TextView','android.view.View'].includes(node.class) &&
+      node.clickable !== 'true' && node['long-clickable'] !== 'true' && node.checkable !== 'true' && fits(node,area) &&
       box[0] >= labelBounds[2] && Math.abs(box[1] - labelBounds[1]) <= 3 && Math.abs(box[3] - labelBounds[3]) <= 3 &&
       (!packetCount || Number.isSafeInteger(Number(packetCount[1]))) && valuePattern.test(text);
   });
