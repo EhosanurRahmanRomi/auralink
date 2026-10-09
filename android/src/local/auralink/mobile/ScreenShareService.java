@@ -60,8 +60,8 @@ public final class ScreenShareService extends Service {
     private byte[] pixels;
     private Listener listener;
     private volatile boolean running, fullDisplay, stopping;
-    private volatile long inFlight, sentAt;
-    private long sequence, lastFrame;
+    private volatile ScreenFrameDelivery frameDelivery;
+    private long lastFrame;
     private int width, height, contentWidth, contentHeight, maxEdge, foregroundTypes;
     private final DisplayManager.DisplayListener rotationListener = new DisplayManager.DisplayListener() {
         public void onDisplayAdded(int id) { }
@@ -127,7 +127,11 @@ public final class ScreenShareService extends Service {
         try { source.start(); return true; } catch (RuntimeException failure) { current.playbackAudio = null; throw failure; }
     }
     private void stopPlaybackAudio() { playbackGeneration++; PlaybackAudio previous = playbackAudio; playbackAudio = null; if (previous != null) previous.stop(); }
-    static void acknowledge(long seq) { ScreenShareService current = instance; if (current != null && current.inFlight == seq) current.inFlight = 0; }
+    static boolean acknowledge(String ticket, long seq) {
+        ScreenShareService current = instance;
+        ScreenFrameDelivery delivery = current == null ? null : current.frameDelivery;
+        return delivery != null && delivery.acknowledge(ticket, seq);
+    }
     static void stopCurrent(String reason) { ScreenShareService current = instance; if (current != null) current.main.post(() -> current.stopSharing(reason)); else cancelPreparation(); }
     static void stopCurrent(String ticket, String reason) {
         ScreenShareService current = instance;
@@ -164,6 +168,7 @@ public final class ScreenShareService extends Service {
             }
             activeTicket = ticket; listener = pendingListener; pendingListener = null;
         }
+        frameDelivery = new ScreenFrameDelivery(ticket);
         maxEdge = intent.getIntExtra("maxEdge", 1280) == 1920 ? 1920 : 1280;
         foregroundTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
         if (Build.VERSION.SDK_INT >= 30 && intent.getBooleanExtra("microphone", false) && checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) foregroundTypes |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
@@ -222,8 +227,12 @@ public final class ScreenShareService extends Service {
             if (!running || stopping || source != reader) return;
             image = source.acquireLatestImage(); if (image == null) return;
             long now = SystemClock.elapsedRealtime();
-            if (inFlight != 0 && now - sentAt > 3000) { main.post(() -> stopSharing("Screen delivery stalled. Return to Glance-Port and restart sharing.")); return; }
-            if (inFlight != 0 || now - lastFrame < 83) return; // At most 12fps and one frame awaiting canvas acknowledgement.
+            ScreenFrameDelivery delivery = frameDelivery;
+            // SystemUI, WebView decoding or the media writer can temporarily
+            // pause acknowledgement. Keep that one pending frame, discard
+            // newer images, and resume from the latest image after its ACK.
+            // Owner/session/projection teardown remains the stop condition.
+            if (delivery == null || delivery.waiting() || now - lastFrame < 83) return;
             Image.Plane plane = image.getPlanes()[0]; int stride = plane.getRowStride(), pixelStride = plane.getPixelStride();
             if (pixelStride != 4 || stride < width * 4) return;
             int paddedWidth = stride / 4;
@@ -240,8 +249,9 @@ public final class ScreenShareService extends Service {
             if (bytes.size() > 524288) { bytes.reset(); visible.compress(Bitmap.CompressFormat.JPEG, 52, bytes); }
             if (bytes.size() > 524288) return;
             final String encoded = Base64.encodeToString(bytes.toByteArray(), Base64.NO_WRAP); final int frameWidth = width, frameHeight = height;
-            final long seq = ++sequence; inFlight = seq; sentAt = lastFrame = now;
-            main.post(() -> { if (running && !stopping && inFlight == seq && listener != null) listener.frame(seq, encoded, frameWidth, frameHeight); });
+            final long seq = delivery.reserve(); if (seq == 0) return;
+            lastFrame = now;
+            main.post(() -> { if (running && !stopping && delivery.matches(seq) && listener != null) listener.frame(seq, encoded, frameWidth, frameHeight); });
         } catch (Exception failure) { main.post(() -> stopSharing("Screen frame conversion failed. Restart sharing to continue.")); }
         finally { if (visible != null && visible != padded) visible.recycle(); if (image != null) image.close(); }
     }
@@ -253,7 +263,8 @@ public final class ScreenShareService extends Service {
             .setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).setContentIntent(open).addAction(new Notification.Action.Builder(null, "Stop sharing", stop).build()).build();
     }
     private void stopSharing(String reason) {
-        if (stopping) return; stopping = true; running = false; fullDisplay = false; inFlight = 0;
+        if (stopping) return; stopping = true; running = false; fullDisplay = false;
+        ScreenFrameDelivery delivery = frameDelivery; if (delivery != null) delivery.close();
         stopPlaybackAudio();
         cancelPreparation(activeTicket); ownership.release(activeTicket);
         AttendedAccessibilityService control = AttendedAccessibilityService.current(); if (control != null) control.revoke(reason);

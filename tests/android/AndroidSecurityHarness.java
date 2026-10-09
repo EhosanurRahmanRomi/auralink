@@ -145,6 +145,7 @@ public final class AndroidSecurityHarness {
     projectionOwnershipPolicies();
   }
   private static void projectionOwnershipPolicies() throws Exception {
+    frameDeliveryPolicies();
     check(ScreenCaptureQuality.maxEdge("720p")==1280 && ScreenCaptureQuality.maxEdge("1080p")==1920,"Phone capture exposes only its supported resolution ceilings");
     for(final String quality:new String[]{null,"auto","480p","1440p","1080"," 720p","720P"})
       refuses(()->ScreenCaptureQuality.maxEdge(quality),"Unsupported or malformed capture quality is rejected");
@@ -171,6 +172,38 @@ public final class AndroidSecurityHarness {
     check(ownership.claim(oldTicket) && ownership.activeMatches(oldTicket), "Replacement consent can claim only after the old projection releases ownership");
     check(!ownership.release(replacement) && ownership.activeMatches(oldTicket), "Delayed prior teardown cannot release the newly started projection");
     check(ownership.release(oldTicket) && !ownership.activeMatches(oldTicket), "Owner stop releases exact active capture ownership");
+  }
+  private static void frameDeliveryPolicies() throws Exception {
+    refuses(()->new ScreenFrameDelivery(null),"Screen delivery cannot exist without an owner");
+    refuses(()->new ScreenFrameDelivery(""),"An empty capture ticket cannot create a delivery slot");
+    final String owner="active-capture",replacement="replacement-capture";
+    ScreenFrameDelivery delivery=new ScreenFrameDelivery(owner);
+    long first=delivery.reserve();
+    check(first==1 && delivery.waiting() && delivery.matches(first),"Exactly one valid pending frame is reserved");
+    long delayedAt=System.nanoTime();
+    Thread.sleep(3200);
+    check(TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-delayedAt)>=3000,"The consumer delay really exceeds the old three-second stop threshold");
+    boolean bounded=true;for(int index=0;index<1000;index++)bounded &= delivery.reserve()==0;
+    check(bounded,"A thousand capture attempts during a paused consumer cannot enqueue another payload");
+    check(delivery.waiting() && delivery.matches(first),"Delayed frame remains pending without expiring the owner capture");
+    check(!delivery.acknowledge(replacement,first) && !delivery.acknowledge(owner,first+1) && !delivery.acknowledge(owner,0),"Wrong owner and nonmatching ACK cannot release a pending frame");
+    check(delivery.acknowledge(owner,first) && !delivery.waiting(),"The exact delayed acknowledgement releases the existing slot");
+    long fresh=delivery.reserve();
+    check(fresh==first+1 && delivery.waiting(),"Fresh frames resume on the same owner slot after delayed ACK");
+    check(!delivery.acknowledge(owner,first) && delivery.matches(fresh),"A replayed old ACK cannot release a fresh pending frame");
+    delivery.close();
+    check(!delivery.matches(fresh) && !delivery.waiting(),"Actual owner stop invalidates a queued frame before delivery");
+    check(!delivery.acknowledge(owner,fresh) && delivery.reserve()==0,"Late ACK or conversion completion cannot revive a closed capture");
+    ScreenFrameDelivery newer=new ScreenFrameDelivery(replacement);long replacementFirst=newer.reserve();
+    check(replacementFirst==1 && !newer.acknowledge(owner,replacementFirst) && newer.matches(replacementFirst),"An old capture ACK cannot release a replacement capture even with the same sequence");
+    check(newer.acknowledge(replacement,replacementFirst),"A replacement capture requires its own exact owner acknowledgement");
+    final ScreenFrameDelivery concurrent=new ScreenFrameDelivery(owner);
+    final CountDownLatch ready=new CountDownLatch(8),go=new CountDownLatch(1),done=new CountDownLatch(8);
+    final java.util.concurrent.atomic.AtomicInteger reservations=new java.util.concurrent.atomic.AtomicInteger();
+    for(int index=0;index<8;index++)new Thread(()->{ready.countDown();try{go.await();if(concurrent.reserve()!=0)reservations.incrementAndGet();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();}finally{done.countDown();}}).start();
+    check(ready.await(3,TimeUnit.SECONDS),"Concurrent producer test starts all workers");go.countDown();
+    check(done.await(3,TimeUnit.SECONDS) && reservations.get()==1,"Concurrent producers still reserve exactly one payload");
+    concurrent.close();check(concurrent.reserve()==0,"Concurrent delivery stop is final");
   }
   private static void relayPolicies() {
     String epoch = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[12]);

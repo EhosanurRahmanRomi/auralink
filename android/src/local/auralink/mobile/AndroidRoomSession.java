@@ -394,11 +394,13 @@ final class AndroidRoomSession extends ContextWrapper {
                 }
                 reply(id, json("ok", true)); clearProjectionRequest(); ScreenShareService.stopCurrent("Stopped in Glance-Port."); revokeControl("Screen sharing stopped.");
             } else if ("ackScreenFrame".equals(method)) {
-                if (((JSONObject)args).has("captureId") &&
-                    !java.util.Objects.equals(projectionId, ((JSONObject)args).optString("captureId"))) {
-                    reply(id, json("ok", false)); return;
-                }
-                ScreenShareService.acknowledge(((JSONObject)args).getLong("seq")); reply(id, json("ok", true));
+                JSONObject packet = args instanceof JSONObject ? (JSONObject)args : new JSONObject();
+                if (!(packet.opt("captureId") instanceof String) || !(packet.opt("seq") instanceof Number)) throw new IllegalArgumentException("Invalid screen frame acknowledgement.");
+                double sequence = ((Number)packet.opt("seq")).doubleValue();
+                if (!Double.isFinite(sequence) || sequence < 1 || sequence > 9007199254740991L || sequence != Math.floor(sequence)) throw new IllegalArgumentException("Invalid screen frame sequence.");
+                String capture = packet.getString("captureId");
+                boolean matching = capture.equals(projectionId) && roomMembership.hasRoom();
+                reply(id, json("ok", matching && ScreenShareService.acknowledge(capture, (long)sequence)));
             } else if ("grantControl".equals(method)) {
                 grantControl(id, (JSONObject)args);
             } else if ("revokeControl".equals(method)) {
@@ -715,7 +717,10 @@ final class AndroidRoomSession extends ContextWrapper {
                 reply(requestId, json("id", "android-screen", "captureId", ticket, "name", "Phone display", "width", width, "height", height, "fps", 12, "maxEdge", maxEdge, "notificationAvailable", notificationsAvailable()));
             }
             public void frame(long seq, String jpeg, int width, int height) {
-                if (roomMembership.epoch() == serial && roomMembership.hasRoom() && ticket.equals(projectionId) && localDocument()) deliver(json("event", "screen", "type", "frame", "captureId", ticket, "seq", seq, "data", "data:image/jpeg;base64," + jpeg, "width", width, "height", height));
+                if (destroyed || roomMembership.epoch() != serial || !roomMembership.hasRoom() || !ticket.equals(projectionId) || !localDocument()) {
+                    ScreenShareService.stopCurrent(ticket, "The screen-sharing room or display has ended."); return;
+                }
+                deliver(json("event", "screen", "type", "frame", "captureId", ticket, "seq", seq, "data", "data:image/jpeg;base64," + jpeg, "width", width, "height", height));
             }
             public void audio(long seq, String data, int frames) {
                 if (roomMembership.epoch() == serial && roomMembership.hasRoom() && ticket.equals(projectionId) && localDocument())

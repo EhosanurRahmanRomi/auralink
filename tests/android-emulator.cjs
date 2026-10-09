@@ -1010,7 +1010,7 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
             await tapStable(node=>['android.widget.CheckedTextView','android.widget.TextView'].includes(node.class) &&
               ['local.auralink.mobile','android'].includes(node.package) && node.text===`${quality}p` && visible(node) && node.enabled==='true');
             await findNode((node,nodes)=>node['resource-id']==='presentation-quality' && visibleInWebView(node,nodes) &&
-              (node['content-desc'] || '').includes(`${quality}p`));
+              (node.text===`${quality}p` || (node['content-desc'] || '').includes(`${quality}p`)));
             const nativeDeadline=Date.now()+15000;let display;
             do {display=await captureDisplay();if(display.width===w && display.height===h)break;await delay(300);} while(Date.now()<nativeDeadline);
             assert.equal(display.identity,captureBefore.identity,'Quality changes must resize the same native virtual display');

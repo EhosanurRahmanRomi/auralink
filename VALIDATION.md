@@ -12,6 +12,8 @@ The fullscreen Stream selector is owner-only and must stay synchronized with the
 
 Android ownership tests execute the production routing/session policies against API doubles. The production APK runtime must retain its actual process, room, projection and decoded track across OS-triggered Activity destruction/recreation, and separately capture external eligible playback while the microphone is off. Its separate QA instrumentation supplies tones from another app UID; it does not modify the production APK or enable its debugging. Consult the release report for completed stages. Process termination, Android API29–35 branches, screen-lock rules and physical iQOO battery management remain outside emulator proof.
 
+The frame-delivery policy must retain exactly one pending frame through acknowledgements delayed beyond the former three-second shutdown, reject stale acknowledgements and prevent new delivery after owner cleanup. Its JVM checks establish bounded backpressure and resumption; the unchanged production APK fullscreen, quality and recreation checks exercise actual Android transitions without injecting a timed renderer pause.
+
 Coordinator policy and actual workerd/SQLite tests cover multi-hour healthy idle, restored encrypted relay keys and credits, host departure and heartbeat loss. Removing time cutoffs does not relax the 512 MiB room or daily byte/packet budgets, nor the 15-minute remote-control consent lease. Rooms remain host-owned; no fixed inactivity timeout is imposed on a healthy session.
 
 ## Historical 0.5.0 Glance-Port fullscreen revision

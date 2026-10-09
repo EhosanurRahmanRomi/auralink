@@ -145,7 +145,11 @@ async function sourcePolicies() {
   assert.match(projection, /registerCallback\(/, 'Projection registers its stop callback');
   assert.match(projection, /onCapturedContentResize/, 'Projection handles Android capture resizing');
   assert.match(projection, /START_NOT_STICKY/, 'Projection is never silently restarted by Android');
-  assert.match(projection, /inFlight\s*!=\s*0/, 'Native screen frames are bounded to one pending delivery');
+  assert.match(projection, /delivery\.waiting\(\)\s*\|\|/, 'Native screen frames are bounded to one pending delivery');
+  assert.doesNotMatch(consumeFrame, /sentAt|3000|Screen delivery stalled/, 'Temporary delayed acknowledgement cannot stop an owner-approved projection');
+  assert.match(projection,/delivery\.close\(\)/,'Actual capture stop closes pending delivery before releasing resources');
+  assert.match(consumeFrame,/delivery\.reserve\(\)/,'Frame dispatch must claim the same bounded native pending slot');
+  assert.match(consumeFrame,/delivery\.matches\(seq\)/,'A queued frame cannot be delivered after owner cleanup closes its slot');
   assert.match(projection, /bytes\.size\(\)\s*>\s*524288/, 'Native JPEG size is bounded');
   assert.match(projection, /Stop sharing/, 'Screen service provides a stop notification action');
   assert.match(projection, /if\s*\(running\)\s*return\s*START_NOT_STICKY/, 'Delayed service intents do not stop a live projection');
@@ -175,7 +179,12 @@ async function sourcePolicies() {
   assert.match(activity, /"version",\s*installedVersion\(\)/, 'Android bridge reports the actual installed package version');
   assert.match(activity, /projectionGeneration\s*=\s*roomMembership\.epoch\(\)/, 'Phone capture consent is scoped to the admitted room, not the longer-lived directory socket');
   assert.match(activity, /mediaGeneration\s*!=\s*roomMembership\.epoch\(\)/, 'Old microphone permission completion cannot authorize a later Internet room');
-  assert.match(activity, /roomMembership\.epoch\(\)\s*==\s*serial\s*&&\s*roomMembership\.hasRoom\(\)/, 'Screen frame delivery rejects callbacks from rooms already left');
+  const screenFrame=activity.slice(activity.indexOf('public void frame(long seq'),activity.indexOf('public void audio(long seq'));
+  assert.match(screenFrame,/roomMembership\.epoch\(\)\s*!=\s*serial\s*\|\|\s*!roomMembership\.hasRoom\(\)/,'Screen frame delivery rejects callbacks from rooms already left');
+  assert.match(screenFrame,/ScreenShareService\.stopCurrent\(ticket,/,'A room or renderer that has actually ended stops only its own pending projection');
+  const screenAck=activity.slice(activity.indexOf('} else if ("ackScreenFrame".equals(method))'),activity.indexOf('} else if ("grantControl".equals(method))'));
+  assert.match(screenAck,/capture\.equals\(projectionId\)\s*&&\s*roomMembership\.hasRoom\(\)/,'Every frame acknowledgement requires an exact admitted capture ticket');
+  assert.match(screenAck,/ScreenShareService\.acknowledge\(capture,\s*\(long\)sequence\)/,'Sequence acknowledgement carries its owner ticket all the way into the native slot');
   assert.match(activity, /"captureId",\s*ticket/, 'Native capture callbacks carry the opaque projection identity');
   assert.match(activity, /!ticket\.equals\(projectionId\)/, 'A stopped or started old projection cannot mutate a newer pending projection');
   const realStop = activity.slice(activity.indexOf('} else if ("stopScreenShare".equals(method))'), activity.indexOf('} else if ("ackScreenFrame".equals(method))'));
@@ -238,7 +247,7 @@ async function main() {
   evidence.checks.callAudioLifecycle = await runCallAudioHarness({ run, javac, java, fixtureDir, packageDir });
   const libs = ['Java-WebSocket-1.6.0.jar', 'slf4j-api-2.0.13.jar'].map(name => path.join(root, 'android', 'libs', name));
   const classpath = libs.join(path.delimiter);
-  const sources = ['Invitation.java', 'AppInvitation.java', 'InternetServiceEndpoint.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'RoomMembership.java', 'ProjectionOwnership.java', 'ScreenCaptureQuality.java', 'RelayMediaPolicy.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
+  const sources = ['Invitation.java', 'AppInvitation.java', 'InternetServiceEndpoint.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'RoomMembership.java', 'ProjectionOwnership.java', 'ScreenCaptureQuality.java', 'ScreenFrameDelivery.java', 'RelayMediaPolicy.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
   await run(javac, ['--release', '8', '-cp', classpath, '-d', classesDir, ...sources, path.join(__dirname, 'android', 'AndroidSecurityHarness.java')]);
   evidence.checks.compile = { passed: true, javaTarget: 8, productionClasses: sources.map(filename => path.basename(filename)) };
   const now = Date.now();
