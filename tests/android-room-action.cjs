@@ -44,21 +44,37 @@ function gestureBlockers(nodes) {
     (node.clickable === 'true' || node['long-clickable'] === 'true' || node['resource-id'] === 'stage-video' ||
       /^android\.widget\.(?:Button|ToggleButton|EditText|Spinner|SeekBar|Switch)$/.test(node.class || '')) && rect(node));
 }
-function gesturePath(nodes, area, direction) {
-  if (!area) return null;
-  const middle = Math.round((area[1] + area[3]) / 2), half = Math.round((area[3] - area[1]) * .23);
-  if (half < 1) return null;
-  const top = middle - half, bottom = middle + half;
+function gesturePaths(nodes, area, direction) {
+  if (!area) return [];
   const blockers = gestureBlockers(nodes).map(rect);
-  for (const fraction of [.025,.975,.5,.25,.75]) {
+  const minimumStroke = Math.max(24,Math.min(64,Math.round((area[3]-area[1])*.08)));
+  const maximumStroke = Math.round((area[3]-area[1])*.46), candidates = [];
+  for (const fraction of [.5,.25,.75,.1,.9]) {
     const x = Math.round(area[0] + (area[2] - area[0]) * fraction);
-    if (x <= area[0] || x >= area[2] || blockers.some(box => x >= box[0] - 4 && x <= box[2] + 4 && bottom >= box[1] - 4 && top <= box[3] + 4)) continue;
-    return [x,direction === 'earlier' ? top : bottom,x,direction === 'earlier' ? bottom : top];
+    // Stay inside the observed view, away from system edge-gesture gutters.
+    if (x-area[0] < 24 || area[2]-x < 24) continue;
+    let free = [[area[1],area[3]]];
+    for (const box of blockers) {
+      if (x < box[0]-4 || x > box[2]+4) continue;
+      const blockedTop=box[1]-4,blockedBottom=box[3]+4;
+      free=free.flatMap(([top,bottom])=>blockedBottom<top || blockedTop>bottom ? [[top,bottom]] :
+        [[top,Math.min(bottom,blockedTop-1)],[Math.max(top,blockedBottom+1),bottom]].filter(([a,b])=>b>a));
+    }
+    for (const [start,end] of free) {
+      const stroke=Math.min(maximumStroke,end-start);
+      if (stroke<minimumStroke) continue;
+      const top=Math.round((start+end-stroke)/2),bottom=top+stroke;
+      candidates.push({stroke,path:[x,direction==='earlier'?top:bottom,x,direction==='earlier'?bottom:top]});
+    }
   }
-  return null;
+  return candidates.sort((a,b)=>b.stroke-a.stroke).map(value=>value.path);
+}
+function gesturePath(nodes, area, direction) {
+  return gesturePaths(nodes,area,direction)[0] || null;
 }
 function signature(nodes, area) {
-  return nodes.filter(node => fits(node, area)).map(node => [node['resource-id'], node.class, node.bounds, node.text, node['content-desc']].join('|')).join('\n');
+  return JSON.stringify([area,nodes.filter(node => node.package===appPackage && node['visible-to-user']==='true')
+    .map(node => [node['resource-id'],node.class,node.bounds,node['visible-to-user'],node.scrollable])]);
 }
 function diagnosticValue(label, nodes, valuePattern) {
   const area = viewport(nodes), labelBounds = rect(label);
@@ -75,7 +91,8 @@ function diagnosticValue(label, nodes, valuePattern) {
 }
 async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, timeout = 30000, observe}) {
   const deadline = now() + timeout;
-  let stableBounds, previousViewport, sameViewport = 0, direction = 'earlier', scans = 0, observedViewport = false;
+  let stableBounds, previousGeometry, lastSwipeDirection, direction = 'earlier', observedViewport = false;
+  const triedPaths = new Set(), progressDirections = new Set();
   do {
     const nodes = await read(); const area = viewport(nodes); const node = nodes.find(value => value.package === appPackage && predicate(value,nodes));
     const attempt = {viewport:area,direction,decision:'pending',path:null};
@@ -83,39 +100,45 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
     if (now() >= deadline) { attempt.decision = 'deadline'; break; }
     // UiAutomation can briefly omit the app while returning only SystemUI.
     // Such a snapshot proves neither a scroll boundary nor an absent action.
-    if (!area) { attempt.decision = 'wait-no-viewport'; stableBounds = previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
+    if (!area) { attempt.decision = 'wait-no-viewport'; stableBounds = previousGeometry = lastSwipeDirection = undefined; triedPaths.clear(); await wait(300); continue; }
     observedViewport = true;
     if (node && fits(node, area)) {
       if (node.bounds === stableBounds) { attempt.decision = 'return-stable-action'; return node; }
       attempt.decision = 'wait-stable-action'; stableBounds = node.bounds; await wait(300); continue;
     }
     stableBounds = undefined;
-    if (!gesturePath(nodes,area,direction)) { attempt.decision = 'wait-no-safe-gesture'; previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
+    const currentGeometry=signature(nodes,area);
+    if (previousGeometry!==undefined && currentGeometry!==previousGeometry && lastSwipeDirection) {
+      progressDirections.add(lastSwipeDirection);triedPaths.clear();attempt.geometryAdvanced=true;
+    } else attempt.geometryAdvanced=false;
+    previousGeometry=currentGeometry;
     const box = rect(node);
     if (box && box[3] > box[1]) {
       // Above the viewport needs a downward finger swipe; below needs upward.
-      direction = box[1] < area[1] ? 'earlier' : 'later';
-      previousViewport = undefined; sameViewport = 0; scans = 0;
-    } else {
-      // WebView omits offscreen nodes. Search back to the top, then advance in
-      // overlapping steps rather than assuming an absent action lies below.
-      const current = signature(nodes, area);
-      sameViewport = current === previousViewport ? sameViewport + 1 : 0;
-      previousViewport = current;
-      if (sameViewport >= 2 || scans >= 8) {
-        if (direction === 'later') { attempt.decision = 'absent-after-search'; throw new Error('Room action is absent after searching the native viewport in both directions'); }
-        direction = 'later'; previousViewport = undefined; sameViewport = 0; scans = 0;
-      }
-      scans++;
+      const nextDirection=box[1] < area[1] ? 'earlier' : 'later';
+      if(nextDirection!==direction)triedPaths.clear();direction=nextDirection;
     }
-    const path = gesturePath(nodes,area,direction);
+    let candidates=gesturePaths(nodes,area,direction);
+    if (!candidates.length) { attempt.decision='wait-no-safe-gesture';await wait(300);continue; }
+    let path=candidates.find(value=>!triedPaths.has(value.join(',')));
+    if(!path) {
+      // No movement at one safe corridor does not prove a scroll boundary.
+      // Try every current interior corridor before changing search direction.
+      if(!box) {
+        if(direction==='later' && progressDirections.has('earlier') && progressDirections.has('later')) {
+          attempt.decision='absent-after-search';throw new Error('Room action is absent after searching the native viewport in both directions');
+        }
+        direction=direction==='earlier'?'later':'earlier';candidates=gesturePaths(nodes,area,direction);
+      }
+      triedPaths.clear();path=candidates[0];
+    }
     attempt.direction = direction;
-    if (!path) { attempt.decision = 'wait-no-safe-gesture'; previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
     attempt.decision = 'swipe'; attempt.path = path;
+    triedPaths.add(path.join(','));lastSwipeDirection=direction;
     await swipe(...path);
     await wait(500);
   } while (now() < deadline);
   throw new Error(observedViewport ? 'Room action did not expose stable fully visible native bounds before the deadline' :
     'Production WebView did not expose a valid observed viewport before the deadline');
 }
-module.exports = {findRoomAction, fits, viewport, gesturePath, gestureBlockers, diagnosticValue};
+module.exports = {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue};

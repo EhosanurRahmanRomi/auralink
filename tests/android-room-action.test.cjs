@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {findRoomAction, fits, viewport, gesturePath, gestureBlockers, diagnosticValue} = require('./android-room-action.cjs');
+const {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue} = require('./android-room-action.cjs');
 
 const packageName = 'local.auralink.mobile';
 const view = {class:'android.webkit.WebView',package:packageName,'visible-to-user':'true',bounds:'[0,136][720,1245]'};
@@ -111,7 +111,7 @@ test('a resize requires two stable current action bounds and never taps old view
 
 test('an absent or invisible action fails rather than tapping a different node', async () => {
   const state = fixture(() => [view,navBand,nav,{'resource-id':'host-button','visible-to-user':'false',bounds:'[0,0][0,0]'}]);
-  await assert.rejects(findRoomAction(target,state.options),/absent after searching/);
+  await assert.rejects(findRoomAction(target,state.options),/before the deadline/);
   assert.ok(state.swipes.some(coords => coords[3]>coords[1]));assert.ok(state.swipes.some(coords => coords[3]<coords[1]));
 });
 
@@ -141,6 +141,69 @@ test('gesture coordinates come from the observed viewport and avoid the captured
   const nested = {...view,bounds:'[40,180][680,1000]'};const narrowArea=viewport([nested,view]);
   const narrowPath=gesturePath([nested,view],narrowArea,'later');
   assert.ok(narrowPath[0]>40 && narrowPath[0]<680 && narrowPath[3]>=180 && narrowPath[1]<=1000);
+});
+
+function capturedHomeReturnGeometry() {
+  const webView={...view,bounds:'[0,136][720,1244]'};
+  const content={...view,bounds:'[0,136][720,1245]',scrollable:'true'};
+  const rooms={...nav,bounds:'[78,1157][186,1235]'};
+  const devices={...nav,text:'Devices',bounds:'[306,1157][412,1235]'};
+  const settings={...nav,text:'Settings',bounds:'[534,1157][640,1235]'};
+  const block=(id,bounds,kind='android.widget.Button')=>({...button(bounds),'resource-id':id,class:kind,clickable:'true'});
+  return [webView,content,rooms,devices,settings,
+    block('room-code','[51,136][669,143]','android.widget.EditText'),
+    block('copy-room-code','[51,158][354,220]'),block('copy-room-link','[366,158][669,220]'),
+    block('lock-room-button','[33,283][114,320]'),block('rotate-room-invite','[130,283][232,320]'),
+    block('room-people-button','[249,283][358,320]'),block('fullscreen-button','[610,353][678,421]'),
+    {...block('stage-video','[30,341][690,836]','android.view.View'),clickable:'false'},
+    block('screen-zoom-out','[42,353][109,421]'),block('screen-zoom-in','[159,353][226,421]'),
+    block('screen-zoom-fit','[225,353][292,421]'),block('screen-pan','[291,353][358,421]'),
+    block('','[30,853][354,1037]'),block('','[366,853][690,1037]')];
+}
+
+test('captured post-Home blockers yield clear interior gaps without touching the stage or controls', () => {
+  const nodes=capturedHomeReturnGeometry(),area=viewport(nodes),paths=gesturePaths(nodes,area,'earlier');
+  assert.deepEqual(area,[0,144,720,1129]);assert.ok(paths.length>1);
+  assert.deepEqual(paths[0],[360,841,360,1129]);
+  assert.ok(paths.some(path=>path.join(',')==='540,225,540,336'));
+  const blockers=gestureBlockers(nodes);
+  for(const [x,top,,bottom] of paths) {
+    assert.ok(x>=area[0]+24 && x<=area[2]-24 && top>=area[1] && bottom<=area[3]);
+    assert.ok(bottom-top>=64,'Short interior paths retain a meaningful minimum stroke');
+    for(const node of blockers) {
+      const [left,y1,right,y2]=node.bounds.match(/-?\d+/g).map(Number);
+      assert.equal(x>=left-4 && x<=right+4 && bottom>=y1-4 && top<=y2+4,false,
+        `Safe gap must avoid the padded ${node['resource-id'] || node.class} rectangle`);
+    }
+  }
+});
+
+test('unchanged post-Home geometry cycles distinct safe gaps despite changing live text', async () => {
+  const nodes=capturedHomeReturnGeometry();let reads=0,clock=0;
+  const swipes=[],decisions=[];
+  const found=await findRoomAction(target,{read:async()=>{
+    reads++;
+    return [...nodes,{package:packageName,class:'android.widget.TextView','visible-to-user':'true',
+      'resource-id':'room-duration',text:`00:${reads}`,bounds:'[200,1044][300,1070]'},
+      ...(swipes.length>=2?[button('[66,400][157,468]')]:[])];
+  },swipe:(...path)=>swipes.push(path),wait:async ms=>{clock+=ms;},now:()=>clock,timeout:5000,
+  observe:(snapshot,node,attempt)=>decisions.push(attempt)});
+  assert.equal(found.bounds,'[66,400][157,468]');assert.equal(swipes.length,2);
+  assert.deepEqual(swipes[0],[360,841,360,1129]);assert.deepEqual(swipes[1],[360,148,360,278]);
+  assert.equal(decisions[1].geometryAdvanced,false,'A timer tick must not masquerade as actual layout progress');
+  assert.deepEqual(decisions.slice(-2).map(value=>value.decision),['wait-stable-action','return-stable-action']);
+});
+
+test('ineffective safe swipes stay bounded by the deadline instead of proving an absent action', async () => {
+  const nodes=capturedHomeReturnGeometry();let clock=0;const swipes=[],decisions=[];
+  await assert.rejects(findRoomAction(target,{read:async()=>nodes,swipe:(...path)=>swipes.push(path),
+    wait:async ms=>{clock+=ms;},now:()=>clock,timeout:12000,observe:(snapshot,node,attempt)=>decisions.push(attempt)}),
+    /before the deadline/);
+  const candidates=gesturePaths(nodes,viewport(nodes),'earlier');
+  assert.equal(new Set(swipes.slice(0,candidates.length).map(path=>path.join(','))).size,candidates.length);
+  assert.ok(swipes.some(path=>path[3]>path[1]) && swipes.some(path=>path[3]<path[1]));
+  assert.equal(decisions.some(value=>value.decision==='absent-after-search'),false);
+  assert.ok(clock<=12000 && swipes.length<=24);
 });
 
 test('diagnostic observations report actual blocked, swipe and stability decisions without changing the search', async () => {
