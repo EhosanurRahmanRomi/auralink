@@ -72,9 +72,23 @@ function gesturePaths(nodes, area, direction) {
 function gesturePath(nodes, area, direction) {
   return gesturePaths(nodes,area,direction)[0] || null;
 }
-function signature(nodes, area) {
-  return JSON.stringify([area,nodes.filter(node => node.package===appPackage && node['visible-to-user']==='true')
-    .map(node => [node['resource-id'],node.class,node.bounds,node['visible-to-user'],node.scrollable])]);
+function contentGeometry(nodes, area) {
+  const boxes = new Map();
+  for(const node of nodes) {
+    const box=rect(node),id=node['resource-id'];
+    if(!id || !box || node.package!==appPackage || node['visible-to-user']!=='true')continue;
+    boxes.set(id,boxes.has(id)?null:{kind:node.class,box});
+  }
+  return {area:area.join(','),boxes};
+}
+function contentMoved(before, after) {
+  if(!before || before.area!==after.area)return false;
+  for(const [key,value] of after.boxes) {
+    const earlier=before.boxes.get(key),box=value?.box,previous=earlier?.box;
+    if(box && previous && value.kind===earlier.kind && box[0]===previous[0] && box[2]-box[0]===previous[2]-previous[0] &&
+      box[3]-box[1]===previous[3]-previous[1] && Math.abs(box[1]-previous[1])>=4)return true;
+  }
+  return false;
 }
 function diagnosticValue(label, nodes, valuePattern) {
   const area = viewport(nodes), labelBounds = rect(label);
@@ -92,7 +106,7 @@ function diagnosticValue(label, nodes, valuePattern) {
 async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, timeout = 30000, observe}) {
   const deadline = now() + timeout;
   let stableBounds, previousGeometry, lastSwipeDirection, direction = 'earlier', observedViewport = false;
-  const triedPaths = new Set(), progressDirections = new Set();
+  const triedPaths = {earlier:new Set(),later:new Set()}, stalledAttempts={earlier:0,later:0}, progressDirections = new Set();
   do {
     const nodes = await read(); const area = viewport(nodes); const node = nodes.find(value => value.package === appPackage && predicate(value,nodes));
     const attempt = {viewport:area,direction,decision:'pending',path:null};
@@ -100,41 +114,41 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
     if (now() >= deadline) { attempt.decision = 'deadline'; break; }
     // UiAutomation can briefly omit the app while returning only SystemUI.
     // Such a snapshot proves neither a scroll boundary nor an absent action.
-    if (!area) { attempt.decision = 'wait-no-viewport'; stableBounds = previousGeometry = lastSwipeDirection = undefined; triedPaths.clear(); await wait(300); continue; }
+    if (!area) { attempt.decision = 'wait-no-viewport'; stableBounds = previousGeometry = lastSwipeDirection = undefined; await wait(300); continue; }
     observedViewport = true;
     if (node && fits(node, area)) {
       if (node.bounds === stableBounds) { attempt.decision = 'return-stable-action'; return node; }
       attempt.decision = 'wait-stable-action'; stableBounds = node.bounds; await wait(300); continue;
     }
     stableBounds = undefined;
-    const currentGeometry=signature(nodes,area);
-    if (previousGeometry!==undefined && currentGeometry!==previousGeometry && lastSwipeDirection) {
-      progressDirections.add(lastSwipeDirection);triedPaths.clear();attempt.geometryAdvanced=true;
+    const currentGeometry=contentGeometry(nodes,area);
+    if (contentMoved(previousGeometry,currentGeometry) && lastSwipeDirection) {
+      progressDirections.add(lastSwipeDirection);triedPaths[lastSwipeDirection].clear();stalledAttempts[lastSwipeDirection]=0;attempt.geometryAdvanced=true;
     } else attempt.geometryAdvanced=false;
     previousGeometry=currentGeometry;
     const box = rect(node);
     if (box && box[3] > box[1]) {
       // Above the viewport needs a downward finger swipe; below needs upward.
       const nextDirection=box[1] < area[1] ? 'earlier' : 'later';
-      if(nextDirection!==direction)triedPaths.clear();direction=nextDirection;
+      direction=nextDirection;
     }
     let candidates=gesturePaths(nodes,area,direction);
     if (!candidates.length) { attempt.decision='wait-no-safe-gesture';await wait(300);continue; }
-    let path=candidates.find(value=>!triedPaths.has(value.join(',')));
-    if(!path) {
+    let path=candidates.find(value=>!triedPaths[direction].has(value.join(',')));
+    if(!box && (stalledAttempts[direction]>=3 || !path)) {
       // No movement at one safe corridor does not prove a scroll boundary.
-      // Try every current interior corridor before changing search direction.
-      if(!box) {
-        if(direction==='later' && progressDirections.has('earlier') && progressDirections.has('later')) {
-          attempt.decision='absent-after-search';throw new Error('Room action is absent after searching the native viewport in both directions');
-        }
-        direction=direction==='earlier'?'later':'earlier';candidates=gesturePaths(nodes,area,direction);
+      // Bound each direction to three ineffective attempts so a large number
+      // of clear gaps cannot consume the whole lookup deadline at one edge.
+      if(direction==='later' && !path && progressDirections.has('earlier') && progressDirections.has('later')) {
+        attempt.decision='absent-after-search';throw new Error('Room action is absent after searching the native viewport in both directions');
       }
-      triedPaths.clear();path=candidates[0];
+      direction=direction==='earlier'?'later':'earlier';stalledAttempts[direction]=0;
+      candidates=gesturePaths(nodes,area,direction);path=candidates.find(value=>!triedPaths[direction].has(value.join(',')));
     }
+    if(!path){triedPaths[direction].clear();path=candidates[0];}
     attempt.direction = direction;
     attempt.decision = 'swipe'; attempt.path = path;
-    triedPaths.add(path.join(','));lastSwipeDirection=direction;
+    triedPaths[direction].add(path.join(','));stalledAttempts[direction]++;lastSwipeDirection=direction;
     await swipe(...path);
     await wait(500);
   } while (now() < deadline);

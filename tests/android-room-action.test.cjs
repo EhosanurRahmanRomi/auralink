@@ -206,6 +206,61 @@ test('ineffective safe swipes stay bounded by the deadline instead of proving an
   assert.ok(clock<=12000 && swipes.length<=24);
 });
 
+test('captured top-boundary content with node-list and flag churn searches later after three ineffective swipes', async () => {
+  // Actual failed run: the stage is clipped below the ordinary viewport at
+  // y1159; connection diagnostics are further down and absent from this tree.
+  const stage={...button('[30,1159][690,1245]'),'resource-id':'stage-video',class:'android.view.View',clickable:'false'};
+  const code={...button('[51,895][669,961]'),'resource-id':'room-code',class:'android.widget.EditText'};
+  let reads=0,clock=0;const swipes=[],trace=[];
+  const found=await findRoomAction(target,{read:async()=>{
+    reads++;
+    const nodes=[view,navBand,{...nav,enabled:String(reads%2===0)},stage,code,
+      {package:packageName,'resource-id':`observer-churn-${reads}`,class:'android.view.View',
+        'visible-to-user':'true',bounds:'[250,700][450,720]'}];
+    if(reads%2===0)nodes.reverse();
+    if(swipes.some(path=>path[3]<path[1]))nodes.push(button('[66,600][655,668]'));
+    return nodes;
+  },swipe:(...path)=>swipes.push(path),wait:async ms=>{clock+=ms;},now:()=>clock,timeout:12000,
+  observe:(nodes,node,attempt)=>trace.push(attempt)});
+  assert.equal(found.bounds,'[66,600][655,668]');assert.equal(swipes.length,4);
+  assert.ok(swipes.slice(0,3).every(path=>path[3]>path[1]));assert.ok(swipes[3][3]<swipes[3][1]);
+  assert.equal(new Set(swipes.slice(0,3).map(path=>path.join(','))).size,3);
+  assert.ok(trace.slice(0,4).every(attempt=>attempt.geometryAdvanced===false));
+});
+
+test('direction changes retain unused safe corridors instead of restarting the same ineffective first paths', async () => {
+  const nodes=capturedHomeReturnGeometry();let clock=0;const swipes=[];
+  await assert.rejects(findRoomAction(target,{read:async()=>nodes,swipe:(...path)=>swipes.push(path),
+    wait:async ms=>{clock+=ms;},now:()=>clock,timeout:5000}),/before the deadline/);
+  assert.ok(swipes.slice(0,3).every(path=>path[3]>path[1]));
+  assert.ok(swipes.slice(3,6).every(path=>path[3]<path[1]));
+  assert.ok(swipes[6][3]>swipes[6][1]);
+  assert.equal(new Set([...swipes.slice(0,3),swipes[6]].map(path=>path.join(','))).size,4);
+});
+
+test('scroll progress requires a common unique app ID with unchanged size and a four-pixel vertical shift', async () => {
+  const anchor={...button('[200,400][500,450]'),'resource-id':'content-anchor',class:'android.view.View',clickable:'false'};
+  const cases=[
+    {name:'actual scroll',later:[{...anchor,bounds:'[200,404][500,454]'}],moved:true},
+    {name:'subpixel-size jitter',later:[{...anchor,bounds:'[200,403][500,453]'}],moved:false},
+    {name:'height change',later:[{...anchor,bounds:'[200,404][500,455]'}],moved:false},
+    {name:'width change',later:[{...anchor,bounds:'[200,404][501,454]'}],moved:false},
+    {name:'different ID',later:[{...anchor,'resource-id':'new-anchor',bounds:'[200,404][500,454]'}],moved:false},
+    {name:'duplicate ID',later:[{...anchor,bounds:'[200,404][500,454]'},{...anchor,class:'android.widget.TextView',bounds:'[200,410][500,460]'}],moved:false},
+    {name:'foreign node',later:[{...anchor,package:'com.android.systemui',bounds:'[200,404][500,454]'}],moved:false},
+    {name:'hidden node',later:[{...anchor,'visible-to-user':'false',bounds:'[200,404][500,454]'}],moved:false},
+    {name:'changed viewport',later:[{...anchor,bounds:'[200,404][500,454]'}],view:{...view,bounds:'[0,140][720,1245]'},moved:false}
+  ];
+  for(const sample of cases) {
+    let reads=0,clock=0;const trace=[];
+    await assert.rejects(findRoomAction(target,{read:async()=>{
+      reads++;return [reads===1?view:sample.view || view,navBand,nav,...(reads===1?[anchor]:sample.later)];
+    },swipe:async()=>{},wait:async ms=>{clock+=ms;},now:()=>clock,timeout:1000,
+    observe:(nodes,node,attempt)=>trace.push(attempt)}),/before the deadline/);
+    assert.equal(trace[1].geometryAdvanced,sample.moved,sample.name);
+  }
+});
+
 test('diagnostic observations report actual blocked, swipe and stability decisions without changing the search', async () => {
   const clickedAncestor={...view,clickable:'true',scrollable:'true'};
   const above=button('[66,-40][655,100]'),onScreen=button('[66,300][655,368]');
