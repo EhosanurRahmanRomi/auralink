@@ -14,7 +14,7 @@ const selfsigned=require('selfsigned');
 const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
-const {findRoomAction}=require('./android-room-action.cjs');
+const {findRoomAction,diagnosticValue}=require('./android-room-action.cjs');
 const {visibleInWebView,createImmersiveTutorialHandler}=require('./android-hierarchy.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
@@ -149,6 +149,13 @@ async function findNativeRoomAction(predicate,timeout=30000,observe) {
   try {
     return await findRoomAction(predicate,{read:roomHierarchy,swipe:(x1,y1,x2,y2)=>adb(['shell','input','swipe',...[x1,y1,x2,y2].map(String),'450']),wait:delay,timeout,observe});
   } catch(error) { throw new Error(`${error.message} during ${phase}`); }
+}
+async function readNativePublicStat(labelText,valuePattern,timeout=30000) {
+  let value;
+  await findNativeRoomAction((node,nodes)=>(node.text || node['content-desc'])===labelText && diagnosticValue(node,nodes,valuePattern)!==null,
+    timeout,(nodes,node)=>{value=node ? diagnosticValue(node,nodes,valuePattern) : null;});
+  assert.ok(value!==null && value!==undefined,'Native diagnostics require a visible label and value in the same stable app snapshot');
+  return value;
 }
 async function keyboardShown() {
   const state=await adb(['shell','dumpsys','input_method']);
@@ -703,10 +710,8 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     publicPhase('confirm native secure-relay route diagnostics');
     await findNativeRoomAction(node=>/Secure relay.*TLS.*WebSocket/.test(node.text || node['content-desc'] || ''));
     publicPhase('read native incoming PCM counter before Home');
-    await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio received');
-    const nativeText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
-    const nativeAudio=/Audio received\s+(\d+) packets/.exec(nativeText);
-    assert.ok(nativeAudio && Number(nativeAudio[1])>5,'Actual Android public relay must decode incoming PCM packets');
+    const nativeAudio=Number((await readNativePublicStat('Audio received',/^\d+ packets$/)).split(' ')[0]);
+    assert.ok(nativeAudio>5,'Actual Android public relay must decode incoming PCM packets');
     publicPhase('close native diagnostics before Home');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
     const processBefore=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
@@ -750,23 +755,19 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     publicPhase('open returned native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-toggle');
     publicPhase('require native incoming PCM advanced across Home and return');
-    await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio received');
-    const returnedAudioText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
-    const returnedAudio=/Audio received\s+(\d+) packets/.exec(returnedAudioText);
-    assert.ok(returnedAudio && Number(returnedAudio[1])>Number(nativeAudio[1]),'Android incoming PCM must advance across Home/return after the reverse sender has stopped');
+    const returnedAudio=Number((await readNativePublicStat('Audio received',/^\d+ packets$/)).split(' ')[0]);
+    assert.ok(returnedAudio>nativeAudio,'Android incoming PCM must advance across Home/return after the reverse sender has stopped');
     publicPhase('require native audio playback processing running after return');
-    await findNativeRoomAction(node=>(node.text || node['content-desc'])==='Audio playback processing');
-    const returnedProcessingText=(await hierarchy()).map(node=>node.text || node['content-desc'] || '').join(' ');
-    const returnedProcessing=/Audio playback processing\s+(running|suspended|interrupted|off)/.exec(returnedProcessingText);
-    assert.equal(returnedProcessing?.[1],'running','Android incoming PCM playback processing must be running after Home/return');
+    const returnedProcessing=await readNativePublicStat('Audio playback processing',/^(running|suspended|interrupted|off)$/);
+    assert.equal(returnedProcessing,'running','Android incoming PCM playback processing must be running after Home/return');
     assert.equal((await relayStats()).row.sentAudioPackets,reversePacketsWhenStopped,'The synthetic reverse sender must remain stopped through the returned Android counter check');
     publicPhase('close returned native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
     const summary={passed:true,coordinator:'Deployed public Worker via native system PKI and Node hostname-verified WSS',route:'Secure relay',directRTCImpossible:true,allDirectClosed:true,
       actualProjection:{width:background.width,height:background.height,decodedFrames:background.frames,changedPixelsDuringHome:true},
-      audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:reversePacketsWhenStopped,actualAndroidPcmPacketsDecoded:Number(returnedAudio[1]),
-        actualAndroidPcmPacketsBeforeHome:Number(nativeAudio[1]),actualAndroidPcmPacketsAfterHomeReturn:Number(returnedAudio[1]),reversePcmDeliveredAcrossHomeReturn:true,
-        reverseSenderStoppedWhileHomeForeground:true,playbackProcessingAfterReturn:returnedProcessing[1],exactHiddenDecoderTimingVerified:false,physicalMicrophoneAndSpeakerVerified:false},
+      audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:reversePacketsWhenStopped,actualAndroidPcmPacketsDecoded:returnedAudio,
+        actualAndroidPcmPacketsBeforeHome:nativeAudio,actualAndroidPcmPacketsAfterHomeReturn:returnedAudio,reversePcmDeliveredAcrossHomeReturn:true,
+        reverseSenderStoppedWhileHomeForeground:true,playbackProcessingAfterReturn:returnedProcessing,exactHiddenDecoderTimingVerified:false,physicalMicrophoneAndSpeakerVerified:false},
       encryptedEnvelopesOnly:wire.encryptedEnvelopesOnly,encryptedSent:wire.sent,encryptedReceived:wire.received,homeMediaAdvanced:true,sameProcessAndRoomOnReturn:true,newCaptureAndControlRemainConsentRequired:true,...(fullscreenProof?{fullscreen:fullscreenProof}:{})};
     assert.equal(wire.encryptedEnvelopesOnly,true);assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>publicErrors),[]);
     checkpoint('nativePublicRelayMedia',summary);

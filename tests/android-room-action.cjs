@@ -42,11 +42,23 @@ function gesturePath(nodes, area, direction) {
 function signature(nodes, area) {
   return nodes.filter(node => fits(node, area)).map(node => [node['resource-id'], node.class, node.bounds, node.text, node['content-desc']].join('|')).join('\n');
 }
+function diagnosticValue(label, nodes, valuePattern) {
+  const area = viewport(nodes), labelBounds = rect(label);
+  if (label?.package !== appPackage || !labelBounds || !fits(label,area)) return null;
+  const values = nodes.filter(node => {
+    const box = rect(node), text = node.text || node['content-desc'] || '';
+    const packetCount = /^(\d+) packets$/.exec(text);
+    return node !== label && node.package === appPackage && node.class === 'android.widget.TextView' && fits(node,area) &&
+      box[0] >= labelBounds[2] && Math.abs(box[1] - labelBounds[1]) <= 3 && Math.abs(box[3] - labelBounds[3]) <= 3 &&
+      (!packetCount || Number.isSafeInteger(Number(packetCount[1]))) && valuePattern.test(text);
+  });
+  return values.length === 1 ? values[0].text || values[0]['content-desc'] : null;
+}
 async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, timeout = 30000, observe}) {
   const deadline = now() + timeout;
   let stableBounds, previousViewport, sameViewport = 0, direction = 'earlier', scans = 0, observedViewport = false;
   do {
-    const nodes = await read(); const area = viewport(nodes); const node = nodes.find(value => value.package === appPackage && predicate(value));
+    const nodes = await read(); const area = viewport(nodes); const node = nodes.find(value => value.package === appPackage && predicate(value,nodes));
     observe?.(nodes, node);
     if (now() >= deadline) break;
     // UiAutomation can briefly omit the app while returning only SystemUI.
@@ -84,4 +96,4 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
   throw new Error(observedViewport ? 'Room action did not expose stable fully visible native bounds before the deadline' :
     'Production WebView did not expose a valid observed viewport before the deadline');
 }
-module.exports = {findRoomAction, fits, viewport, gesturePath};
+module.exports = {findRoomAction, fits, viewport, gesturePath, diagnosticValue};

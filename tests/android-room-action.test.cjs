@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {findRoomAction, fits, viewport, gesturePath} = require('./android-room-action.cjs');
+const {findRoomAction, fits, viewport, gesturePath, diagnosticValue} = require('./android-room-action.cjs');
 
 const packageName = 'local.auralink.mobile';
 const view = {class:'android.webkit.WebView',package:packageName,'visible-to-user':'true',bounds:'[0,136][720,1245]'};
@@ -80,5 +80,39 @@ test('an interactive or video-covered viewport never falls back to fabricated ge
     const state=fixture(()=>nodes);
     await assert.rejects(findRoomAction(node=>node['resource-id']==='diagnostics-close',state.options),/before the deadline/);
     assert.deepEqual(state.swipes,[]);
+  }
+});
+
+const statNode = (text,bounds) => ({class:'android.widget.TextView',package:packageName,'visible-to-user':'true',text,bounds});
+test('native diagnostic label and packet value are read from the same final stable app snapshot', async () => {
+  const label = statNode('Audio received','[51,800][225,821]');
+  const packetValue = count=>statNode(`${count} packets`,'[480,800][654,821]');
+  const snapshots = [[view,nav,label,packetValue(417)],[],[view,nav,label,packetValue(419)],[view,nav,label,packetValue(420)]];
+  let reads=0,clock=0,observedValue;const swipes=[];
+  await findRoomAction((node,nodes)=>node.text==='Audio received' && diagnosticValue(node,nodes,/^\d+ packets$/)!==null,
+    {read:async()=>snapshots[reads++],swipe:(...coords)=>swipes.push(coords),wait:async ms=>{clock+=ms;},now:()=>clock,timeout:5000,
+      observe:(nodes,node)=>{observedValue=node ? diagnosticValue(node,nodes,/^\d+ packets$/) : null;}});
+  assert.equal(reads,4);assert.equal(observedValue,'420 packets');assert.deepEqual(swipes,[]);
+});
+
+test('missing, clipped, hidden, malformed, wrong-row or ambiguous stat values cannot prove native packets', () => {
+  const label=statNode('Audio received','[51,800][225,821]'),value=statNode('419 packets','[480,800][654,821]');
+  assert.equal(diagnosticValue(label,[view,nav,label,value],/^\d+ packets$/),'419 packets');
+  for (const nodes of [[],[label,value],[view,nav,label],[view,nav,label,{...value,'visible-to-user':'false'}],
+    [view,nav,label,{...value,package:'com.android.systemui'}],[view,nav,label,{...value,bounds:'[480,800][721,821]'}],
+    [view,nav,label,{...value,bounds:'[480,1120][654,1190]'}],[view,nav,label,{...value,bounds:'[480,830][654,851]'}],
+    [view,nav,label,{...value,bounds:'invalid'}],[view,nav,label,{...value,text:'—'}],
+    [view,nav,label,{...value,text:'9999999999999999999999 packets'}],[view,nav,label,value,{...value}],
+    [view,nav,{...label,'visible-to-user':'false'},value]]) {
+    assert.equal(diagnosticValue(nodes.find(node=>node.text==='Audio received'),nodes,/^\d+ packets$/),null);
+  }
+  assert.equal(diagnosticValue(label,[view,nav,label,statNode('0 packets',value.bounds)],/^\d+ packets$/),'0 packets',
+    'Zero is an actual value; the existing media threshold must reject it');
+});
+
+test('native playback states use a visible same-row value without converting failure states to running', () => {
+  const label=statNode('Audio playback processing','[51,700][330,721]');
+  for(const state of ['running','suspended','interrupted','off']) {
+    assert.equal(diagnosticValue(label,[view,nav,label,statNode(state,'[480,700][654,721]')],/^(running|suspended|interrupted|off)$/),state);
   }
 });
