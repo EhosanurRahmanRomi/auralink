@@ -511,8 +511,8 @@ test('relay microphone diagnostics distinguish capture suspension from blocked i
   transport.localTracks.set('audio', { track: { enabled: true } });
   try {
     await media.syncSource('audio'); const source = media.sources.get('audio');
-    worklet.port.onmessage({ data: { buffer: new Int16Array(2400).buffer, sampleRate: 24000, sampleCount: 2400, meanSquareEnergy: .01 } }); await peer.sendQueue;
-    assert.deepEqual(media.audioDiagnostics('guest'), { captureContextState: 'running', playbackContextState: 'off', sentAudioPackets: 1, capturedAudioPackets: 1, capturedAudioSamples: 2400, capturedAudioEnergy: .01, microphoneLevel: .1 });
+    worklet.port.onmessage({ data: { buffer: new Int16Array(3840).buffer, sampleRate: 48000, channels:2, frames:1920, sampleCount:3840, meanSquareEnergy: .01 } }); await peer.sendQueue;
+    assert.deepEqual(media.audioDiagnostics('guest'), { captureContextState: 'running', playbackContextState: 'off', sentAudioPackets: 1, capturedAudioPackets: 1, capturedAudioSamples:3840, audioCodec:null, capturedAudioEnergy: .01, microphoneLevel: .1 });
     contexts[0].state = 'suspended'; contexts[0].onstatechange();
     assert.equal(events.filter(event => event.type === 'playback-blocked').at(-1).detail.blocked, false, 'A paused outgoing microphone must not be mislabeled as incoming playback');
     assert.equal(events.filter(event => event.type === 'relay-audio-state').at(-1).detail.captureContextState, 'suspended');
@@ -526,6 +526,6 @@ test('an unsupported relay microphone AudioContext is reported instead of reject
   const transport = rtc(); transport.emit = (type, detail) => events.push({ type, detail });
   const media = new RelayMedia(transport, randomBytes(32).toString('base64url')), peer = media.addPeer('guest'); peer.active = true;
   transport.localTracks.set('audio', { track: { enabled: true } });
-  try { await media.syncSource('audio'); assert.equal(media.sources.has('audio'), false); assert.ok(events.some(event => event.type === 'error' && /microphone processing/.test(event.detail.error.message))); }
+  try { await media.syncSource('audio'); assert.equal(media.sources.has('audio'), false); assert.ok(events.some(event => event.type === 'error' && /audio processing/.test(event.detail.error.message))); }
   finally { media.close(); global.AudioContext = original; }
 });

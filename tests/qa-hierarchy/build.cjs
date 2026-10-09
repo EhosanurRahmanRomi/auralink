@@ -37,7 +37,8 @@ for (const file of [androidJar, jdk('java'), jdk('javac'), jdk('jar'), jdk('keyt
 for (const file of [unsigned, aligned, apk, key]) fs.rmSync(file, { force: true });
 try {
   run(path.join(tools, 'aapt2' + extension), ['link', '--manifest', path.join(__dirname, 'AndroidManifest.xml'), '-I', androidJar, '-o', unsigned]);
-  run(jdk('javac'), ['--release', '8', '-encoding', 'UTF-8', '-classpath', androidJar, '-d', classes, path.join(__dirname, 'HierarchyInstrumentation.java')]);
+  run(jdk('javac'), ['--release', '8', '-encoding', 'UTF-8', '-classpath', androidJar, '-d', classes,
+    path.join(__dirname, 'HierarchyInstrumentation.java'), path.join(__dirname, 'AudioToneInstrumentation.java')]);
   const classJar = path.join(output, 'classes.jar');
   run(jdk('jar'), ['--create', '--no-manifest', '--file', classJar, '-C', classes, '.']);
   run(jdk('java'), ['-cp', path.join(tools, 'lib/d8.jar'), 'com.android.tools.r8.D8', '--release', '--min-api', '29', '--lib', androidJar, '--output', dex, classJar]);
@@ -50,6 +51,7 @@ try {
   run(jdk('java'), ['-jar', path.join(tools, 'lib/apksigner.jar'), 'verify', '--verbose', apk]);
   console.log(JSON.stringify({ apk: path.relative(project, apk).replaceAll('\\', '/'), package: 'local.auralink.qa',
     instrumentation: 'local.auralink.qa/.HierarchyInstrumentation', productionApkModified: false,
+    audioInstrumentation: 'local.auralink.qa/.AudioToneInstrumentation',
     sha256: crypto.createHash('sha256').update(fs.readFileSync(apk)).digest('hex') }));
 } finally {
   fs.rmSync(key, { force: true });

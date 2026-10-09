@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 — Device audio and focused screen viewing
+
+- Added independently switchable device audio during sharing, separate from the microphone. Desktop capture uses the selected display's loopback audio; Android uses the owner's active MediaProjection and captures only playback allowed by the source app.
+- Added a 48 kHz stereo mixer and encrypted 192 kbps stereo Opus fallback, with bounded PCM compatibility playback. Disabling either source preserves the other; leaving or stopping a share releases device capture.
+- Added 100–400% cursor-anchored zoom, pan, Fit and phone pinch. Approved remote input maps to the viewed screen through zoom; phone drag is an explicit control mode. Compact zoom controls and fullscreen tools leave more space for the shared content.
+- Moved Android room/WebView ownership outside the Activity, retaining the same live session and projection across window recreation. Foreground services renew bounded wake-lock leases only while that session remains active; process kills and manufacturer battery restrictions remain OS limits.
+- Removed fixed public-room and relay time cutoffs. A healthy host keeps its room open until leaving; host disconnection ends it for everyone. Heartbeat, free byte/message budgets and separate remote-control consent expiry remain enforced.
+- Updated all three packages and source checks for the new native audio classes, twelve renderer assets and macOS audio capture usage description. Release verification distinguishes native/emulator checks from physical-device acceptance.
+
 ## 0.5.0 — Glance-Port presentation update
 
 - Renamed the visible app and release packages to Glance-Port and used the supplied logo for desktop, Android and the interface. Existing application IDs, profiles, invitation scheme and local Android signing identity remain compatible.

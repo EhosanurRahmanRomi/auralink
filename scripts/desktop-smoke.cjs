@@ -70,7 +70,7 @@ async function main(){
     await page.locator('#end-button').click();
     await page.waitForFunction(()=>document.querySelector('#session').hidden);
     assert.equal(errors.length,0,errors.join('\n'));
-    const sourceHashes=Object.fromEntries(['src/main.cjs','src/preload.cjs','src/renderer/app.js','src/renderer/rtc.js','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/internet.js','src/renderer/brand-mark.png','build/icon.png'].map(file=>[file,createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex')]));
+    const sourceHashes=Object.fromEntries(['src/main.cjs','src/preload.cjs','src/renderer/app.js','src/renderer/rtc.js','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/screen-view.js','src/renderer/audio-mixer.js','src/renderer/internet.js','src/renderer/brand-mark.png','build/icon.png'].map(file=>[file,createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex')]));
     fs.writeFileSync(path.join(out,'desktop-smoke.json'),JSON.stringify({passed:true,isolatedUserData:true,cameraDeviceFixture:'Synthetic device; production permission handlers unchanged',checks:['Electron loads isolated renderer and test profile','settings persist within the test profile','real HTTPS room starts','pinned invitation generated','room diagnostics render','native camera capture denied','actual native app-window capture','capture stops','room teardown'],cameraPermission,capture,errors,sourceHashes},null,2));
     console.log('Desktop smoke passed: window, preferences, HTTPS room, invitation, native app-window capture and teardown.');
   }catch(error){

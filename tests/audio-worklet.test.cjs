@@ -29,6 +29,13 @@ test('capture energy resets per packet and includes only finite clipped input sa
   assert.equal(capture.port.messages[0].meanSquareEnergy, 1); assert.equal(capture.port.messages[1].meanSquareEnergy, 0);
   assert.equal(new Int16Array(capture.port.messages[1].buffer).every(sample => sample === 0), true);
 });
+test('40 ms high-quality PCM preserves distinct stereo channels and bounded packet size',()=>{
+  const Capture=processors(48000).get('auralink-relay-capture');const capture=new Capture({processorOptions:{channels:2,frameMillis:40}});
+  const left=new Float32Array(1920).fill(.25),right=new Float32Array(1920).fill(-.5);capture.process([[left,right]],[]);
+  const message=capture.port.messages[0];assert.equal(message.channels,2);assert.equal(message.frames,1920);assert.equal(message.buffer.byteLength,7680);assert.equal(message.meanSquareEnergy,.15625);
+  const samples=new Int16Array(message.buffer);assert.equal(samples[0],8192);assert.equal(samples[1],-16383);assert.equal(samples[3839],-16383);
+  const Playback=processors(48000).get('auralink-relay-playback');const playback=new Playback();playback.port.onmessage({data:{buffer:message.buffer,channels:2}});const outLeft=new Float32Array(1920),outRight=new Float32Array(1920);playback.process([],[[outLeft,outRight]]);assert.equal(outLeft[0],.25);assert.equal(outRight[0],-16383/32768);assert.equal(playback.queue.length,0);
+});
 
 test('invalid PCM cannot terminate the output processor or prevent the next valid packet', () => {
   const Playback = processors().get('auralink-relay-playback'); const playback = new Playback();

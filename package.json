@@ -1,6 +1,6 @@
 {
   "name": "glance-port",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "One-click screen sharing and attended remote control",
   "private": true,
   "main": "src/main.cjs",
@@ -91,7 +91,8 @@
         "NSCameraUsageDescription": null,
         "NSMicrophoneUsageDescription": "Use your microphone only when you enable audio in a room.",
         "NSScreenCaptureUsageDescription": "Share a screen you select with the people joining your invitation room.",
-        "NSLocalNetworkUsageDescription": "Connect directly to devices you invite for private calls, screen sharing and attended remote assistance."
+        "NSLocalNetworkUsageDescription": "Connect directly to devices you invite for private calls, screen sharing and attended remote assistance.",
+        "NSAudioCaptureUsageDescription": "Share audio playing on this Mac only when you turn Device audio on during screen sharing."
       },
       "identity": "-",
       "hardenedRuntime": true,

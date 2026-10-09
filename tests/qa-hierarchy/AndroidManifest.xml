@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="local.auralink.qa" android:versionCode="1" android:versionName="1.0">
   <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
   <!-- Debuggable only so adb run-as can read this isolated QA package's private output. -->
-  <application android:label="Auralink hierarchy QA" android:debuggable="true" android:allowBackup="false" android:usesCleartextTraffic="false" />
+  <application android:label="Glance-Port isolated QA" android:debuggable="true" android:allowBackup="false" android:usesCleartextTraffic="false" android:allowAudioPlaybackCapture="true" />
   <instrumentation android:name=".HierarchyInstrumentation" android:targetPackage="local.auralink.qa" android:label="Non-suppressing hierarchy observer" android:functionalTest="true" />
+  <instrumentation android:name=".AudioToneInstrumentation" android:targetPackage="local.auralink.qa" android:label="Finite external stereo playback fixture" android:functionalTest="true" />
 </manifest>

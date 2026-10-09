@@ -14,6 +14,12 @@ function peerEntry(id, sender) {
   return { info: { id }, senders: new Map([['audio', sender]]), remoteTracks: new Map(), inactiveRemoteTracks: new Map(),
     pc: { connectionState: 'connected', close() { this.connectionState = 'closed'; } } };
 }
+test('Opus SDP preserves stereo high-fidelity receive without altering screen codecs or duplicating audio parameters', async () => {
+  const {stereoAudioDescription}=await moduleReady;
+  const original={type:'offer',sdp:'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0;maxaveragebitrate=64000\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n'};
+  const updated=stereoAudioDescription(original);assert.equal(updated.type,'offer');assert.match(updated.sdp,/minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=192000/);assert.equal(updated.sdp.split('m=video')[1],original.sdp.split('m=video')[1]);assert.equal(stereoAudioDescription(updated).sdp,updated.sdp);assert.match(original.sdp,/stereo=0/);
+  assert.match(stereoAudioDescription({type:'answer',sdp:'m=audio 9 RTP/AVP 111\na=rtpmap:111 opus/48000/2\n'}).sdp,/a=fmtp:111 stereo=1;sprop-stereo=1;maxaveragebitrate=192000\n/);
+});
 
 test('a capture permission completing after room teardown cannot leak its track', async () => {
   const { RoomRTC } = await moduleReady; const rtc = new RoomRTC({ selfId: 'owner', signal() {} });

@@ -1,26 +1,29 @@
 package local.auralink.mobile;
 
 import android.app.Activity;
+import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.os.Build;
+import java.lang.ref.WeakReference;
 
 /** Owns only this call's focus and communication route; restores the previous mode. */
 final class CallAudio {
     interface Listener { void unavailable(String reason); }
-    private final Activity activity;
+    private WeakReference<Activity> activity = new WeakReference<>(null);
     private final AudioManager manager;
     private final AudioFocusRequest focus;
     private final Listener listener;
     private boolean active, focusOwned, speaker = true;
     private boolean previousSpeaker;
     private int previousMode, previousVolumeStream;
+    private boolean volumeOwned;
     private AudioDeviceInfo previousDevice;
     private String failure = "";
-    CallAudio(Activity owner, Listener observer) {
-        activity = owner; listener = observer; manager = (AudioManager)owner.getSystemService(Activity.AUDIO_SERVICE);
+    CallAudio(Context application, Listener observer) {
+        listener = observer; manager = (AudioManager)application.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
         focus = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
             .setWillPauseWhenDucked(true).setOnAudioFocusChangeListener(change -> {
@@ -39,6 +42,29 @@ final class CallAudio {
                 }
             }).build();
     }
+    void attach(Activity next) {
+        Activity previous = activity.get();
+        if (previous != null && previous != next) detach(previous);
+        activity = new WeakReference<>(next);
+        if (active) claimVolumeStream();
+    }
+    void detach(Activity previous) {
+        if (activity.get() != previous) return;
+        restoreVolumeStream(); activity.clear();
+    }
+    private void claimVolumeStream() {
+        Activity attached = activity.get();
+        if (attached == null || attached.isDestroyed()) return;
+        if (!volumeOwned) { previousVolumeStream = attached.getVolumeControlStream(); volumeOwned = true; }
+        attached.setVolumeControlStream(AudioManager.STREAM_VOICE_CALL);
+    }
+    private void restoreVolumeStream() {
+        Activity attached = activity.get();
+        if (volumeOwned && attached != null) {
+            try { attached.setVolumeControlStream(previousVolumeStream); } catch (RuntimeException ignored) { }
+        }
+        volumeOwned = false;
+    }
     String lastError() { return failure; }
     boolean update(boolean nextActive, boolean nextSpeaker) {
         speaker = nextSpeaker;
@@ -47,7 +73,7 @@ final class CallAudio {
         try {
             if (!active || !focusOwned) {
                 if (!active) {
-                    previousMode = manager.getMode(); previousVolumeStream = activity.getVolumeControlStream();
+                    previousMode = manager.getMode();
                     previousSpeaker = manager.isSpeakerphoneOn();
                     previousDevice = Build.VERSION.SDK_INT >= 31 ? manager.getCommunicationDevice() : null;
                 }
@@ -57,7 +83,7 @@ final class CallAudio {
                 active = true; focusOwned = true;
             }
             manager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-            activity.setVolumeControlStream(AudioManager.STREAM_VOICE_CALL);
+            claimVolumeStream();
             if (!route()) { failure = "Android could not select the call speaker. Check the phone audio output and retry."; stop(); return false; }
             return true;
         } catch (RuntimeException denied) {
@@ -99,6 +125,6 @@ final class CallAudio {
         } catch (RuntimeException ignored) { }
         try { manager.abandonAudioFocusRequest(focus); } catch (RuntimeException ignored) { }
         try { if (manager.getMode() == AudioManager.MODE_IN_COMMUNICATION) manager.setMode(previousMode); } catch (RuntimeException ignored) { }
-        activity.setVolumeControlStream(previousVolumeStream); previousDevice = null;
+        restoreVolumeStream(); previousDevice = null;
     }
 }

@@ -156,6 +156,15 @@ export class RelayMedia {
     this.audioContexts = new Set(); this.audioModules = new WeakMap(); this.audioContextRoles = new WeakMap();
     this.hardwarePreferences = new Map();
     this.capabilities = this.codecCapabilities();
+    this.audioCapabilities = this.audioCodecCapabilities();
+  }
+  async audioCodecCapabilities() {
+    if (typeof AudioEncoder !== 'function' || typeof AudioDecoder !== 'function' || typeof AudioData !== 'function' || typeof EncodedAudioChunk !== 'function') return [];
+    try {
+      const encoder = await AudioEncoder.isConfigSupported({codec:'opus', sampleRate:48000, numberOfChannels:2, bitrate:192000});
+      const decoder = await AudioDecoder.isConfigSupported({codec:'opus', sampleRate:48000, numberOfChannels:2});
+      return encoder.supported && decoder.supported ? ['opus'] : [];
+    } catch { return []; }
   }
   async codecCapabilities() {
     if (typeof VideoEncoder !== 'function' || typeof VideoDecoder !== 'function' || typeof VideoFrame !== 'function') return [];
@@ -176,15 +185,15 @@ export class RelayMedia {
   }
   addPeer(id) {
     if (!this.peers.has(id)) this.peers.set(id, { cipher: new RelayCipher(this.key, this.rtc.selfId, id), active: false,
-      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingMetadata: 0, pendingData: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, sentAudioPackets: 0, needsKey: true, videoCodecs: null });
+      sendQueue: Promise.resolve(), receiveQueue: Promise.resolve(), pending: 0, pendingAudio:0, pendingMetadata: 0, pendingData: 0, pendingVideo: 0, outputs: new Map(), sent: 0, received: 0, frames: 0, audioPackets: 0, sentAudioPackets: 0, needsKey: true, videoCodecs: null, audioCodecs:[] });
     return this.peers.get(id);
   }
   activate(id) {
     const peer = this.addPeer(id); if (peer.active || this.closed) return;
     peer.active = true; peer.startedAt = performance.now();
-    void this.capabilities.then(videoCodecs => {
+    void Promise.all([this.capabilities, this.audioCapabilities]).then(([videoCodecs, audioCodecs]) => {
       if (this.closed || this.peers.get(id) !== peer || !peer.active) return;
-      this.send(id, { type: 'hello', videoCodecs });
+      this.send(id, { type: 'hello', videoCodecs, audioCodecs });
       const source = this.sources.get('screen'); if (source) source.forceKey = true;
     });
     this.send(id, { type: 'state', mediaState: this.rtc.mediaState() });
@@ -194,8 +203,8 @@ export class RelayMedia {
   }
   send(id, header, bytes) {
     const peer = this.peers.get(id);
-    const data = header?.type === 'data', metadata = ['hello', 'state', 'keyframe', 'codec-reject'].includes(header?.type);
-    const queue = data ? 'pendingData' : metadata ? 'pendingMetadata' : 'pending';
+    const data = header?.type === 'data', metadata = ['hello', 'state', 'keyframe', 'codec-reject', 'audio-codec-reject'].includes(header?.type);
+    const queue = data ? 'pendingData' : metadata ? 'pendingMetadata' : header?.type === 'audio' ? 'pendingAudio' : 'pending';
     if (this.closed || !peer?.active || (data && peer.dataFailed) || this.rtc.closed || !this.rtc.peers.has(id)) return false;
     if (header?.type === 'state') peer.deferredState = null;
     if (peer[queue] >= (data ? 16 : metadata ? 8 : 3)) {
@@ -274,15 +283,17 @@ export class RelayMedia {
       if (!bytes || this.closed || this.peers.get(id) !== peer || !this.rtc.peers.has(id)) return;
       const item = unpack(bytes); if (!item) return;
       const { header, payload } = item;
-      if (!['hello', 'state', 'video', 'video-chunk', 'keyframe', 'codec-reject', 'audio', 'data'].includes(header?.type)) return;
+      if (!['hello', 'state', 'video', 'video-chunk', 'keyframe', 'codec-reject', 'audio-codec-reject', 'audio', 'data'].includes(header?.type)) return;
       peer.received += bytes.length;
       if (!peer.active) await this.rtc.activateRelay(this.rtc.peers.get(id));
       if (!peer.active || this.closed || this.peers.get(id) !== peer) return;
       if (header.type === 'hello') {
         peer.videoCodecs = Array.isArray(header.videoCodecs) ? header.videoCodecs.filter(codec => CODECS.includes(codec)) : [];
+        peer.audioCodecs = Array.isArray(header.audioCodecs) && header.audioCodecs.includes('opus') ? ['opus'] : [];
         this.requestSourceKey();
       } else if (header.type === 'keyframe') this.requestSourceKey();
       else if (header.type === 'codec-reject' && CODECS.includes(header.codec)) { peer.videoCodecs = (peer.videoCodecs || []).filter(codec => codec !== header.codec); this.requestSourceKey(); }
+      else if (header.type === 'audio-codec-reject' && header.codec === 'opus') peer.audioCodecs = [];
       else if (header.type === 'state') {
         if (!header.mediaState || typeof header.mediaState !== 'object') return;
         this.rtc.applyMediaState(id, header.mediaState);
@@ -308,6 +319,7 @@ export class RelayMedia {
     const source = this.sources.get('audio'), peer = this.peers.get(id);
     return { captureContextState: source?.context?.state || 'off', playbackContextState: peer?.outputs.get('audio')?.context?.state || 'off',
       sentAudioPackets: peer?.sentAudioPackets || 0, capturedAudioPackets: source?.audioPackets || 0, capturedAudioSamples: source?.audioSamples || 0,
+      audioCodec:peer?.outputs.get('audio')?.codec === 'opus' ? 'Opus · 48 kHz stereo' : peer?.outputs.get('audio') ? `${peer.outputs.get('audio').sampleRate / 1000} kHz PCM ${peer.outputs.get('audio').channels === 2 ? 'stereo' : 'mono'}` : null,
       capturedAudioEnergy: source?.audioMeanSquareEnergy ?? null, microphoneLevel: Number.isFinite(source?.audioMeanSquareEnergy) ? Math.sqrt(source.audioMeanSquareEnergy) : null };
   }
   async audioModule(context) {
@@ -428,7 +440,11 @@ export class RelayMedia {
     output.count++; peer.frames++; peer.width = width; peer.height = height; peer.codec = codec.startsWith('avc1') ? 'H.264' : 'VP8'; peer.decodeFailures = 0;
   }
   async audio(id, peer, header, payload) {
-    if (![24000, 48000, 44100].includes(header.sampleRate) || payload.length < 2 || payload.length > 24000 || payload.length % 2) return;
+    const channels = header.channels === undefined ? 1 : header.channels;
+    const codec = header.codec === undefined || header.codec === 'pcm' ? 'pcm' : header.codec;
+    if (![1,2].includes(channels) || ![24000, 48000, 44100].includes(header.sampleRate) || !['pcm','opus'].includes(codec)) return;
+    if (codec === 'pcm' && (payload.length < 2 || payload.length > 24000 || payload.length % (channels * 2))) return;
+    if (codec === 'opus' && (header.sampleRate !== 48000 || channels !== 2 || payload.length < 1 || payload.length > 4096 || !Number.isSafeInteger(header.timestamp) || header.timestamp < 0 || !/^[A-Za-z0-9_-]{16}$/.test(header.stream || '') || (header.description !== undefined && (typeof header.description !== 'string' || header.description.length > 172 || !canonicalBase64(header.description))))) return;
     if (this.rtc.peers.get(id)?.remoteState.audio === false) return;
     let output = peer.outputs.get('audio');
     if (!output) {
@@ -437,10 +453,11 @@ export class RelayMedia {
         context = new AudioContext({ sampleRate: header.sampleRate, latencyHint: 'interactive' }); this.watchAudioContext(context, 'playback');
         await this.audioModule(context);
         if (this.closed || this.peers.get(id) !== peer || !peer.active || !this.rtc.peers.has(id) || this.rtc.peers.get(id)?.remoteState.audio === false) { this.audioContexts.delete(context); await context.close(); return; }
-        const node = new AudioWorkletNode(context, 'auralink-relay-playback', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+        const node = new AudioWorkletNode(context, 'auralink-relay-playback', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [channels] });
         const destination = context.createMediaStreamDestination(); node.connect(destination);
+        destination.channelCount = channels; destination.channelCountMode = 'explicit';
         const track = destination.stream.getAudioTracks()[0];
-        this.output(id, 'audio', track, destination.stream, { context, node, sampleRate: header.sampleRate }); output = peer.outputs.get('audio');
+        this.output(id, 'audio', track, destination.stream, { context, node, sampleRate: header.sampleRate, channels }); output = peer.outputs.get('audio');
         void context.resume().catch(() => {}); this.playbackState();
       } catch (error) {
         this.audioContexts.delete(context); await context?.close().catch(() => {});
@@ -450,9 +467,44 @@ export class RelayMedia {
         throw error;
       }
     }
-    if (!output || output.sampleRate !== header.sampleRate) return;
+    if (!output || output.sampleRate !== header.sampleRate || output.channels !== channels) {
+      if (output) this.removeOutput(id, 'audio'); return;
+    }
+    if (codec === 'opus') {
+      if (output.opusRejected) return;
+      if (typeof AudioDecoder !== 'function' || typeof EncodedAudioChunk !== 'function') { output.opusRejected = true; this.send(id,{type:'audio-codec-reject',codec:'opus'}); return; }
+      if (!output.audioDecoder || output.audioStream !== header.stream) {
+        try { output.audioDecoder?.close(); } catch {}
+        const stream = header.stream;
+        let decoder;
+        try {
+          decoder = new AudioDecoder({output:data => {
+            try {
+              if (this.closed || this.peers.get(id) !== peer || peer.outputs.get('audio') !== output || output.audioDecoder !== decoder || output.audioStream !== stream || this.rtc.peers.get(id)?.remoteState.audio === false || data.numberOfChannels !== 2 || data.sampleRate !== 48000 || data.numberOfFrames < 1 || data.numberOfFrames > 5760) return;
+              const pcm = new Int16Array(data.numberOfFrames * 2);
+              for (let channel=0; channel<2; channel++) {
+                const plane = new Float32Array(data.numberOfFrames); data.copyTo(plane,{planeIndex:channel,format:'f32-planar'});
+                for (let frame=0;frame<plane.length;frame++) pcm[frame*2+channel] = Math.round(Math.max(-1,Math.min(1,Number.isFinite(plane[frame]) ? plane[frame] : 0))*32767);
+              }
+              output.node.port.postMessage({buffer:pcm.buffer,channels:2},[pcm.buffer]); peer.audioPackets++;
+            } finally { data.close(); }
+          }, error:() => {
+            if (this.closed || peer.outputs.get('audio') !== output || output.audioDecoder !== decoder) return;
+            output.opusRejected = true; this.send(id,{type:'audio-codec-reject',codec:'opus'});
+            try { decoder.close(); } catch {} output.audioDecoder = null;
+          }});
+          decoder.configure({codec:'opus',sampleRate:48000,numberOfChannels:2,...(header.description ? {description:unbase64(header.description)} : {})});
+          output.audioDecoder = decoder; output.audioStream = stream;
+        } catch { try { decoder?.close(); } catch {} output.opusRejected = true; this.send(id,{type:'audio-codec-reject',codec:'opus'}); return; }
+      }
+      if (output.audioDecoder.decodeQueueSize >= 4) return;
+      try { output.audioDecoder.decode(new EncodedAudioChunk({type:'key', timestamp:header.timestamp, data:payload})); output.codec = 'opus'; }
+      catch { output.opusRejected = true; this.send(id,{type:'audio-codec-reject',codec:'opus'}); }
+      return;
+    }
+    try { output.audioDecoder?.close(); } catch {} output.audioDecoder = null; output.audioStream = null; output.codec = 'pcm';
     const buffer = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
-    output.node.port.postMessage({ buffer }, [buffer]); peer.audioPackets++;
+    output.node.port.postMessage({ buffer, channels }, [buffer]); peer.audioPackets++;
   }
   async syncSource(kind) {
     const current = this.rtc.localTracks.get(kind); const old = this.sources.get(kind);
@@ -464,23 +516,45 @@ export class RelayMedia {
     if (kind === 'audio') {
       let context;
       try {
-        context = new AudioContext({ sampleRate: 24000, latencyHint: 'interactive' }); source.context = context; this.watchAudioContext(context, 'capture');
+        context = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' }); source.context = context; this.watchAudioContext(context, 'capture');
         await this.audioModule(context); if (!valid()) { await context.close(); return; }
+        if ((await this.audioCapabilities).includes('opus') && valid()) {
+          try {
+            source.audioEncoder = new AudioEncoder({output:(chunk, metadata) => {
+              if (!valid() || !source.opusReady || !current.track.enabled || chunk.byteLength > 4096) return;
+              const description = metadata?.decoderConfig?.description;
+              if (description && description.byteLength <= 128) source.audioDescription = base64(new Uint8Array(description));
+              const bytes = new Uint8Array(chunk.byteLength); chunk.copyTo(bytes);
+              for (const [id, peer] of this.peers) if (peer.active && peer.audioCodecs.includes('opus')) this.send(id,{type:'audio',codec:'opus',sampleRate:48000,channels:2,timestamp:chunk.timestamp,stream:source.instance,...(source.audioDescription ? {description:source.audioDescription} : {})},bytes);
+            }, error:() => { source.opusReady = false; }});
+            source.audioEncoder.configure({codec:'opus',sampleRate:48000,numberOfChannels:2,bitrate:192000}); source.opusReady = true;
+          } catch { source.opusReady = false; }
+        }
+        if (!valid()) { try { source.audioEncoder?.close(); } catch {} await context.close(); return; }
         source.input = context.createMediaStreamSource(new MediaStream([current.track]));
-        source.node = new AudioWorkletNode(context, 'auralink-relay-capture'); source.input.connect(source.node); source.node.connect(context.destination);
+        source.node = new AudioWorkletNode(context, 'auralink-relay-capture', {channelCount:2,channelCountMode:'explicit',processorOptions:{channels:2,frameMillis:40,float32:true}}); source.input.connect(source.node); source.node.connect(context.destination);
         source.node.port.onmessage = event => {
           if (!valid() || !current.track.enabled || !(event.data?.buffer instanceof ArrayBuffer)) return;
           const bytes = new Uint8Array(event.data.buffer);
-          if (!bytes.length || bytes.length > 24000 || bytes.length % 2 || ![24000, 44100, 48000].includes(event.data.sampleRate)) return;
+          if (!bytes.length || bytes.length > 24000 || bytes.length % 4 || event.data.channels !== 2 || event.data.sampleRate !== 48000) return;
           source.audioPackets = (source.audioPackets || 0) + 1; source.audioSamples = (source.audioSamples || 0) + bytes.length / 2;
           if (Number.isFinite(event.data.meanSquareEnergy) && event.data.meanSquareEnergy >= 0 && event.data.meanSquareEnergy <= 1) source.audioMeanSquareEnergy = event.data.meanSquareEnergy;
-          for (const [id, peer] of this.peers) if (peer.active) this.send(id, { type: 'audio', sampleRate: event.data.sampleRate }, bytes);
+          const opusPeers = [...this.peers.values()].some(peer => peer.active && peer.audioCodecs.includes('opus'));
+          if (source.opusReady && opusPeers && event.data.floats instanceof ArrayBuffer && source.audioEncoder.encodeQueueSize < 4) {
+            let frame;
+            try {
+              source.audioTimestamp = (source.audioTimestamp || 0) + Math.round(event.data.frames * 1000000 / 48000);
+              frame = new AudioData({format:'f32',sampleRate:48000,numberOfFrames:event.data.frames,numberOfChannels:2,timestamp:source.audioTimestamp,data:event.data.floats});
+              source.audioEncoder.encode(frame);
+            } catch { source.opusReady = false; } finally { frame?.close(); }
+          }
+          for (const [id, peer] of this.peers) if (peer.active && (!source.opusReady || !peer.audioCodecs.includes('opus'))) this.send(id, { type: 'audio', codec:'pcm', sampleRate:48000,channels:2 }, bytes);
         };
         void context.resume().catch(() => {}); this.playbackState();
       } catch (error) {
         const wasActive = valid(); this.audioContexts.delete(context); void context?.close().catch(() => {});
         if (this.sources.get(kind) === source) this.stopSource(kind);
-        if (wasActive) this.rtc.emit('error', { error: new Error('Relay microphone processing could not start. Check microphone permission, then turn the microphone off and on again.') });
+        if (wasActive) this.rtc.emit('error', { error: new Error('Relay audio processing could not start. Check sound, then retry your microphone or device audio.') });
       }
       return;
     }
@@ -494,6 +568,7 @@ export class RelayMedia {
     // A recovered reader at the same resolution must get a fresh encoder;
     // otherwise its output would retain the retired generation's validity gate.
     try { source.encoder?.close(); } catch {}
+    try { source.audioEncoder?.close(); } catch {} source.audioEncoder = null;
     source.encoder = null; source.codec = null; source.forceKey = true;
     clearInterval(source.timer); clearInterval(source.captureWatchdog); source.timer = null; source.captureWatchdog = null;
     source.clone?.stop(); source.clone = null; void source.reader?.cancel().catch(() => {}); source.reader = null; source.capture = null;
@@ -717,6 +792,7 @@ export class RelayMedia {
     }
     const output = peer?.outputs.get(kind); if (!output) return;
     peer.outputs.delete(kind); output.track.stop(); void output.writer?.abort().catch(() => {});
+    try { output.audioDecoder?.close(); } catch {} output.audioDecoder = null;
     if (output.node) { output.node.port.postMessage('stop'); output.node.disconnect(); }
     if (output.context) { this.audioContexts.delete(output.context); void output.context.close().catch(() => {}); this.playbackState(); }
     const entry = this.rtc.peers.get(id); if (entry?.remoteTracks.get(kind)?.track === output.track) { entry.remoteTracks.delete(kind); this.rtc.emit('track-removed', { peerId: id, kind }); }

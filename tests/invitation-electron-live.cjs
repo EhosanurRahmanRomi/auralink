@@ -247,7 +247,7 @@ async function main() {
     outputDevice: 'Chromium fake final OS output stream; normal browser audio mixer and clock remain active.',
     productionDefaultProcessingVerified: false, physicalMicrophoneVerified: false, physicalSpeakerVerified: false, generatedOscillatorUsed: false
   };
-  const sourceFiles=['src/main.cjs', 'src/preload.cjs', 'src/core/internet-client.cjs', 'src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js'];
+  const sourceFiles=['src/main.cjs', 'src/preload.cjs', 'src/core/internet-client.cjs', 'src/renderer/app.js', 'src/renderer/rtc.js', 'src/renderer/relay-media.js', 'src/renderer/audio-mixer.js', 'src/renderer/audio-worklet.js', 'src/renderer/screen-view.js'];
   const hashSource=file=>crypto.createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex');
   const sourceHashes=Object.fromEntries(sourceFiles.map(file=>[file,hashSource(file)]));
   const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;

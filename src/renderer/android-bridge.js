@@ -13,6 +13,9 @@
   const mediaErrorListeners = new Set();
   const invitationListeners = new Set();
   const fullscreenListeners = new Set();
+  const systemAudioListeners = new Set();
+  let systemAudioSequence = -1, systemAudioEnabled = false;
+  let systemAudioRequestNumber = 0;
   let screenSequence = -1;
   let screenCaptureId = null;
   let captureRequestNumber = 0;
@@ -23,7 +26,7 @@
   function invoke(method, args = null) {
     return new Promise((resolve, reject) => {
       const requestId = `r${++requestNumber}`;
-      const timeout = ['startScreenShare', 'grantControl'].includes(method) ? 120000 : ['trustInvite', 'trustInternetService'].includes(method) ? 60000 : 15000;
+      const timeout = ['startScreenShare', 'grantControl', 'setSystemAudio'].includes(method) ? 120000 : ['trustInvite', 'trustInternetService'].includes(method) ? 60000 : 15000;
       const timer = setTimeout(() => { requests.delete(requestId); reject(new Error('The Android service did not respond.')); }, timeout);
       requests.set(requestId, { resolve, reject, timer });
       try { native.postMessage(JSON.stringify({ requestId, method, args })); }
@@ -124,6 +127,17 @@
     if (message.event === 'socket') {
       sockets.get(message.socketId)?.nativeEvent(message); return;
     }
+    if (message.event === 'system-audio') {
+      if (!systemAudioEnabled || !screenCaptureId || message.captureId !== screenCaptureId) return;
+      if (message.type === 'chunk') {
+        if (!Number.isSafeInteger(message.seq) || message.seq <= systemAudioSequence || message.sampleRate !== 48000 || message.channels !== 2 || message.frames !== 1920 || typeof message.data !== 'string' || message.data.length !== 10240 || !/^[A-Za-z0-9+/]+$/.test(message.data)) return;
+        systemAudioSequence = message.seq;
+      } else if (message.type === 'stopped') { systemAudioEnabled = false; systemAudioSequence = -1; }
+      else return;
+      try { for (const listener of systemAudioListeners) { try { listener(message); } catch { /* Audio consumers own their graph. */ } } }
+      finally { if (message.type === 'chunk') void invoke('ackSystemAudio', {captureId:message.captureId, seq:message.seq}).catch(() => {}); }
+      return;
+    }
     if (message.event === 'app-invitation') {
       if (typeof message.code !== 'string' || message.code.length > 128 || !/^A1\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/i.test(message.code)) return;
       for (const listener of invitationListeners) { try { listener(message.code); } catch { /* Invitations never change native consent. */ } }
@@ -147,6 +161,7 @@
         screenSequence = message.seq;
         for (const listener of frameListeners) { try { listener(message); } catch { /* Frame consumers have separate lifetimes. */ } }
       } else if (message.type === 'stopped') {
+        systemAudioEnabled = false; systemAudioSequence = -1; systemAudioRequestNumber++;
         screenSequence = -1;
         screenCaptureId = null;
         const capture = { captureId: typeof message.captureId === 'string' ? message.captureId : null };
@@ -155,6 +170,7 @@
       return;
     }
     if (message.event === 'session-stop') {
+      systemAudioEnabled = false; systemAudioSequence = -1; systemAudioRequestNumber++;
       stopped = true;
       screenSequence = -1;
       screenCaptureId = null;
@@ -214,12 +230,26 @@
           if (captureRequest === captureRequestNumber && !stopped) {
             screenSequence = -1;
             screenCaptureId = typeof screen?.captureId === 'string' ? screen.captureId : null;
+            systemAudioEnabled = false; systemAudioSequence = -1; systemAudioRequestNumber++;
           }
           return screen;
         });
       },
       stopScreenShare: (args) => invoke('stopScreenShare', args),
       stopSharing: (args) => invoke('stopScreenShare', args),
+      setSystemAudio: (args) => {
+        if (typeof args?.enabled !== 'boolean' || typeof args.captureId !== 'string' || args.captureId !== screenCaptureId) return Promise.reject(new TypeError('Use the current owner-approved screen share for device audio.'));
+        const operation = ++systemAudioRequestNumber;
+        systemAudioEnabled = args.enabled; systemAudioSequence = -1;
+        return invoke('setSystemAudio', args).then(result => {
+          if (result?.ok !== true) throw new Error(String(result?.reason || 'Android declined device audio capture.'));
+          return result;
+        }).catch(error => { if (operation === systemAudioRequestNumber && args.captureId === screenCaptureId) systemAudioEnabled = false; throw error; });
+      },
+      onSystemAudio: (listener) => {
+        if (typeof listener !== 'function') return () => {};
+        systemAudioListeners.add(listener); return () => systemAudioListeners.delete(listener);
+      },
       ackScreenFrame: (args) => invoke('ackScreenFrame', args),
       grantControl: (args) => invoke('grantControl', args),
       revokeControl: () => invoke('revokeControl'),

@@ -815,6 +815,139 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     assert.equal((await relayStats()).row.sentAudioPackets,reversePacketsWhenStopped,'The synthetic reverse sender must remain stopped through the returned Android counter check');
     publicPhase('close returned native connection diagnostics');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
+    publicPhase('Android configuration recreates the Activity while the same public share continues');
+    const lifecycleCounts=async()=>{
+      const events=await adb(['logcat','-b','events','-d','-v','brief','wm_on_create_called:I','wm_on_destroy_called:I','wm_relaunch_resume_activity:I','wm_relaunch_activity:I','*:S']);
+      const owned=events.split('\n').filter(line=>line.includes('local.auralink.mobile') && line.includes('MainActivity'));
+      return {created:owned.filter(line=>/\bwm_on_create_called\b/.test(line)).length,
+        destroyed:owned.filter(line=>/\bwm_on_destroy_called\b/.test(line)).length,
+        relaunched:owned.filter(line=>/\bwm_relaunch(?:_resume)?_activity\b/.test(line)).length};
+    };
+    const originalFontScale=(await adb(['shell','settings','get','system','font_scale'])).trim();
+    const nextFontScale=Number(originalFontScale)===1.1?'1.2':'1.1';
+    const lifecycleBefore=await lifecycleCounts(),recreateBefore=await relayStats(),screenBefore=await page.evaluate(()=>publicScreenSnapshot());
+    assert.ok(lifecycleBefore.created>0,'The isolated emulator must expose the actual app Activity creation callback');
+    assert.ok(screenBefore?.nonBlank && screenBefore.trackId);
+    let lifecycleAfter,recreateAfter,screenAfter;
+    try {
+      await adb(['shell','settings','put','system','font_scale',nextFontScale]);
+      const recreationDeadline=Date.now()+30000;
+      do {
+        lifecycleAfter=await lifecycleCounts();recreateAfter=await relayStats();screenAfter=await page.evaluate(()=>publicScreenSnapshot());
+        if(lifecycleAfter.created>lifecycleBefore.created && lifecycleAfter.destroyed>lifecycleBefore.destroyed && lifecycleAfter.relaunched>lifecycleBefore.relaunched)break;
+        await delay(300);
+      } while(Date.now()<recreationDeadline);
+      assert.ok(lifecycleAfter.created>lifecycleBefore.created && lifecycleAfter.destroyed>lifecycleBefore.destroyed && lifecycleAfter.relaunched>lifecycleBefore.relaunched,
+        'The font change must cause real native Activity destruction, creation and WM relaunch');
+      assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
+      await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+      await findNativeRoomAction(label('Turn microphone off'));
+      assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
+      await callServiceTypes(0x10|0x80);
+      await adb(['shell','input','keyevent','24']);
+      const recreatedMediaDeadline=Date.now()+20000;
+      do {
+        recreateAfter=await relayStats();screenAfter=await page.evaluate(()=>publicScreenSnapshot());
+        if(screenAfter?.nonBlank && screenAfter.trackId===screenBefore.trackId && screenAfter.frames>screenBefore.frames && screenAfter.hash!==screenBefore.hash && recreateAfter.row.receivedAudioPackets>recreateBefore.row.receivedAudioPackets)break;
+        await delay(300);
+      } while(Date.now()<recreatedMediaDeadline);
+      assert.ok(screenAfter?.nonBlank && screenAfter.trackId===screenBefore.trackId && screenAfter.frames>screenBefore.frames && screenAfter.hash!==screenBefore.hash,
+        'Actual changing decoded pixels must continue on the same remote screen track through Activity recreation');
+      assert.ok(recreateAfter.row.receivedAudioPackets>recreateBefore.row.receivedAudioPackets,'Phone microphone transport must continue through Activity recreation');
+      checkpoint('sharingActivityRecreation',{passed:true,trigger:'Owner font-scale configuration change',actualCreateAndDestroyCallbacks:true,
+        actualWindowManagerRelaunch:true,sameProcess:true,sameRoom:true,sameScreenTrack:true,projectionRemainedActive:true,changedDecodedPixels:true,microphonePacketsAdvanced:true,
+        productionDebugBridgeUsed:false,physicalPhoneVerified:false});
+    } finally {
+      if(originalFontScale==='null')await adb(['shell','settings','delete','system','font_scale']);
+      else await adb(['shell','settings','put','system','font_scale',originalFontScale]);
+    }
+    if(testedMajor>0 || testedMinor>=6) {
+      publicPhase('turn native microphone off before measuring device audio alone');
+      await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+      await tapRoomAction(label('Turn microphone off'));await findNativeRoomAction(label('Turn microphone on'));
+      await page.waitForFunction(id=>!publicRTC.peers.get(id)?.remoteTracks.has('audio') && !publicRTC.relayMedia.peers.get(id)?.outputs.has('audio'),peerId,{timeout:15000});
+      const deviceProcess=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
+      const productionPackage=(await adb(['shell','cmd','package','list','packages','-U','local.auralink.mobile'])).trim();
+      const productionUID=Number(/package:local\.auralink\.mobile\s+uid:(\d+)/.exec(productionPackage)?.[1]);
+      assert.ok(Number.isSafeInteger(productionUID) && productionUID>0,'The actual production APK UID must be observable');
+      publicPhase('owner enables Android device audio for the current projection');
+      await tapRoomAction(label('Turn device audio on'));await findNativeRoomAction(label('Turn device audio off'));
+      await page.waitForFunction(id=>{
+        const output=publicRTC.relayMedia.peers.get(id)?.outputs.get('audio');
+        return output?.track?.readyState==='live' && output.channels===2 && output.sampleRate===48000;
+      },peerId,{timeout:20000});
+      await page.evaluate(async id=>{
+        const output=publicRTC.relayMedia.peers.get(id).outputs.get('audio');
+        const context=new AudioContext({sampleRate:48000});await context.resume();
+        const source=context.createMediaStreamSource(output.stream),splitter=context.createChannelSplitter(2),silentPull=context.createGain();
+        silentPull.gain.value=0;source.connect(splitter);silentPull.connect(context.destination);
+        const analysers=[0,1].map(channel=>{
+          const analyser=context.createAnalyser();analyser.fftSize=4096;analyser.smoothingTimeConstant=0;
+          splitter.connect(analyser,channel);analyser.connect(silentPull);return analyser;
+        });
+        const values=analysers.map(()=>({peakMeanSquareEnergy:0,observations:0,expectedDominantObservations:0,peakExpectedToOtherRatio:0}));
+        const times=analysers.map(analyser=>new Float32Array(analyser.fftSize)),bins=analysers.map(analyser=>new Float32Array(analyser.frequencyBinCount));
+        const power=(spectrum,frequency)=>{
+          const center=Math.round(frequency*4096/context.sampleRate);let result=0;
+          for(let bin=Math.max(0,center-1);bin<=Math.min(spectrum.length-1,center+1);bin++)result+=10**(spectrum[bin]/10);
+          return result;
+        };
+        const sample=()=>analysers.forEach((analyser,channel)=>{
+          analyser.getFloatTimeDomainData(times[channel]);analyser.getFloatFrequencyData(bins[channel]);
+          const energy=times[channel].reduce((sum,value)=>sum+value*value,0)/times[channel].length;
+          const expected=power(bins[channel],channel===0?440:660),other=power(bins[channel],channel===0?660:440),ratio=expected/Math.max(other,1e-15);
+          const value=values[channel];value.observations++;value.peakMeanSquareEnergy=Math.max(value.peakMeanSquareEnergy,energy);
+          if(energy>1e-5 && ratio>4){value.expectedDominantObservations++;value.peakExpectedToOtherRatio=Math.max(value.peakExpectedToOtherRatio,ratio);}
+        });
+        const started=performance.now();const timer=setInterval(sample,40);
+        window.publicDeviceAudioProbe={finish:async()=>{
+          clearInterval(timer);sample();
+          const summary={sampleRate:context.sampleRate,contextState:context.state,channels:output.channels,codec:output.codec || 'pcm',
+            measuredSeconds:(performance.now()-started)/1000,left:values[0],right:values[1],sameTrack:publicRTC.relayMedia.peers.get(id)?.outputs.get('audio')?.track===output.track};
+          source.disconnect();splitter.disconnect();analysers.forEach(analyser=>analyser.disconnect());silentPull.disconnect();await context.close();return summary;
+        }};
+      },peerId);
+      publicPhase('play finite external-app 48 kHz stereo fixture through Android playback capture');
+      const nativeTone=await adb(['shell','am','instrument','-w','local.auralink.qa/.AudioToneInstrumentation'],{timeout:20000});
+      assert.ok(!/INSTRUMENTATION_FAILED|shortMsg=/.test(nativeTone),'The separate external playback fixture must run successfully');
+      const toneMarkers=Object.fromEntries([...nativeTone.matchAll(/^INSTRUMENTATION_RESULT:\s+(tone_[a-z_]+)=(.*)$/gm)].map(([,key,value])=>[key,value.trim()]));
+      assert.equal(toneMarkers.tone_passed,'true');assert.equal(toneMarkers.tone_sample_rate,'48000');assert.equal(toneMarkers.tone_channels,'2');
+      assert.equal(toneMarkers.tone_frames,'192000');assert.ok(Number(toneMarkers.tone_played_frames)>=192000);
+      assert.ok(Number(toneMarkers.tone_elapsed_ms)>=3000 && Number(toneMarkers.tone_elapsed_ms)<=6000);
+      assert.equal(toneMarkers.tone_frequencies_hz,'440,660');assert.equal(toneMarkers.tone_capture_policy,'allow_capture_by_all');
+      assert.equal(toneMarkers.tone_usage,'media');assert.equal(toneMarkers.tone_package,'local.auralink.qa');
+      assert.ok(Number.isSafeInteger(Number(toneMarkers.tone_uid)) && Number(toneMarkers.tone_uid)>0 && Number(toneMarkers.tone_uid)!==productionUID,
+        'Device audio must come from a different app UID, not the excluded Glance-Port app or its microphone');
+      await delay(300);
+      const decodedDeviceAudio=await page.evaluate(async()=>{const probe=publicDeviceAudioProbe;window.publicDeviceAudioProbe=null;return probe.finish();});
+      runtimeDiagnostics.nativeDeviceAudio={externalPlaybackCompleted:true,decoded:decodedDeviceAudio};
+      assert.equal(decodedDeviceAudio.sampleRate,48000);assert.equal(decodedDeviceAudio.channels,2);assert.equal(decodedDeviceAudio.contextState,'running');
+      assert.equal(decodedDeviceAudio.sameTrack,true,'The receiver must measure one stable decoded device-audio output');
+      for(const [channel,value] of Object.entries({left:decodedDeviceAudio.left,right:decodedDeviceAudio.right})) {
+        assert.ok(value.peakMeanSquareEnergy>1e-5,`Actual decoded ${channel} device audio must be non-silent`);
+        assert.ok(value.expectedDominantObservations>=5 && value.peakExpectedToOtherRatio>4,
+          `Actual decoded ${channel} device audio must preserve its independent tone channel`);
+      }
+      await findNativeRoomAction(label('Turn microphone on'));
+      assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),deviceProcess);
+      publicPhase('owner turns device audio off without stopping the shared screen');
+      const deviceScreenBefore=await page.evaluate(()=>publicScreenSnapshot());
+      await tapRoomAction(label('Turn device audio off'));await findNativeRoomAction(label('Turn device audio on'));
+      await page.waitForFunction(id=>!publicRTC.peers.get(id)?.remoteTracks.has('audio') && !publicRTC.relayMedia.peers.get(id)?.outputs.has('audio'),peerId,{timeout:15000});
+      const packetsAtAudioStop=(await relayStats()).row.receivedAudioPackets;await delay(500);
+      assert.equal((await relayStats()).row.receivedAudioPackets,packetsAtAudioStop,'Device audio off must stop relay audio packets when the microphone is off');
+      await adb(['shell','input','keyevent','24']);
+      await page.waitForFunction(before=>{
+        const after=publicScreenSnapshot();return after?.nonBlank && after.trackId===before.trackId && after.frames>before.frames && after.hash!==before.hash;
+      },deviceScreenBefore,{timeout:20000});
+      assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
+      checkpoint('nativeDeviceAudio',{passed:true,microphoneOff:true,externalAppUIDDiffers:true,actualAndroidPlaybackCapture:true,
+        fixture:{sampleRate:48000,channels:2,frames:192000,frequencyHz:[440,660],playbackElapsedMs:Number(toneMarkers.tone_elapsed_ms),usage:'media',capturePolicy:'allow_capture_by_all'},
+        decoded:decodedDeviceAudio,independentStereoChannelsVerified:true,deviceAudioOffStopsPackets:true,sameScreenTrackContinues:true,
+        protectedAppCaptureVerified:false,physicalSpeakerVerified:false,physicalMicrophoneVerified:false,productionApkModified:false});
+      publicPhase('restore owner microphone for normal public room teardown');
+      await tapRoomAction(label('Turn microphone on'));await findNativeRoomAction(label('Turn microphone off'));
+    }
     const summary={passed:true,coordinator:'Deployed public Worker via native system PKI and Node hostname-verified WSS',route:'Secure relay',directRTCImpossible:true,allDirectClosed:true,
       actualProjection:{width:background.width,height:background.height,decodedFrames:background.frames,changedPixelsDuringHome:true},
       audio:{phoneMicrophonePcmPacketsReceived:background.row.receivedAudioPackets,syntheticReversePcmPacketsSent:reversePacketsWhenStopped,actualAndroidPcmPacketsDecoded:returnedAudio,
@@ -838,7 +971,7 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     clearInterval(heartbeat);
     active=false;socket.removeAllListeners('message');await chain.catch(()=>{});
     for(const pending of waiters)clearTimeout(pending.timer);
-    if(page) {await page.evaluate(async()=>{publicRTC?.close();publicTone?.stop();await publicToneContext?.close();}).catch(()=>{});await page.close().catch(()=>{});}
+    if(page) {await page.evaluate(async()=>{await window.publicDeviceAudioProbe?.finish();window.publicDeviceAudioProbe=null;publicRTC?.close();publicTone?.stop();await publicToneContext?.close();}).catch(()=>{});await page.close().catch(()=>{});}
     if(socket.readyState===WebSocket.OPEN)send({type:'leave'});socket.close();
   }
 }

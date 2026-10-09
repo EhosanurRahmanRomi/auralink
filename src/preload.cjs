@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('auralink', {
   },
   sources: () => invoke('sources'),
   chooseScreen: id => invoke('choose-screen', id),
+  prepareSystemAudio: () => invoke('prepare-system-audio'),
+  cancelSystemAudio: token => invoke('cancel-system-audio', token),
   grantControl: args => invoke('grant-control', args),
   revokeControl: () => invoke('revoke-control'),
   stopSharing: () => invoke('stop-sharing'),

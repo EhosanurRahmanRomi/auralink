@@ -77,7 +77,8 @@ async function connectHost() {
   return () => requests;
 }
 async function sourcePolicies() {
-  const activity = await fs.readFile(path.join(packageDir, 'MainActivity.java'), 'utf8');
+  const activity = await fs.readFile(path.join(packageDir, 'AndroidRoomSession.java'), 'utf8');
+  const window = await fs.readFile(path.join(packageDir, 'MainActivity.java'), 'utf8');
   const projection = await fs.readFile(path.join(packageDir, 'ScreenShareService.java'), 'utf8');
   const callService = await fs.readFile(path.join(packageDir, 'CallSessionService.java'), 'utf8');
   const control = await fs.readFile(path.join(packageDir, 'AttendedAccessibilityService.java'), 'utf8');
@@ -103,7 +104,11 @@ async function sourcePolicies() {
   const pauseDispatch = activity.slice(activity.indexOf('private void dispatch(String value)'), activity.indexOf('String id = "";', activity.indexOf('private void dispatch(String value)')));
   assert.match(pauseDispatch, /if\s*\(ownPermissionPause\(\)\s*\|\|\s*projectionSession\(\)\s*\|\|\s*callSession\(\)\)/, 'Paused native dispatch requires an owned permission prompt or explicit active foreground session');
   const backgroundMethods = [...pauseDispatch.matchAll(/!"([^"]+)"\.equals\(method\)/g)].map(match => match[1]);
-  assert.deepEqual(backgroundMethods, ['sendSocket', 'closeSocket', 'ackScreenFrame', 'applyInput', 'revokeControl', 'stopScreenShare', 'setAudioRoute'], 'Background bridge is confined to already-scoped transport, media routing, approved input and stop operations');
+  assert.deepEqual(backgroundMethods, ['sendSocket', 'closeSocket', 'ackScreenFrame', 'applyInput', 'revokeControl', 'stopScreenShare', 'setAudioRoute', 'setSystemAudio', 'ackSystemAudio'], 'Background bridge is confined to already-scoped transport, media routing, approved input and stop operations');
+  const systemAudio = activity.slice(activity.indexOf('private void setSystemAudio('), activity.indexOf('private void cancelSystemAudioPermission('));
+  assert.ok(systemAudio.indexOf('if (!enabled)') < systemAudio.indexOf('if (!trustedPage())'), 'Background device audio can only stop; enabling requires the visible local document');
+  assert.match(systemAudio, /capture\.equals\(projectionId\)/, 'Device audio requests are scoped to the current capture ticket');
+  assert.doesNotMatch(systemAudio, /request\.grant|RESOURCE_AUDIO_CAPTURE|getUserMedia/, 'Playback permission does not grant or open a microphone');
   assert.doesNotMatch(pauseDispatch, /"(?:trustInvite|openSocket|copyText)"\.equals\(method\)/, 'Paused native dispatch cannot authorize a new invitation or privileged operation');
   const delivery = activity.slice(activity.indexOf('private void deliver(JSONObject value)'), activity.indexOf('private void reply(String id'));
   assert.match(delivery, /!transportPage\(\)/, 'Native delivery uses the scoped foreground, owned-prompt or projection guard');
@@ -170,16 +175,29 @@ async function sourcePolicies() {
   assert.doesNotMatch(internetTrust, /setHostnameVerifier|setSSLSocketFactory|PinnedTls/, 'Internet HTTPS health verification retains default certificate and hostname checks');
   assert.match(internetTrust, /setInstanceFollowRedirects\(false\)/, 'Internet health cannot silently switch to another authority');
   assert.match(activity, /internetService\s*!=\s*null\s*&&\s*invitation\s*==\s*null\s*&&\s*internetService\.matchesSocket\(address\)/, 'Internet sockets cannot reuse a LAN invitation trust namespace');
-  const stopSession = activity.slice(activity.indexOf('private void stopSession()'), activity.indexOf('@Override protected void onPause()'));
+  const stopSession = activity.slice(activity.indexOf('private void stopSession()'), activity.indexOf('void pause()'));
   assert.match(stopSession, /generation\+\+/, 'Actual session loss invalidates the current session generation');
   assert.match(stopSession, /pausedEvents\.clear\(\)/, 'Actual session loss discards queued native events');
   assert.match(stopSession, /loadUrl\("about:blank"\)/, 'Actual session loss destroys the media document');
-  const idlePause = activity.slice(activity.indexOf('private void pauseIdleSession()'), activity.indexOf('@Override protected void onPause()'));
+  const idlePause = activity.slice(activity.indexOf('private void pauseIdleSession()'), activity.indexOf('void pause()'));
   assert.doesNotMatch(idlePause, /loadUrl|destroy\(/, 'Ordinary backgrounding retains the local document rather than restarting the UI');
   assert.match(idlePause, /closeSocket\(\)/, 'An unadmitted directory or pending connection has no room background privilege');
-  const lifecycle = activity.slice(activity.indexOf('@Override protected void onPause()'), activity.indexOf('@Override protected void onDestroy()'));
+  const lifecycle = activity.slice(activity.indexOf('void pause()'), activity.indexOf('private void dispose('));
   assert.match(lifecycle, /projectionSession\(\)\s*\|\|\s*callSession\(\)/, 'Existing explicit call or screen foreground service survives an Activity pause');
   assert.match(lifecycle, /if\s*\(!localDocument\(\)\)\s*webView\.loadUrl\(PAGE\)/, 'Returning reloads only an absent/untrusted document');
+  assert.match(window, /session\.detach\(this,\s*isFinishing\(\)\)/, 'Activity destruction distinguishes closing from a replacement window');
+  assert.doesNotMatch(window, /new WebView|closeSocket|stopSharing|\.destroy\(\)/, 'A replaceable Activity cannot destroy an admitted media session');
+  assert.match(activity, /super\(application\.getApplicationContext\(\)\)/, 'Native session ownership has an application context');
+  assert.match(activity, /WeakReference<MainActivity>/, 'The process session holds only a weak Activity reference');
+  const detach = activity.slice(activity.indexOf('void detach('), activity.indexOf('void saveState('));
+  assert.match(detach, /activity\.clear\(\);\s*viewContext\.setBaseContext\(getBaseContext\(\)\)/, 'Destroyed Activity is released from the WebView mutable context');
+  assert.match(detach, /if\s*\(finishing\)\s*dispose\(/, 'An explicit Activity close disposes the session');
+  assert.doesNotMatch(detach, /webView\.destroy|loadUrl|closeSocket|revokeControl\(/, 'Window replacement retains the same document, native connection and previously approved control');
+  assert.match(detach, /mediaRequest\.deny\(\)/, 'An Activity replacement cancels pending microphone prompts');
+  assert.match(detach, /clearProjectionRequest\(\)/, 'An Activity replacement cancels pending screen consent instead of restoring it');
+  assert.match(callService, /ownership\.activeMatches\(ticket\)/, 'Wake leases renew only for the current service owner');
+  assert.match(callService, /roomWakeLock\.acquire\(WAKE_LEASE_MS\)/, 'Room wake leases remain bounded while renewing for a live owned session');
+  assert.match(callService, /main\.removeCallbacks\(renewRoomWakeLock\)/, 'Leaving the room cancels pending wake renewal');
   assert.match(callService, /START_NOT_STICKY/, 'Android never silently resumes an ended call');
   assert.match(callService, /End call/, 'The ongoing call notification has an owner stop action');
   assert.match(callService, /id\s*!=\s*null\s*&&\s*id\.equals\(ticket\)/, 'Notification stop is bound to the exact current call');

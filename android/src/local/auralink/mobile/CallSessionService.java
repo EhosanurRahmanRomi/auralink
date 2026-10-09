@@ -9,6 +9,8 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.os.Handler;
+import android.os.Looper;
 
 /** Keeps an explicitly opened remote-device room visible; never restarts a session. */
 public final class CallSessionService extends Service {
@@ -23,6 +25,17 @@ public final class CallSessionService extends Service {
     private int types;
     private boolean running, stopping;
     private PowerManager.WakeLock roomWakeLock;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private static final long WAKE_LEASE_MS = 5L * 60 * 1000;
+    private final Runnable renewRoomWakeLock = new Runnable() {
+        @Override public void run() {
+            if (!running || stopping || !ownership.activeMatches(ticket)) return;
+            try {
+                if (roomWakeLock != null) roomWakeLock.acquire(WAKE_LEASE_MS);
+                main.postDelayed(this, WAKE_LEASE_MS / 2);
+            } catch (RuntimeException denied) { end("Android could not keep the active room awake. Reopen Glance-Port to reconnect."); }
+        }
+    };
 
     static synchronized void prepare(String id, Listener next) { ownership.prepare(id); pendingListener = next; }
     static synchronized void cancelPreparation(String id) { if (ownership.cancelPending(id)) pendingListener = null; }
@@ -75,8 +88,8 @@ public final class CallSessionService extends Service {
             // Keep the admitted connection's CPU available during ordinary app
             // switches. Never hold a lock for an idle page or restart a room.
             roomWakeLock = ((PowerManager)getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, getPackageName() + ":active-room");
-            roomWakeLock.setReferenceCounted(false); roomWakeLock.acquire(65L * 60 * 1000);
-            running = true; listener.started();
+            roomWakeLock.setReferenceCounted(false);
+            running = true; renewRoomWakeLock.run(); if (running && listener != null) listener.started();
         }
         catch (RuntimeException denied) { end("Android could not keep this call active. Return to Glance-Port and reconnect."); }
         return START_NOT_STICKY;
@@ -92,6 +105,7 @@ public final class CallSessionService extends Service {
     }
     private void end(String reason) {
         if (stopping) return; stopping = true; running = false;
+        main.removeCallbacks(renewRoomWakeLock);
         if (roomWakeLock != null) { if (roomWakeLock.isHeld()) roomWakeLock.release(); roomWakeLock = null; }
         cancelPreparation(ticket); ownership.release(ticket);
         Listener previous = listener; listener = null;

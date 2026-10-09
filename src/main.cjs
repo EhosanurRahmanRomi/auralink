@@ -174,7 +174,10 @@ app.whenReady().then(async () => {
           if (!selectedSource || !sources.has(selectedSource.id) || Date.now()-selectedSource.at > 30000) return callback(false);
         } else {
           if (types.some(type => type !== 'audio')) return callback(false);
-          if (!(await requestMedia('microphone')).ok) return callback(false);
+          const deviceCapture = selectedSource?.purpose === 'device-audio' && currentSource?.id === selectedSource.id && Date.now()-selectedSource.at <= 30000;
+          // Playback capture uses its own OS system-audio permission. It must
+          // never trigger the microphone TCC prompt or turn on that sensor.
+          if (!deviceCapture && !(await requestMedia('microphone')).ok) return callback(false);
         }
       }
       callback(trustedContent(contents,details));
@@ -193,8 +196,10 @@ app.whenReady().then(async () => {
       if (!source || captureGeneration !== grantGeneration || captureRoom !== roomOperation || captureContext !== roomContext ||
           (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') ||
           (captureContext === 'internet' && !internetClient?.membership.roomId)) return callback({});
-      currentSource = source;
-      callback({video:source});
+      if (chosen.purpose === 'device-audio') {
+        if (!request.audioRequested || !currentSource || currentSource.id !== chosen.id || !['win32','darwin'].includes(process.platform)) return callback({});
+        callback({video:source, audio:'loopback'});
+      } else { currentSource = source; callback({video:source}); }
     } catch {callback({});}
   });
 
@@ -283,6 +288,15 @@ app.whenReady().then(async () => {
     if(typeof id!=='string'||!sources.has(id)) throw new Error('Select an available screen.');
     selectedSource={id,at:Date.now()}; return {ok:true};
   });
+  handle('prepare-system-audio', () => {
+    if (!['win32','darwin'].includes(process.platform)) throw new Error('Device audio capture is unavailable on this desktop.');
+    if (process.platform === 'darwin' && Number(os.release().split('.')[0]) < 22) throw new Error('Device audio requires macOS 13 or newer.');
+    if (!currentSource || !currentSource.id.startsWith('screen:') || (roomContext === 'internet' && !internetClient?.membership.roomId)) throw new Error('Share a full display before enabling device audio.');
+    sources.set(currentSource.id, currentSource);
+    selectedSource = {id:currentSource.id, at:Date.now(), purpose:'device-audio', token:++sourceOperation};
+    return {ok:true, sourceId:currentSource.id, token:selectedSource.token};
+  });
+  handle('cancel-system-audio', token => { if (selectedSource?.purpose === 'device-audio' && selectedSource.token === token) selectedSource = null; return {ok:true}; });
   handle('grant-control', async args => {
     if(testing) return {ok:false,reason:'Remote input is disabled in automated tests.'};
     if(!adapter.available) return {ok:false,reason:'Native input helper is unavailable on this platform.'};

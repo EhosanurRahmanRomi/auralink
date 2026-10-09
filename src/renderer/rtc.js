@@ -1,4 +1,21 @@
 /* A small WebRTC mesh. No CDN dependencies and no media capture on construction. */
+export function stereoAudioDescription(description) {
+  if (!description || typeof description.sdp !== 'string') return description;
+  // Chromium's default Opus SDP advertises mono receive. Request preservation
+  // of both device/music channels in each direction, within 192 kbit/s.
+  const sdp = description.sdp.split(/(?=^m=)/m).map(block => {
+    if (!block.startsWith('m=audio ')) return block;
+    const payload = block.match(/^a=rtpmap:(\d+) opus\/48000\/2\r?$/m)?.[1]; if (!payload) return block;
+    const pattern = new RegExp(`^a=fmtp:${payload} ([^\\r\\n]*)`, 'm');
+    const existing = block.match(pattern);
+    const parameters = (existing?.[1] || '').split(';').filter(value => value && !/^(stereo|sprop-stereo|maxaveragebitrate)=/i.test(value.trim()));
+    parameters.push('stereo=1','sprop-stereo=1','maxaveragebitrate=192000');
+    if (existing) return block.replace(pattern, `a=fmtp:${payload} ${parameters.join(';')}`);
+    const newline = block.includes('\r\n') ? '\r\n' : '\n';
+    return block.replace(new RegExp(`(^a=rtpmap:${payload} opus/48000/2\\r?\\n)`, 'm'), `$1a=fmtp:${payload} ${parameters.join(';')}${newline}`);
+  }).join('');
+  return {...description,sdp};
+}
 export class RelayBudget {
   constructor({ seconds = 0, bytes = 0 } = {}) {
     this.secondsLimit = Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds, 3600) : 0;
@@ -183,7 +200,7 @@ export class RoomRTC extends EventTarget {
       if (kind && transceiver.mid !== null) midKinds[transceiver.mid] = kind;
     }
     this.send(entry.info.id, {
-      description: entry.pc.localDescription.toJSON(), trackKinds, midKinds,
+      description: stereoAudioDescription(entry.pc.localDescription.toJSON()), trackKinds, midKinds,
       mediaState: this.mediaState(),
     });
   }
@@ -328,6 +345,17 @@ export class RoomRTC extends EventTarget {
     }
     await Promise.all(replacements);
     if (track?.kind === 'video') await this.setVideoLimits();
+    if (track?.kind === 'audio') await this.setAudioLimits();
+  }
+  async setAudioLimits() {
+    for (const entry of this.peers.values()) {
+      if (entry.relayActive) continue;
+      const sender = entry.senders.get('audio'); if (!sender?.track) continue;
+      try {
+        const parameters = sender.getParameters(); if (!parameters.encodings?.length) parameters.encodings = [{}];
+        parameters.encodings[0].maxBitrate = 192000; await sender.setParameters(parameters);
+      } catch { /* SDP still requests stereo where sender tuning is unavailable. */ }
+    }
   }
 
   syncSenders(entry) {
@@ -402,7 +430,7 @@ export class RoomRTC extends EventTarget {
             fps: seconds > 0 ? Math.round((peer.frames - (prev.frames || 0)) / seconds) : null,
             downloadMbps: seconds > 0 ? Math.max(0, (peer.received - prev.received) * 8 / seconds / 1e6) : null,
             uploadMbps: seconds > 0 ? Math.max(0, (peer.sent - prev.sent) * 8 / seconds / 1e6) : null,
-            receivedAudioPackets: peer.audioPackets, audioCodec: 'PCM mono', roundTripMs: null, packetLoss: null,
+            receivedAudioPackets: peer.audioPackets, audioCodec: 'Audio connecting', roundTripMs: null, packetLoss: null,
             captureBackend: screen?.captureBackend || null, capturedFrames: screen?.capturedFrames ?? null, captureError: screen?.captureError || null,
             microphoneState: this.captureState('audio'), ...this.relayMedia.audioDiagnostics?.(peerId) });
           this.previousStats.set(peerId, { now, received: peer.received, sent: peer.sent, frames: peer.frames }); continue;

@@ -10,10 +10,14 @@ async function runCallAudioHarness({ run, javac, java, fixtureDir, packageDir })
   const classes = path.join(directory, 'classes');
   const source = {
     'android/os/Build.java': `package android.os; public final class Build { public static final class VERSION { public static int SDK_INT = 36; } }`,
+    'android/content/Context.java': `package android.content;
+      import android.media.AudioManager;
+      public class Context { public static final String AUDIO_SERVICE="audio"; public AudioManager manager = new AudioManager();
+        public Context getApplicationContext(){return this;} public Object getSystemService(String ignored){return manager;} }`,
     'android/app/Activity.java': `package android.app;
       import android.media.AudioManager;
-      public class Activity { public static final String AUDIO_SERVICE="audio"; public AudioManager manager = new AudioManager();
-        public int volumeStream=3; public Object getSystemService(String ignored) { return manager; }
+      public class Activity extends android.content.Context {
+        public int volumeStream=3; public boolean destroyed; public boolean isDestroyed(){return destroyed;}
         public int getVolumeControlStream() { return volumeStream; } public void setVolumeControlStream(int stream) { volumeStream=stream; } }`,
     'android/media/AudioAttributes.java': `package android.media;
       public class AudioAttributes { public static final int USAGE_VOICE_COMMUNICATION=2,CONTENT_TYPE_SPEECH=1;
@@ -49,31 +53,32 @@ async function runCallAudioHarness({ run, javac, java, fixtureDir, packageDir })
       import android.app.Activity; import android.media.*; import android.os.Build; import java.util.*;
       public class AndroidCallAudioHarness {
         static int checks; static void check(boolean ok,String reason){if(!ok)throw new AssertionError(reason);checks++;}
+        static CallAudio create(Activity owner,CallAudio.Listener listener){CallAudio audio=new CallAudio(owner,listener);audio.attach(owner);return audio;}
         public static void main(String[] args) {
-          Activity idle=new Activity(); CallAudio idleAudio=new CallAudio(idle,null);
+          Activity idle=new Activity(); CallAudio idleAudio=create(idle,null);
           check(idleAudio.resume() && idle.manager.requests==0,"Idle return cannot claim audio focus");
 
           Activity owner=new Activity(); AudioManager manager=owner.manager;
           AudioDeviceInfo previous=new AudioDeviceInfo(22);manager.selected=previous;manager.mode=1;owner.volumeStream=4;
-          CallAudio audio=new CallAudio(owner,null);
+          CallAudio audio=create(owner,null);
           check(audio.update(true,true),"Speaker call starts");
           check(manager.selected.getType()==2 && manager.mode==3 && owner.volumeStream==0,"Requested speaker and call volume route are applied");
           check(audio.update(true,false) && manager.selected.getType()==1,"Earpiece selection chooses the actual earpiece");
           audio.stop();check(manager.selected==previous && manager.mode==1 && owner.volumeStream==4 && manager.abandons==1,"Stop restores prior device mode volume and releases focus");
           audio.stop();check(manager.abandons==1,"Repeated stop is harmless");
 
-          Activity denied=new Activity();denied.manager.focusResult=0;CallAudio deniedAudio=new CallAudio(denied,null);
+          Activity denied=new Activity();denied.manager.focusResult=0;CallAudio deniedAudio=create(denied,null);
           check(!deniedAudio.update(true,true) && denied.manager.mode==0 && denied.manager.routeCalls==0,"Denied focus cannot change the route or audio mode");
           check(deniedAudio.lastError().contains("focus"),"Denied focus has actionable error");
 
-          Activity refused=new Activity();refused.manager.routeAccepted=false;CallAudio refusedAudio=new CallAudio(refused,null);
+          Activity refused=new Activity();refused.manager.routeAccepted=false;CallAudio refusedAudio=create(refused,null);
           check(!refusedAudio.update(true,true),"A refused communication device cannot report success");
           check(refused.manager.abandons==1 && refused.manager.mode==0 && refused.volumeStream==3,"Refused route unwinds owned focus mode and volume");
-          Activity absent=new Activity();absent.manager.devices.clear();CallAudio absentAudio=new CallAudio(absent,null);
+          Activity absent=new Activity();absent.manager.devices.clear();CallAudio absentAudio=create(absent,null);
           check(!absentAudio.update(true,true),"Missing speaker does not silently enable a call");
           check(absentAudio.update(true,false),"A device without an earpiece can use its normal output");absentAudio.stop();
 
-          List<String> notices=new ArrayList<String>();Activity paused=new Activity();CallAudio pausedAudio=new CallAudio(paused,notices::add);
+          List<String> notices=new ArrayList<String>();Activity paused=new Activity();CallAudio pausedAudio=create(paused,notices::add);
           check(pausedAudio.update(true,true),"Focus callback fixture starts");paused.manager.changeFocus(-2);
           int requestCount=paused.manager.requests;check(pausedAudio.resume() && paused.manager.requests==requestCount,"Transient focus loss does not steal another app's focus on return");
           paused.manager.selected=null;paused.manager.mode=0;paused.manager.changeFocus(1);
@@ -82,16 +87,24 @@ async function runCallAudioHarness({ run, javac, java, fixtureDir, packageDir })
           check(notices.size()==1 && paused.manager.abandons==1,"An OEM exception during focus gain is contained and releases focus");
           requestCount=paused.manager.requests;check(pausedAudio.resume() && paused.manager.requests==requestCount,"Failed callback cannot restart audio on return");
 
-          Activity lost=new Activity();CallAudio lostAudio=new CallAudio(lost,notices::add);check(lostAudio.update(true,true),"Permanent focus fixture starts");
+          Activity lost=new Activity();CallAudio lostAudio=create(lost,notices::add);check(lostAudio.update(true,true),"Permanent focus fixture starts");
           lost.manager.changeFocus(-1);requestCount=lost.manager.requests;
           check(lostAudio.resume() && lost.manager.requests==requestCount && notices.size()==1,"Focus handed to WebView cannot terminate capture or steal focus on return");lostAudio.stop();
 
-          Activity brokenRestore=new Activity();CallAudio brokenAudio=new CallAudio(brokenRestore,null);check(brokenAudio.update(true,true),"Restore exception fixture starts");
+          Activity brokenRestore=new Activity();CallAudio brokenAudio=create(brokenRestore,null);check(brokenAudio.update(true,true),"Restore exception fixture starts");
           brokenRestore.manager.throwClear=true;brokenAudio.stop();check(brokenRestore.manager.abandons==1 && brokenRestore.manager.mode==0,"Route restore exception cannot prevent focus and mode cleanup");
 
-          Build.VERSION.SDK_INT=29;Activity legacy=new Activity();legacy.manager.speaker=true;CallAudio legacyAudio=new CallAudio(legacy,null);
+          Build.VERSION.SDK_INT=29;Activity legacy=new Activity();legacy.manager.speaker=true;CallAudio legacyAudio=create(legacy,null);
           check(legacyAudio.update(true,false) && !legacy.manager.speaker,"Legacy earpiece routing is applied");legacyAudio.stop();
           check(legacy.manager.speaker && legacy.manager.mode==0,"Legacy stop restores previous speaker state");
+          Build.VERSION.SDK_INT=36;Activity oldWindow=new Activity();CallAudio retained=create(oldWindow,null);
+          check(retained.update(true,true),"Replacement Activity fixture starts");int focusRequests=oldWindow.manager.requests;
+          retained.detach(oldWindow);oldWindow.destroyed=true;
+          check(oldWindow.volumeStream==3 && oldWindow.manager.mode==3 && oldWindow.manager.abandons==0,"Detaching the destroyed window restores its volume UI without ending room audio");
+          Activity newWindow=new Activity();newWindow.manager=oldWindow.manager;newWindow.volumeStream=6;retained.attach(newWindow);
+          check(newWindow.volumeStream==0 && newWindow.manager.requests==focusRequests,"Replacement window attaches call volume without claiming focus again");
+          retained.stop();check(newWindow.volumeStream==6 && oldWindow.volumeStream==3 && newWindow.manager.abandons==1,"Session stop restores only the live window and releases focus once");
+          for(java.lang.reflect.Field field:CallAudio.class.getDeclaredFields())check(field.getType()!=Activity.class,"CallAudio never strongly stores an Activity");
           System.out.println("Production CallAudio: "+checks+" assertions passed; Android API doubles, no hardware sound claim.");
         }
       }`,

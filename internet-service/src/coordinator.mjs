@@ -8,7 +8,7 @@ export const LIMITS = Object.freeze({ devices: 32, sockets: 64, unauthenticated:
   publicCommandsDaily: 20000, publicRoomCommandsHourly: 2000 });
 export const DIRECT_ICE = Object.freeze([{ urls: 'stun:stun.cloudflare.com:3478' }]);
 export const WEBSOCKET_RELAY_LIMITS = Object.freeze({ maxMessageBytes: 262144, roomBytes: 536870912,
-  roomSeconds: 1800, dailyBytes: 1073741824, dailyMessages: 300000, senderBytesPer5s: 6291456,
+  roomSeconds: 0, dailyBytes: 1073741824, dailyMessages: 300000, senderBytesPer5s: 6291456,
   senderPacketsPer5s: 600, reservationBytes: 2097152, reservationMessages: 256 });
 const encoder = new TextEncoder();
 const SECRET = /^[A-Za-z0-9_-]{32,128}$/;
@@ -179,8 +179,8 @@ export class Coordinator {
       const client = { ...attachment, transport };
       const publicIdentity = client.mode === 'public' && env.PUBLIC_ROOMS === 'true' &&
         /^public-[a-f0-9-]{36}$/.test(client.deviceId || '') && /^[a-f0-9]{64}$/.test(client.sourceHash || '') &&
-        Number.isFinite(client.sessionDeadline) && client.sessionDeadline > this.now() &&
-        client.sessionDeadline <= this.now() + LIMITS.publicSessionMs;
+        Number.isFinite(client.sessionDeadline) && (client.sessionDeadline === 0 ||
+          (client.sessionDeadline > this.now() && client.sessionDeadline <= this.now() + LIMITS.publicSessionMs));
       if ((client.mode === 'public' && (!publicIdentity || restoredPublic >= LIMITS.publicClients)) ||
           (client.deviceId && client.mode !== 'public' && !this.devices.has(client.deviceId))) {
         transport.close(1008, 'Device registration unavailable.'); continue;
@@ -194,8 +194,9 @@ export class Coordinator {
     let publicRooms = 0;
     for (const room of [...this.rooms.values()]) if (room.access === 'invite') {
       if (env.PUBLIC_ROOMS !== 'true' || publicRooms >= LIMITS.publicRooms || !Number.isFinite(room.createdAt) ||
-          !Number.isFinite(room.expiresAt) || room.createdAt > this.now() || room.expiresAt <= this.now() ||
-          room.expiresAt - room.createdAt > LIMITS.publicSessionMs || !/^public-[a-f0-9-]{36}$/.test(room.ownerDeviceId || '')) {
+          !Number.isFinite(room.expiresAt) || room.createdAt > this.now() ||
+          (room.expiresAt !== 0 && (room.expiresAt <= this.now() || room.expiresAt - room.createdAt > LIMITS.publicSessionMs)) ||
+          !/^public-[a-f0-9-]{36}$/.test(room.ownerDeviceId || '')) {
         this.endRoom(room, 'Public room state expired. Create a new room to continue.');
       } else publicRooms++;
     }
@@ -512,7 +513,9 @@ export class Coordinator {
       if (this.env.PUBLIC_ROOMS !== 'true' || [...this.sockets.values()].filter(peer => peer.mode === 'public').length >= LIMITS.publicClients ||
           !this.publicAllowance(client, 'bootstrap')) { this.close(client, 'Public connection limit reached. Try again later.'); return; }
       client.deviceId = `public-${crypto.randomUUID()}`; client.mode = 'public'; client.name = name;
-      client.sessionDeadline = this.now() + LIMITS.publicSessionMs; delete client.authDeadline; this.save(client);
+      // Zero means the authenticated socket has no wall-clock session cutoff.
+      // Heartbeat loss, explicit leave and all capacity/usage quotas still apply.
+      client.sessionDeadline = 0; delete client.authDeadline; this.save(client);
       this.send(client, { type: 'registered', deviceId: client.deviceId, mode: 'public' }); return;
     } else if (message.type === 'pair') {
       if (!validSecret(this.env.PAIRING_KEY) || !validSecret(message.pairingKey) ||
@@ -559,7 +562,7 @@ export class Coordinator {
     const room = { id: crypto.randomUUID(), name: cleanName(message.name) || `${client.name}'s room`,
       ownerDeviceId: client.deviceId, roomKeyHash: await digest(roomKey), hostTokenHash: await digest(hostToken),
       hostId: null, createdAt: this.now(), startDeadline: this.now() + LIMITS.roomStartMs,
-      ...(publicRoom ? { access: 'invite', inviteRevision: 0, blocked: [], expiresAt: Math.min(client.sessionDeadline, this.now() + LIMITS.publicSessionMs) } : {}) };
+      ...(publicRoom ? { access: 'invite', inviteRevision: 0, blocked: [], expiresAt: 0 } : {}) };
     if (!this.current(client) || client.roomRevision !== revision || client.roomId ||
         [...this.rooms.values()].some(item => item.ownerDeviceId === client.deviceId) ||
         this.rooms.size >= LIMITS.rooms || (publicRoom && [...this.rooms.values()].filter(item => item.access === 'invite').length >= LIMITS.publicRooms)) return;
@@ -685,7 +688,7 @@ export class Coordinator {
       if (!value && room.websocketKeyCache) {
         const cache = room.websocketKeyCache;
         if (cache.version !== 1 || cache.provider !== provider || !Number.isFinite(cache.expiresAt) ||
-            cache.expiresAt <= this.now() || cache.expiresAt > this.now() + LIMITS.publicSessionMs) return disabled;
+            (cache.expiresAt !== 0 && (cache.expiresAt <= this.now() || cache.expiresAt > this.now() + LIMITS.publicSessionMs))) return disabled;
         const iv = decodeBytes(cache.iv, 12), cipher = decodeBytes(cache.cipher, 1024);
         if (iv.length !== 12) return disabled;
         const clear = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: encoder.encode(`${room.id}:${provider}`) }, await this.cacheKey(), cipher);
@@ -693,12 +696,14 @@ export class Coordinator {
         if (!keysAre(value, ['key', 'relayExpiresAt']) || !/^[A-Za-z0-9_-]{43}$/.test(value.key || '') ||
             encodeBytes(decodeBytes(value.key, 32)) !== value.key || value.relayExpiresAt !== cache.expiresAt) return disabled;
       } else if (!value) {
-        value = { key: secret(), relayExpiresAt: Math.min(room.expiresAt || Infinity, this.now() + LIMITS.publicSessionMs) };
+        // The encrypted key is bound to this live room via authenticated cache
+        // data; room teardown removes it. Media remains byte/packet limited.
+        value = { key: secret(), relayExpiresAt: 0 };
         const encrypted = await this.encryptIceCache(room, provider, value);
-        if (this.rooms.get(room.id) !== room || value.relayExpiresAt <= this.now()) return disabled;
+        if (this.rooms.get(room.id) !== room || (value.relayExpiresAt !== 0 && value.relayExpiresAt <= this.now())) return disabled;
         room.websocketKeyCache = encrypted; this.store.saveRoom(room);
       }
-      if (this.rooms.get(room.id) !== room || value.relayExpiresAt <= this.now()) return disabled;
+      if (this.rooms.get(room.id) !== room || (value.relayExpiresAt !== 0 && value.relayExpiresAt <= this.now())) return disabled;
       this.mediaKeys.set(room.id, value);
       return { websocketRelayEnabled: true, relayKey: value.key, websocketRelayLimits: { ...WEBSOCKET_RELAY_LIMITS } };
     } catch { return disabled; }
@@ -706,15 +711,16 @@ export class Coordinator {
   mediaAllowance(client, target, room, bytes) {
     const denied = message => { this.send(client, { type: 'error', code: 'websocket-relay-limit', message }); return false; };
     if (this.env.WEBSOCKET_RELAY !== 'true' || !this.mediaBudgetValid || client.websocketRelayEnabled !== true ||
-        target.websocketRelayEnabled !== true || !room.websocketKeyCache || room.websocketKeyCache.expiresAt <= this.now()) {
+        target.websocketRelayEnabled !== true || !room.websocketKeyCache ||
+        (room.websocketKeyCache.expiresAt !== 0 && room.websocketKeyCache.expiresAt <= this.now())) {
       return denied('Encrypted media fallback is unavailable for this room. Create a new room or use a direct connection.');
     }
     const budget = this.mediaBudget, day = new Date(this.now()).toISOString().slice(0, 10);
     if (budget.day !== day) { budget.day = day; budget.bytes = 0; budget.messages = 0; }
     for (const id of Object.keys(budget.rooms)) if (!this.rooms.has(id)) delete budget.rooms[id];
     const usage = budget.rooms[room.id] || { bytes: 0, startAt: this.now() };
-    if (this.now() - usage.startAt >= WEBSOCKET_RELAY_LIMITS.roomSeconds * 1000) {
-      return denied('This room reached its encrypted-media byte or 30-minute limit. Create a new room or use a direct connection.');
+    if (WEBSOCKET_RELAY_LIMITS.roomSeconds > 0 && this.now() - usage.startAt >= WEBSOCKET_RELAY_LIMITS.roomSeconds * 1000) {
+      return denied('This room reached its encrypted-media time limit. Create a new room or use a direct connection.');
     }
     if (!Number.isFinite(client.mediaBurstStart) || this.now() - client.mediaBurstStart >= 5000) { client.mediaBurstStart = this.now(); client.mediaBurstBytes = 0; }
     if (!Number.isSafeInteger(client.mediaBurstBytes) || client.mediaBurstBytes < 0 || client.mediaBurstBytes + bytes > WEBSOCKET_RELAY_LIMITS.senderBytesPer5s) {
@@ -731,7 +737,7 @@ export class Coordinator {
         if (budget.bytes + bytes - byteCredits > WEBSOCKET_RELAY_LIMITS.dailyBytes || reservedMessages + packetCredits < 1) {
           return denied('The free service encrypted-media allowance is exhausted for today. Try a direct connection or return after 00:00 UTC.');
         }
-        return denied('This room reached its encrypted-media byte or 30-minute limit. Create a new room or use a direct connection.');
+        return denied('This room reached its encrypted-media byte allowance. Create a new room or use a direct connection.');
       }
       // Reserve before exposing credits in the durable socket attachment. A
       // failure between these steps wastes credits; it cannot refund or reuse
@@ -752,7 +758,8 @@ export class Coordinator {
       this.mediaBudget.rooms[room.id] && keysAre(lease, ['roomId', 'connectionId', 'peerId', 'day', 'expiresAt', 'bytesRemaining', 'messagesRemaining']) &&
       lease.roomId === room.id && client.roomId === room.id && lease.connectionId === client.connectionId && lease.peerId === client.id &&
       lease.day === new Date(this.now()).toISOString().slice(0, 10) &&
-      Number.isFinite(lease.expiresAt) && lease.expiresAt === room.websocketKeyCache?.expiresAt && lease.expiresAt > this.now() &&
+      Number.isFinite(lease.expiresAt) && lease.expiresAt === room.websocketKeyCache?.expiresAt &&
+      (lease.expiresAt === 0 || lease.expiresAt > this.now()) &&
       Number.isSafeInteger(lease.bytesRemaining) && lease.bytesRemaining >= 0 && lease.bytesRemaining <= WEBSOCKET_RELAY_LIMITS.reservationBytes &&
       Number.isSafeInteger(lease.messagesRemaining) && lease.messagesRemaining >= 0 && lease.messagesRemaining <= WEBSOCKET_RELAY_LIMITS.reservationMessages &&
       this.mediaBudget.bytes >= lease.bytesRemaining && this.mediaBudget.messages >= lease.messagesRemaining &&
@@ -878,7 +885,7 @@ export class Coordinator {
         return direct('The room or relay credential expired.');
       }
       const seconds = Math.min(sessionSeconds, Math.floor((expiry - this.now()) / 1000));
-      const deadline = Math.min(this.now() + seconds * 1000, Number.isFinite(room.expiresAt) ? room.expiresAt : Infinity);
+      const deadline = Math.min(this.now() + seconds * 1000, Number.isFinite(room.expiresAt) && room.expiresAt > 0 ? room.expiresAt : Infinity);
       room.relayDeadline = Math.min(room.relayDeadline || deadline, deadline); this.store.saveRoom(room);
       const config = { iceServers, relayEnabled: true, relaySecondsLimit: Math.max(0, Math.floor((room.relayDeadline - this.now()) / 1000)),
         relayExpiresAt: room.relayDeadline };

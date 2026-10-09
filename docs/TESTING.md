@@ -24,7 +24,7 @@ Put Windows on home Wi-Fi/Ethernet and the Mac on a separate Internet connection
 5. With blocked direct RTC, verify **Secure relay** or a useful failure. Direct success does not establish relay.
 6. Test Wi-Fi change, endpoint quit and capture cancellation. Reconnect/new-room entry must not inherit capture or control.
 
-Free relay budgets are finite. Current WebSocket limits reserve up to 512 MiB of wire media and 30 minutes per room, plus global daily byte/message caps. The timer is an upper bound: two 1080p/1440p feeds at illustrative 3–4.5 Mbps each can exhaust that room budget in roughly 6–9 minutes including base64url expansion, before audio/metadata. One presenter, static content or lower quality can use less. These are estimates, not promised durations. Exhaustion must stop fallback visibly. TURN remains optional/disabled until provider-enforced free quota, disabled overages and genuine expiry are verified.
+Free relay budgets are finite. Current WebSocket limits reserve up to 512 MiB of wire media per room without a fixed time cutoff, plus global daily byte/message caps. The byte allowance is a hard budget: two 1080p/1440p feeds at illustrative 3–4.5 Mbps each can exhaust that room budget in roughly 6–9 minutes including base64url expansion, before audio/metadata. One presenter, static content or lower quality can use less. These are estimates, not promised durations. Exhaustion must stop fallback visibly. TURN remains optional/disabled until provider-enforced free quota, disabled overages and genuine expiry are verified.
 
 Basic JPEG fallback is slower than encoded transport. Judge high-quality fallback by actual codec, resolution and motion; a 4 fps presentation does not satisfy that goal.
 

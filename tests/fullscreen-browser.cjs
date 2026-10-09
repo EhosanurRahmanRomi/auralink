@@ -71,12 +71,64 @@ async function noInputs(owner, action) {
 async function waitInputs(owner, count) {
   await owner.page.waitForFunction(count => fixtureInputs.length >= count, count, { timeout: 5000 }); return inputs(owner);
 }
+
+async function imageLocation(page, x, y) {
+  return page.locator('#stage-video').evaluate((video, point) => {
+    const rect = video.getBoundingClientRect(), scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
+    const width = video.videoWidth * scale, height = video.videoHeight * scale;
+    return { x: (point.x - rect.left - (rect.width - width) / 2) / width, y: (point.y - rect.top - (rect.height - height) / 2) / height };
+  }, { x, y });
+}
+
+async function trustedZoomWheel(page, point, deltaY, controlling) {
+  const client = await page.context().newCDPSession(page);
+  try { await client.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: point.x, y: point.y, deltaX: 0, deltaY, modifiers: controlling ? 2 : 0 }); }
+  finally { await client.detach(); }
+}
+
+async function trustedPinch(page, viewport) {
+  const client = await page.context().newCDPSession(page);
+  const middle = { x: viewport.x + viewport.width / 2, y: viewport.y + viewport.height / 2 };
+  const touches = distance => [{ x: middle.x - distance, y: middle.y, id: 1 }, { x: middle.x + distance, y: middle.y, id: 2 }];
+  try {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: touches(35) });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: touches(65) });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally { await client.detach(); }
+}
+
+async function trustedTouchTap(page, point) {
+  const client = await page.context().newCDPSession(page);
+  try {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: point.x, y: point.y, id: 1 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally { await client.detach(); }
+}
+
+async function trustedTouchDrag(page, from, to) {
+  const client = await page.context().newCDPSession(page);
+  try {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: from.x, y: from.y, id: 1 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: to.x, y: to.y, id: 1 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally { await client.detach(); }
+}
+
+async function trustedSecondFingerRelease(page, viewport) {
+  const client = await page.context().newCDPSession(page), x = viewport.x + viewport.width / 2, y = viewport.y + viewport.height / 2;
+  try {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: x - 35, y, id: 1 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: x - 35, y, id: 1 }, { x: x + 35, y, id: 2 }] });
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally { await client.detach(); }
+}
 async function presentationBounds(page) {
   return page.evaluate(() => {
     const bounds = element => { const { left, top, right, bottom, width, height } = element.getBoundingClientRect(); return { left, top, right, bottom, width, height }; };
     return { viewport: { width: innerWidth, height: innerHeight }, stage: bounds(document.getElementById('stage')),
       video: bounds(document.getElementById('stage-video')), toolbar: bounds(document.getElementById('presentation-toolbar')),
-      buttons: ['presentation-fullscreen-exit', 'presentation-control-button', 'presentation-mic-button', 'presentation-share-button', 'presentation-leave-button'].map(id => {
+      zoom: bounds(document.getElementById('screen-view-controls')), zoomButton: bounds(document.getElementById('screen-zoom-in')),
+      buttons: ['presentation-fullscreen-exit', 'presentation-control-button', 'presentation-mic-button', 'presentation-speaker-button', 'presentation-share-button', 'presentation-system-audio', 'presentation-leave-button'].map(id => {
         const element = document.getElementById(id), rect = bounds(element); return { id, ...rect,
           reachable: element.contains(document.elementFromPoint((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)) };
       }), active: document.body.classList.contains('presentation-mode'), mode: document.getElementById('stage').dataset.presentation,
@@ -87,6 +139,7 @@ function checkBounds(proof) {
   assert.equal(proof.active, true); assert.ok(proof.stage.left <= 1 && proof.stage.top <= 1);
   assert.ok(proof.stage.right >= proof.viewport.width - 1 && proof.stage.bottom >= proof.viewport.height - 1, 'Stage must fill the current viewport');
   assert.ok(proof.video.height > 80 && proof.video.width > 200, 'A useful live screen remains above the controls');
+  assert.ok(proof.video.width >= proof.viewport.width - 1, 'The viewing viewport uses the full available window width');
   assert.ok(proof.video.bottom <= proof.toolbar.top + 1, 'Video must not be hidden behind the presentation controls');
   for (const button of proof.buttons) { assert.ok(button.reachable, `${button.id} must remain reachable`); assert.ok(button.left >= 0 && button.right <= proof.viewport.width + 1); }
   assert.deepEqual(proof.decoded, { width: 1280, height: 720 }); assert.deepEqual(proof.captureCalls, []);
@@ -169,8 +222,28 @@ async function run(browser, mode) {
       proof.resizedLayouts = [];
       for (const viewport of [{ width: 360, height: 640 }, { width: 915, height: 412 }, { width: 412, height: 915 }]) {
         await guest.setViewportSize(viewport); const bounds = await presentationBounds(guest); checkBounds(bounds); proof.resizedLayouts.push(bounds);
+        await guest.screenshot({ path: path.join(output, `fullscreen-compact-${viewport.width}x${viewport.height}.png`) });
       }
     }
+    await guest.screenshot({ path: path.join(output, `fullscreen-compact-${mode}.png`) });
+    phase = 'local zoom before control approval'; console.log(`Fullscreen ${mode}: ${phase}`);
+    assert.equal(await guest.locator('#remote-touch-drag').isDisabled(), true, 'Touch drag requires owner-approved control');
+    await guest.evaluate(() => { window.qaZoomTrack = document.getElementById('stage-video').srcObject.getVideoTracks()[0]; });
+    await noInputs(owner, () => guest.locator('#screen-zoom-in').click());
+    assert.equal(await guest.locator('#screen-zoom-level').textContent(), '125%');
+    await noInputs(owner, () => guest.locator('#screen-zoom-fit').click());
+    const viewBounds = await guest.locator('#screen-viewport').boundingBox();
+    const anchor = { x: viewBounds.x + viewBounds.width * .6, y: viewBounds.y + viewBounds.height / 2 };
+    const anchorBefore = await imageLocation(guest, anchor.x, anchor.y);
+    await noInputs(owner, () => trustedZoomWheel(guest, anchor, -250, false));
+    const anchorAfter = await imageLocation(guest, anchor.x, anchor.y);
+    assert.ok(Math.abs(anchorBefore.x - anchorAfter.x) < .001 && Math.abs(anchorBefore.y - anchorAfter.y) < .001, 'A cursor zoom keeps its remote image pixel under the pointer');
+    await noInputs(owner, () => guest.locator('#screen-zoom-fit').click());
+    await noInputs(owner, () => trustedPinch(guest, viewBounds));
+    assert.ok(Number(await guest.locator('#screen-viewport').getAttribute('data-zoom')) > 160, 'Trusted two-touch pinch increases local screen zoom');
+    await noInputs(owner, () => guest.locator('#screen-zoom-fit').click());
+    assert.equal(await guest.evaluate(() => qaZoomTrack === document.getElementById('stage-video').srcObject.getVideoTracks()[0]), true, 'Zoom and Fit retain the actual decoded remote track');
+    proof.zoomBeforeConsent = { cursorAnchor: { before: anchorBefore, after: anchorAfter }, trustedTwoFingerPinch: true, sameRemoteTrack: true, inputEvents: 0 };
     await noInputs(owner, () => guest.locator('#stage-video').click());
     assert.equal(await guest.locator('#presentation-control-button').getAttribute('aria-label'), 'Request control');
 
@@ -201,6 +274,43 @@ async function run(browser, mode) {
     });
     if (blackBar) await noInputs(owner, () => guest.locator('#stage-video').click({ position: blackBar }));
     proof.pointerCentre = { x: down.x, y: down.y }; proof.letterboxIgnored = Boolean(blackBar);
+
+    phase = 'zoomed control coordinates and local pan'; console.log(`Fullscreen ${mode}: ${phase}`);
+    const approvedBounds = await guest.locator('#screen-viewport').boundingBox();
+    const approvedAnchor = { x: approvedBounds.x + approvedBounds.width * .6, y: approvedBounds.y + approvedBounds.height / 2 };
+    await noInputs(owner, () => trustedZoomWheel(guest, approvedAnchor, -250, true));
+    const expectedLocation = await imageLocation(guest, approvedAnchor.x, approvedAnchor.y);
+    before = (await inputs(owner)).length; await guest.mouse.click(approvedAnchor.x, approvedAnchor.y);
+    events = await waitInputs(owner, before + 3);
+    const zoomDown = events.slice(before).map(packet => packet.data.event).find(event => event.type === 'down');
+    assert.ok(zoomDown && Math.abs(zoomDown.x - expectedLocation.x) < .002 && Math.abs(zoomDown.y - expectedLocation.y) < .002, 'An approved click on the zoomed image maps back to the original remote pixel');
+    before = (await inputs(owner)).length; await trustedTouchTap(guest, approvedAnchor);
+    const touchInput = await waitInputs(owner, before + 3), touchEvents = touchInput.slice(before).map(packet => packet.data.event);
+    assert.deepEqual(touchEvents.map(event => event.type), ['move', 'down', 'up'], 'A single trusted touch tap produces one paired approved click');
+    assert.ok(Math.abs(touchEvents[1].x - expectedLocation.x) < .002 && Math.abs(touchEvents[1].y - expectedLocation.y) < .002);
+    await noInputs(owner, async () => { await guest.locator('#presentation-tools-toggle').click(); await guest.locator('#remote-touch-drag').click(); await guest.locator('#presentation-tools-toggle').click(); });
+    assert.equal(await guest.locator('#remote-touch-drag').getAttribute('aria-pressed'), 'true');
+    const dragEnd = { x: approvedAnchor.x - 30, y: approvedAnchor.y + 20 }, expectedDragEnd = await imageLocation(guest, dragEnd.x, dragEnd.y);
+    before = (await inputs(owner)).length; await trustedTouchDrag(guest, approvedAnchor, dragEnd);
+    const dragged = await waitInputs(owner, before + 4), dragEvents = dragged.slice(before).map(packet => packet.data.event);
+    assert.deepEqual(dragEvents.map(event => event.type), ['move', 'down', 'move', 'up'], 'Explicit Touch drag pairs its approved button and movement');
+    assert.ok(Math.abs(dragEvents.at(-1).x - expectedDragEnd.x) < .002 && Math.abs(dragEvents.at(-1).y - expectedDragEnd.y) < .002);
+    before = (await inputs(owner)).length; await trustedSecondFingerRelease(guest, approvedBounds);
+    const secondFinger = await waitInputs(owner, before + 3), secondEvents = secondFinger.slice(before).map(packet => packet.data.event);
+    assert.deepEqual(secondEvents.map(event => event.type), ['move', 'down', 'up'], 'A second finger releases explicit remote drag before switching to pinch');
+    assert.equal(await guest.locator('#remote-touch-drag').getAttribute('aria-pressed'), 'false');
+    await noInputs(owner, () => guest.locator('#screen-pan').click());
+    await noInputs(owner, async () => {
+      await guest.mouse.move(approvedAnchor.x, approvedAnchor.y); await guest.mouse.down();
+      await guest.mouse.move(approvedAnchor.x - 25, approvedAnchor.y + 25); await guest.mouse.up();
+    });
+    const pannedLocation = await imageLocation(guest, approvedAnchor.x, approvedAnchor.y);
+    assert.ok(Math.abs(pannedLocation.x - expectedLocation.x) > .005, 'Pan changes the local viewport location');
+    await noInputs(owner, () => guest.locator('#screen-pan').click());
+    await noInputs(owner, () => trustedPinch(guest, approvedBounds));
+    await noInputs(owner, () => guest.locator('#screen-zoom-fit').click());
+    assert.equal(await guest.locator('#screen-zoom-level').textContent(), '100%');
+    proof.zoomWithConsent = { inverseCoordinate: { expected: expectedLocation, received: { x: zoomDown.x, y: zoomDown.y } }, trustedTouchTapPaired: true, explicitTouchDragPaired: true, secondFingerReleasesRemoteDrag: true, localPanEmitsNoInput: true, trustedPinchEmitsNoInput: true, fitRestoresWholeScreen: true };
 
     phase = 'Escape releases held input and exits'; console.log(`Fullscreen ${mode}: ${phase}`); await guest.locator('#stage-video').focus(); before = (await inputs(owner)).length;
     await guest.keyboard.down('Shift'); await waitInputs(owner, before + 1); await guest.keyboard.press('Escape');
@@ -251,9 +361,27 @@ async function run(browser, mode) {
 
     phase = 'fullscreen owner revoke'; console.log(`Fullscreen ${mode}: ${phase}`); await guest.locator('#fullscreen-button').click();
     await guest.waitForFunction(() => document.body.classList.contains('presentation-mode'));
+    await noInputs(owner, async () => { await guest.locator('#presentation-tools-toggle').click(); await guest.locator('#remote-touch-drag').click(); await guest.locator('#presentation-tools-toggle').click(); });
+    assert.equal(await guest.locator('#remote-touch-drag').getAttribute('aria-pressed'), 'true');
     owner.send({ type: 'control-revoke', to: request.peerId }); await owner.take('control-revoked');
     await guest.waitForFunction(() => document.getElementById('remote-tools').hidden && document.getElementById('presentation-control-button').getAttribute('aria-label') === 'Request control');
+    assert.equal(await guest.locator('#remote-touch-drag').getAttribute('aria-pressed'), 'false', 'Owner revocation clears Touch drag');
     await noInputs(owner, async () => { await guest.locator('#stage-video').click(); await guest.locator('#stage-video').dispatchEvent('keydown', { code: 'KeyA', key: 'a' }); });
+
+    phase = 'new shared screen resets viewing geometry'; console.log(`Fullscreen ${mode}: ${phase}`);
+    await noInputs(owner, () => guest.locator('#screen-zoom-in').click());
+    assert.equal(await guest.locator('#screen-zoom-level').textContent(), '125%');
+    await owner.page.evaluate(() => rtc.setTrack('screen', null));
+    await guest.waitForFunction(() => document.getElementById('stage-video').hidden && document.getElementById('screen-view-controls').hidden);
+    await owner.page.evaluate(async () => {
+      const canvas = document.createElement('canvas'); canvas.width = 1280; canvas.height = 720;
+      const draw = canvas.getContext('2d'); draw.fillStyle = '#6c3450'; draw.fillRect(0, 0, canvas.width, canvas.height);
+      draw.fillStyle = '#ffe4b2'; draw.font = '32px sans-serif'; draw.fillText('New synthetic sharing session', 50, 150);
+      const stream = canvas.captureStream(12); window.qaReplacementStream = stream; await rtc.setTrack('screen', stream.getVideoTracks()[0], stream);
+    });
+    await guest.waitForFunction(() => !document.getElementById('stage-video').hidden && document.getElementById('stage-video').videoWidth === 1280 && document.getElementById('screen-zoom-level').textContent === '100%');
+    await noInputs(owner, () => guest.locator('#stage-video').click());
+    proof.newSharingSessionResetsFit = true;
     await guest.locator('#presentation-fullscreen-exit').click(); await guest.waitForFunction(() => !document.body.classList.contains('presentation-mode'));
     if (mode === 'electron') await assertEventually(app, false);
 
@@ -265,7 +393,9 @@ async function run(browser, mode) {
     proof.passed = true; proof.verified = ['decoded remote display retained in fullscreen', 'viewport filled with reachable exit and consent controls',
       'viewing and pending request emit no input', 'owner approval works inside fullscreen', 'contained image centre maps to remote centre',
       'Escape releases held modifiers without sending Escape remotely', 'video continues after fullscreen exit', 'owner revoke disables input immediately',
-      'visible exit and leave actions restore the normal room', 'no local screen or microphone capture'];
+      'visible exit and leave actions restore the normal room', 'cursor-anchored zoom and trusted two-finger pinch retain the decoded track',
+      'zoomed approved clicks invert to the original remote pixel', 'local pan and pinch never send remote input', 'Fit restores the whole screen',
+      'ending and restarting a share resets zoom without restoring revoked control', 'no local screen or microphone capture'];
     if (mode === 'electron') proof.verified.push('production native main/preload fullscreen entry and exit', 'native minimized window retains room and video track while actual remote packets and frames advance', 'admitted room owns prevent-app-suspension and leave releases it');
     return proof;
   } catch (error) {

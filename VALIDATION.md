@@ -2,7 +2,17 @@
 
 Tests record specific behavior. They do not certify unrestricted device control, physical media quality, internet reachability or absolute security.
 
-## 0.5.0 Glance-Port fullscreen revision
+## 0.6.0 audio, zoom and Android session revision
+
+The new audio fixture exercises the shipped controls and stereo mixer using declared 440/880 Hz device tones and a separate 200 Hz microphone. It requires device-only capture to make zero microphone calls, independent toggles, stereo separation after actual encrypted 48 kHz/192 kbps Opus decode, honest missing-loopback errors and cleanup of late permissions. Generated tones establish the software path; physical Windows/macOS loopback permissions, protected source apps and audible speakers require device acceptance.
+
+Fullscreen tests require cursor-anchored zoom, inverse remote-coordinate mapping, bounded pan/Fit, trusted two-finger pinch without accidental remote input, explicit touch-drag release on a second finger, and compact reachable controls in portrait and landscape. Native Electron additionally exercises fullscreen/minimize with the same live track and no navigation.
+
+Android ownership tests execute the production routing/session policies against API doubles. The production APK runtime must retain its actual process, room, projection and decoded track across OS-triggered Activity destruction/recreation, and separately capture external eligible playback while the microphone is off. Its separate QA instrumentation supplies tones from another app UID; it does not modify the production APK or enable its debugging. Consult the release report for completed stages. Process termination, Android API29–35 branches, screen-lock rules and physical iQOO battery management remain outside emulator proof.
+
+Coordinator policy and actual workerd/SQLite tests cover multi-hour healthy idle, restored encrypted relay keys and credits, host departure and heartbeat loss. Removing time cutoffs does not relax the 512 MiB room or daily byte/packet budgets, nor the 15-minute remote-control consent lease. Rooms remain host-owned; no fixed inactivity timeout is imposed on a healthy session.
+
+## Historical 0.5.0 Glance-Port fullscreen revision
 
 The renamed app uses the supplied PNG logo and warm plum, rose, coral and gold gradients. Internal application IDs, invitation scheme, preferences key and desktop profile location remain compatible. APK resources preserve the canonical PNG bytes; packaged native and renderer assets are checked against the frozen source. Stable signing identity and profile paths support updates, but fresh package checks do not establish a physical in-place upgrade from 0.4.1.
 
@@ -93,7 +103,7 @@ Mac hosted build checks do not grant the user's TCC permissions or prove physica
 
 - Internet rooms prefer direct WebRTC with STUN, then use compressed encrypted WebSocket relay when direct transport fails. TURN is disabled. HTTPS/WSS blocking, service outages and finite shared budgets can still prevent connections.
 - Desktop presentation targets at most 1440p/30. The measured same-PC compressed tests exceed 15 fps; source capability, decoder, network and congestion can reduce it. Engines without a common video codec use the explicitly labeled 4 fps JPEG compatibility path. Android is included with its separate 1280/1920-pixel long-edge ceiling at up to 12 fps.
-- Voice uses microphone audio. Desktop/phone system playback capture is absent.
+- Microphone and device audio are separate. Device playback depends on OS permissions and source-app capture policies; protected media and call audio remain excluded. Physical system-audio/speaker quality needs acceptance on the actual endpoints.
 - Desktop input follows OS permission boundaries, including the Windows secure/UAC desktop and locked screens. It does not inspect or block ordinary desktop password fields. Android refuses password-field editing and cannot bypass lock screens, protected content or OS permission surfaces.
 - ASCII/host layout limits apply; arbitrary Unicode and complete OS keyboard support are absent.
 - Runtime dependency audit and broader build-tool advisories must be distinguished. No automated downgrade is used without validating its build effects.

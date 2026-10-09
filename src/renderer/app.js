@@ -1,6 +1,8 @@
 import { RoomRTC } from './rtc.js';
 import { InternetDirectory, internetOrigin, internetInvitation, DEFAULT_PUBLIC_ORIGIN, roomInvitation, roomCode } from './internet.js';
 import { createDesktopInternetSocket } from './desktop-internet.js';
+import { CaptureAudioMixer } from './audio-mixer.js';
+import { attachScreenView } from './screen-view.js';
 
 const icons = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/>',
@@ -10,7 +12,8 @@ const icons = {
   mic: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8"/>',
   'mic-off': '<path d="m3 3 18 18M9 9v2a3 3 0 0 0 5 2M9 5a3 3 0 0 1 6 0v5M5 10v2a7 7 0 0 0 12 5m2-7v2m-7 7v3m-4 0h8"/>',
   link: '<path d="m10 13 4-4m-6 7-2 2a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m4 2a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-2 2" transform="translate(1 1) scale(.92)"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>', arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>', minus: '<path d="M5 12h14"/>', arrow: '<path d="M4 12h16m-6-6 6 6-6 6"/>',
+  hand: '<path d="M8 13V6a2 2 0 0 1 4 0v6-8a2 2 0 0 1 4 0v8-5a2 2 0 0 1 4 0v9c0 4-3 6-6 6h-2c-2 0-3-1-4-2l-5-5a2 2 0 0 1 3-3l2 2Z"/>',
   lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4m-4 5v2"/>',
   users: '<circle cx="9" cy="7" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m1-17a3 3 0 0 1 0 6m2 4a5 5 0 0 1 3 5v2"/>',
   'user-plus': '<circle cx="8" cy="7" r="3"/><path d="M2 21v-3a6 6 0 0 1 12 0v3m4-14v8m-4-4h8"/>',
@@ -41,6 +44,7 @@ const state = {
   pendingControl: null, controlTimer: null, grantTimer: null, audioElements: new Map(), speakerPool: [], nativeInfo: null,
   audioContext: null, silentOutput: null, microphoneMonitor: null, microphoneTest: null, speaker: true, phoneScreen: null,
   mediaPending: new Map(), sharingPending: false,
+  systemAudio: null, audioMixer: null, audioSync: Promise.resolve(),
   relayPlaybackBlocked: false, relayCaptureSuspended: false, relayCompatibilityNotified: false,
   leaving: false, epoch: 0, preparing: null, preparingHost: false, preparingInternet: false,
   started: 0, lastMove: 0, seq: 0, pressed: new Set(), pressedButtons: new Set(), lastPoint: { x: .5, y: .5 }, statsTimer: null, durationTimer: null,
@@ -332,11 +336,12 @@ function renderPresentationControls() {
   }
   const toolbar = $('presentation-toolbar'); if (!toolbar) return;
   toolbar.hidden = !presentation.active;
-  for (const [targetId, sourceId] of [['presentation-mic-button', 'mic-button'], ['presentation-share-button', 'share-button']]) {
+  for (const [targetId, sourceId] of [['presentation-mic-button', 'mic-button'], ['presentation-share-button', 'share-button'], ['presentation-system-audio', 'system-audio-button']]) {
     const target = $(targetId), source = $(sourceId); if (!target || !source) continue;
     target.disabled = source.disabled; target.classList.toggle('enabled', source.classList.contains('enabled'));
     target.innerHTML = source.querySelector('[data-icon]').outerHTML + `<span>${source.querySelector('small').textContent}</span>`;
     target.setAttribute('aria-label', source.getAttribute('aria-label')); target.title = source.title;
+    if (source.hasAttribute('aria-pressed')) target.setAttribute('aria-pressed',source.getAttribute('aria-pressed'));
   }
   const control = $('presentation-control-button');
   const controlLabel = state.grant ? 'Stop control' : state.controlling ? 'Release control' : state.pendingControl ? 'Request pending' : 'Request control';
@@ -351,6 +356,7 @@ function renderPresentationControls() {
 }
 function setPresentationLayout(active) {
   releaseKeys(); clearRemoteText();
+  screenView.cancelGesture();
   presentation.active = active; presentation.toolsOpen = false;
   document.body.classList.toggle('presentation-mode', active); $('stage').classList.toggle('presentation-active', active);
   $('stage').dataset.presentation = active ? presentation.native ? 'native' : presentation.browser ? 'browser' : 'expanded' : 'off';
@@ -412,7 +418,7 @@ $('presentation-tools-toggle')?.addEventListener('click', () => {
   releaseKeys(); clearRemoteText(); presentation.toolsOpen = !presentation.toolsOpen;
   renderRemoteTools(); renderPresentationControls();
 });
-for (const [targetId, sourceId] of [['presentation-mic-button', 'mic-button'], ['presentation-share-button', 'share-button'], ['presentation-leave-button', 'end-button']]) {
+for (const [targetId, sourceId] of [['presentation-mic-button', 'mic-button'], ['presentation-share-button', 'share-button'], ['presentation-system-audio', 'system-audio-button'], ['presentation-leave-button', 'end-button']]) {
   $(targetId)?.addEventListener('click', () => { releaseKeys(); clearRemoteText(); $(sourceId).click(); });
 }
 $('presentation-control-button')?.addEventListener('click', () => { releaseKeys(); clearRemoteText(); $(state.grant || state.controlling ? 'stop-control' : 'request-control').click(); });
@@ -459,17 +465,19 @@ function prepareListening() {
   }
   for (const audio of state.audioElements.values()) void playRemoteAudio(audio);
   void state.rtc?.resumePlayback?.().catch(() => {});
+  void state.audioMixer?.context.resume().catch(() => {});
+  void state.systemAudio?.context?.resume().catch(() => {});
 }
 async function updatePhoneAudioRoute() {
-  const ongoing = Boolean(state.joined && (state.local.has('audio') || state.mediaPending.has('audio') || [...state.audioElements.values()].some(audio => audio.srcObject)));
+  const ongoing = Boolean(state.joined && (state.local.has('audio') || state.mediaPending.has('audio') || state.systemAudio || [...state.audioElements.values()].some(audio => audio.srcObject)));
   const playback = Boolean(state.joined && [...state.audioElements.values()].some(audio => audio.srcObject));
   if (bridge?.setAudioRoute) await bridge.setAudioRoute({ active: Boolean(state.joined || state.microphoneTest), ongoing, playback, speaker: state.speaker });
 }
 function updateAudioBanner() {
   const blocked = state.relayCaptureSuspended || state.relayPlaybackBlocked || [...state.audioElements.values()].some(audio => audio.dataset.blocked === 'true');
   $('audio-banner').hidden = !blocked;
-  $('audio-banner-title').textContent = state.relayCaptureSuspended ? 'Microphone processing needs a tap' : 'Room audio needs a tap';
-  $('audio-banner-text').textContent = state.relayCaptureSuspended ? 'Resume audio processing so the other person can hear your microphone.' : 'Enable playback to hear the other participants.';
+  $('audio-banner-title').textContent = state.relayCaptureSuspended ? 'Audio sharing needs a tap' : 'Room audio needs a tap';
+  $('audio-banner-text').textContent = state.relayCaptureSuspended ? 'Resume sound so the other person can hear your microphone or device audio.' : 'Enable playback to hear the other participants.';
   renderPresentationControls();
 }
 async function playRemoteAudio(audio) {
@@ -858,7 +866,7 @@ function bindRTC() {
   const on = (type, listener) => rtc.addEventListener(type, event => { if (state.rtc === rtc && state.epoch === epoch && !state.leaving) void listener(event); });
   on('playback-blocked', ({ detail }) => { state.relayPlaybackBlocked = Boolean(detail.blocked); updateAudioBanner(); });
   on('relay-audio-state', ({ detail }) => {
-    state.relayCaptureSuspended = Boolean(state.local.has('audio') && ['suspended', 'interrupted'].includes(detail.captureContextState));
+    state.relayCaptureSuspended = Boolean((state.local.has('audio') || state.systemAudio) && ['suspended', 'interrupted'].includes(detail.captureContextState));
     updateAudioBanner();
   });
   on('capture-state', ({ detail }) => {
@@ -987,6 +995,7 @@ function renderStage() {
   }
   const controlling = Boolean(state.controlling && state.selected?.peerId === state.controlling.peerId && state.selected.kind === 'screen');
   video.classList.toggle('controlling', controlling); video.tabIndex = controlling ? 0 : -1;
+  screenView.setTrack(item?.track || null);
   renderRemoteTools();
   $('control-hint').hidden = !controlling; updateButtons();
 }
@@ -1039,6 +1048,15 @@ function updateButtons() {
   if (state.mediaPending.has('audio')) $('mic-button').disabled = true;
   if (state.sharingPending) $('share-button').disabled = true;
   if (bridge?.platform === 'android' && !bridge?.startScreenShare) $('share-button').disabled = true;
+  const deviceButton = $('system-audio-button');
+  if (deviceButton) {
+    const available = bridge?.platform === 'android' ? Boolean(bridge.setSystemAudio) : Boolean(bridge?.prepareSystemAudio && state.sourceId?.startsWith('screen:'));
+    deviceButton.disabled = !ready || !state.local.has('screen') || !available || state.mediaPending.has('system-audio') || Boolean(state.sharingPending);
+    deviceButton.classList.toggle('enabled', Boolean(state.systemAudio)); deviceButton.setAttribute('aria-pressed', String(Boolean(state.systemAudio)));
+    deviceButton.querySelector('small').textContent = state.systemAudio ? 'Device audio on' : 'Device audio off';
+    deviceButton.setAttribute('aria-label', state.systemAudio ? 'Turn device audio off' : 'Turn device audio on');
+    deviceButton.title = available ? 'Share device sound separately from your microphone. Some apps block capture.' : 'Share a full display in the Glance-Port app to enable device sound.';
+  }
   for (const [kind, buttonId, onIcon, offIcon, onText, offText] of [
     ['audio', 'mic-button', 'mic', 'mic-off', 'Mic on', 'Mic off'],
     ['screen', 'share-button', 'share', 'share', 'Stop sharing', 'Share screen'],
@@ -1060,6 +1078,78 @@ function updateButtons() {
 }
 
 $('mic-button').addEventListener('click', () => toggleMicrophone());
+function syncCapturedAudio(epoch = state.epoch, rtc = state.rtc) {
+  const task = state.audioSync.catch(() => {}).then(async () => {
+    if (!roomCurrent(epoch, rtc)) return;
+    const mic = state.local.get('audio'); const device = state.systemAudio;
+    if (!device) {
+      const old = state.audioMixer; state.audioMixer = null;
+      await rtc.setTrack('audio', mic?.track || null, mic?.stream);
+      old?.close(); return;
+    }
+    const mixer = state.audioMixer || (state.audioMixer = new CaptureAudioMixer());
+    mixer.context.onstatechange = () => {
+      if (!roomCurrent(epoch, rtc) || state.audioMixer !== mixer) return;
+      state.relayCaptureSuspended = ['suspended','interrupted'].includes(mixer.context.state); updateAudioBanner();
+    };
+    await mixer.setSources(mic?.track, device.track);
+    if (!roomCurrent(epoch, rtc) || state.audioMixer !== mixer) return;
+    await rtc.setTrack('audio', mixer.track, mixer.destination.stream);
+  });
+  state.audioSync = task; return task;
+}
+$('system-audio-button')?.addEventListener('click', () => toggleSystemAudio());
+async function toggleSystemAudio() {
+  if (!state.joined || !state.local.has('screen') || state.mediaPending.has('system-audio')) return;
+  const rtc = state.rtc, epoch = state.epoch, operation = {}; let source = null, permissionToken = null;
+  state.mediaPending.set('system-audio', operation); updateButtons(); prepareListening();
+  try {
+    if (state.systemAudio) { await stopSystemAudio(epoch, rtc); return; }
+    const screen = state.local.get('screen'); const captureId = state.phoneScreen?.captureId;
+    if (bridge?.platform === 'android') {
+      if (!bridge.setSystemAudio || !captureId) throw new Error('This Android build cannot capture device audio. Install the current version.');
+      const context = new AudioContext({ sampleRate:48000, latencyHint:'interactive' });
+      source = { context, captureId, active:true, close() { this.active = false; this.unsubscribe?.(); this.node?.port.postMessage('stop'); this.node?.disconnect(); this.stream?.getTracks().forEach(track => track.stop()); void context.close().catch(() => {}); } };
+      await context.audioWorklet.addModule(new URL('./audio-worklet.js', import.meta.url));
+      if (!roomCurrent(epoch, rtc) || state.local.get('screen') !== screen) { source.close(); return; }
+      const node = new AudioWorkletNode(context, 'auralink-device-audio', { numberOfInputs:0, numberOfOutputs:1, outputChannelCount:[2] });
+      const destination = context.createMediaStreamDestination(); destination.channelCount = 2; destination.channelCountMode = 'explicit'; node.connect(destination);
+      source.node = node; source.stream = destination.stream; source.track = destination.stream.getAudioTracks()[0]; source.track.contentHint = 'music';
+      source.unsubscribe = bridge.onSystemAudio(message => {
+        if (!source.active || message.captureId !== captureId) return;
+        if (message.type === 'stopped') { if (state.systemAudio === source) { void stopSystemAudio(epoch, rtc); toast(message.reason || 'Android stopped device audio.', true); } return; }
+        try { const raw = atob(message.data); if (raw.length !== 7680) return; const bytes = Uint8Array.from(raw, char => char.charCodeAt(0)); node.port.postMessage({buffer:bytes.buffer,channels:2}, [bytes.buffer]); } catch { /* Native packets are bounded and validated by the adapter. */ }
+      });
+      await context.resume(); await bridge.setSystemAudio({enabled:true, captureId});
+    } else {
+      if (!bridge?.prepareSystemAudio) throw new Error('Use the Glance-Port desktop app to capture device audio.');
+      const authorization = await bridge.prepareSystemAudio(); permissionToken = authorization?.token;
+      if (!roomCurrent(epoch, rtc) || state.local.get('screen') !== screen) return;
+      const stream = await navigator.mediaDevices.getDisplayMedia({video:{frameRate:{ideal:1,max:1}}, audio:{sampleRate:{ideal:48000}, channelCount:{ideal:2}, echoCancellation:false, noiseSuppression:false, autoGainControl:false, restrictOwnAudio:true}, systemAudio:'include'});
+      stream.getVideoTracks().forEach(track => track.stop());
+      source = {stream,track:stream.getAudioTracks()[0],active:true,close() { this.active = false; stream.getTracks().forEach(track => track.stop()); }};
+      if (!source.track || source.track.readyState !== 'live') throw new Error('The system did not provide device sound. Check screen/system-audio permission and restart Glance-Port.');
+      source.track.contentHint = 'music';
+      source.track.addEventListener('ended', () => { if (state.systemAudio === source) { void stopSystemAudio(epoch, rtc); toast('Device audio capture ended. Enable it again to retry.', true); } });
+    }
+    if (!roomCurrent(epoch, rtc) || state.local.get('screen') !== screen) { source?.close(); if (captureId) void bridge.setSystemAudio({enabled:false,captureId}).catch(() => {}); return; }
+    state.systemAudio = source; await syncCapturedAudio(epoch, rtc);
+    if (roomCurrent(epoch, rtc)) toast(bridge?.platform === 'android' ? 'Device audio on · allowed media and games are shared. Protected apps and calls stay restricted.' : 'Device audio on · sound from other apps is shared separately from your microphone.');
+  } catch (error) {
+    source?.close(); if (source?.captureId) void bridge.setSystemAudio({enabled:false,captureId:source.captureId}).catch(() => {});
+    if (state.systemAudio === source) { state.systemAudio = null; await syncCapturedAudio(epoch, rtc).catch(() => {}); }
+    if (roomCurrent(epoch, rtc)) toast(`Device audio: ${cleanError(error)}`, true, 12000);
+  } finally {
+    if (permissionToken !== null) void bridge?.cancelSystemAudio?.(permissionToken).catch(() => {});
+    if (state.mediaPending.get('system-audio') === operation) state.mediaPending.delete('system-audio');
+    updateButtons(); renderParticipants();
+  }
+}
+async function stopSystemAudio(epoch = state.epoch, rtc = state.rtc) {
+  const source = state.systemAudio; state.systemAudio = null; source?.close();
+  if (source?.captureId) await bridge?.setSystemAudio?.({enabled:false,captureId:source.captureId}).catch(() => {});
+  await syncCapturedAudio(epoch, rtc); updateButtons();
+}
 async function toggleMicrophone() {
   const kind = 'audio';
   if (!state.joined || state.mediaPending.has(kind)) return;
@@ -1070,7 +1160,7 @@ async function toggleMicrophone() {
   let captured = null;
   try {
     if (state.local.has(kind)) {
-      const item = state.local.get(kind); state.local.delete(kind); item.stream.getTracks().forEach((track) => track.stop()); await rtc.setTrack(kind, null);
+      const item = state.local.get(kind); state.local.delete(kind); item.stream.getTracks().forEach((track) => track.stop()); await syncCapturedAudio(epoch, rtc);
       stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner();
     } else {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture requires a trusted HTTPS connection and browser support.');
@@ -1078,11 +1168,11 @@ async function toggleMicrophone() {
       const track = stream.getAudioTracks()[0];
       if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach((item) => item.stop()); return; }
       if (!track || track.readyState !== 'live') throw new DOMException('The microphone did not provide a live audio track.', 'NotReadableError');
-      track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); void rtc.setTrack(kind, null).catch(() => {}); stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); } });
+      track.addEventListener('ended', () => { if (state.local.get(kind)?.track === track) { state.local.delete(kind); void syncCapturedAudio(epoch, rtc).catch(() => {}); stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner(); $('voice-status-text').textContent = 'Microphone disconnected. Turn it on to retry.'; void updatePhoneAudioRoute().catch(() => {}); updateButtons(); renderParticipants(); renderStage(); } });
       // Native permission prompts can interrupt a previously unlocked audio
       // context. Resume the existing outputs after capture, before publishing.
       prepareListening(); await rtc.resumePlayback?.().catch(() => {});
-      state.local.set(kind, { track, stream }); await rtc.setTrack(kind, track, stream);
+      state.local.set(kind, { track, stream }); await syncCapturedAudio(epoch, rtc);
       if (!roomCurrent(epoch, rtc)) { stream.getTracks().forEach(item => item.stop()); return; }
       if (track.readyState !== 'live' || state.local.get(kind)?.track !== track) throw new DOMException('The microphone stopped while connecting. Turn it on again.', 'NotReadableError');
       stopMicrophoneMonitor(); state.microphoneMonitor = startMicrophoneMonitor(stream); await updatePhoneAudioRoute();
@@ -1091,7 +1181,7 @@ async function toggleMicrophone() {
   } catch (error) {
     captured?.getTracks().forEach(track => track.stop());
     if (roomCurrent(epoch, rtc)) {
-      if (captured && state.local.get(kind)?.stream === captured) { state.local.delete(kind); await rtc.setTrack(kind, null).catch(() => {}); }
+      if (captured && state.local.get(kind)?.stream === captured) { state.local.delete(kind); await syncCapturedAudio(epoch, rtc).catch(() => {}); }
       stopMicrophoneMonitor(); state.relayCaptureSuspended = false; updateAudioBanner();
       $('voice-status').classList.add('error'); $('voice-status-text').textContent = 'Microphone unavailable · check sound'; toast(`Microphone: ${microphoneError(error)}`, true, 12000);
     }
@@ -1257,6 +1347,7 @@ async function stopSharing() {
   if (ownedOperation) state.sharingPending = operation;
   const captureId = state.phoneScreen?.captureId; const item = state.local.get('screen'); state.local.delete('screen'); state.sourceId = null;
   item?.stream.getTracks().forEach(track => track.stop()); clearPhoneCapture();
+  await stopSystemAudio(epoch, rtc);
   const request = state.controlRequest; state.controlRequest = null; $('control-dialog').close();
   if (request) send({ type: 'control-response', to: request.peerId, accepted: false, requestId: request.requestId });
   updateButtons(); renderParticipants(); renderStage();
@@ -1356,7 +1447,7 @@ bridge?.onMediaError?.(async reason => {
   for (const kind of ['audio']) {
     const item = state.local.get(kind); state.local.delete(kind);
     item?.stream.getTracks().forEach(track => track.stop());
-    await rtc?.setTrack(kind, null).catch(() => {});
+    await syncCapturedAudio(epoch, rtc).catch(() => {});
   }
   if (!roomCurrent(epoch, rtc)) return;
   state.relayCaptureSuspended = false; updateAudioBanner();
@@ -1368,18 +1459,14 @@ bridge?.onMediaError?.(async reason => {
 bridge?.onSessionStop?.((reason) => { leaveRoom(); toast(reason || 'The Android call ended. Your room and media have stopped.'); });
 
 function videoPoint(event, clamp = false) {
-  const video = $('stage-video'); const rect = video.getBoundingClientRect();
-  if (!video.videoWidth || !video.videoHeight) return null;
-  const scale = Math.min(rect.width / video.videoWidth, rect.height / video.videoHeight);
-  const width = video.videoWidth * scale; const height = video.videoHeight * scale;
-  const left = rect.left + (rect.width - width) / 2; const top = rect.top + (rect.height - height) / 2;
-  const x = (event.clientX - left) / width; const y = (event.clientY - top) / height;
-  if (!clamp && (x < 0 || x > 1 || y < 0 || y > 1)) return null;
-  return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+  return screenView.point(event, clamp);
 }
 function inputAllowed() { return state.controlling && state.selected?.peerId === state.controlling.peerId && state.selected.kind === 'screen'; }
 function sendInput(event) {
-  if (!inputAllowed()) return false;
+  // A selected stream may disappear while a button is held. Releases still
+  // belong to the existing approved session; all new input requires selection.
+  const release = event.type === 'up' || event.type === 'keyup';
+  if (!state.controlling || !release && !inputAllowed()) return false;
   const { peerId, sessionId } = state.controlling;
   const sent = state.rtc?.sendData(peerId, { type: 'input', sessionId, event: { ...event, seq: ++state.seq } });
   if (!sent) {
@@ -1392,6 +1479,37 @@ function sendInput(event) {
   return Boolean(sent);
 }
 const stageVideo = $('stage-video');
+const screenView = attachScreenView({
+  viewport: $('screen-viewport'), video: stageVideo, controls: $('screen-view-controls'), dragToggle: $('remote-touch-drag'),
+  beforeGesture: () => { releaseKeys(); clearRemoteText(); }, canControl: () => Boolean(inputAllowed()),
+  onTouchTap: (point) => {
+    if (!inputAllowed()) return;
+    stageVideo.focus({ preventScroll: true });
+    state.lastPoint = point;
+    if (!sendInput({ type: 'move', ...point })) return;
+    state.pressedButtons.add(0);
+    if (!sendInput({ type: 'down', button: 0, ...point })) return;
+    state.pressedButtons.delete(0); sendInput({ type: 'up', button: 0, ...point });
+  },
+  onTouchDrag: ({ type, point }) => {
+    if (type === 'up') {
+      state.pressedButtons.delete(0); state.lastPoint = point;
+      return sendInput({ type: 'up', button: 0, ...point });
+    }
+    if (!inputAllowed()) return false;
+    if (type === 'down') stageVideo.focus({ preventScroll: true });
+    state.lastPoint = point;
+    if (!sendInput({ type: 'move', ...point })) return false;
+    if (type === 'down') { state.pressedButtons.add(0); return sendInput({ type: 'down', button: 0, ...point }); }
+    return true;
+  },
+});
+// Keep the image above the actual wrapping toolbar, including small phones,
+// landscape windows and font scaling. No fixed row count is assumed.
+new ResizeObserver(() => {
+  if (!presentation.active) return;
+  $('stage').style.setProperty('--presentation-toolbar-height', `${Math.ceil($('presentation-toolbar').getBoundingClientRect().height)}px`);
+}).observe($('presentation-toolbar'));
 stageVideo.addEventListener('pointermove', (event) => {
   if (!inputAllowed() || performance.now() - state.lastMove < 24) return;
   const point = videoPoint(event, state.pressedButtons.size > 0); if (!point) return;
@@ -1419,7 +1537,7 @@ stageVideo.addEventListener('wheel', (event) => {
 const allowedCodes = /^(Key[A-Z]|Digit[0-9]|Arrow(Up|Down|Left|Right)|Enter|Tab|Space|Backspace|Delete|Insert|Home|End|PageUp|PageDown|Shift(Left|Right)|Control(Left|Right)|Alt(Left|Right)|Meta(Left|Right)|CapsLock|Escape|Minus|Equal|BracketLeft|BracketRight|Backslash|Semicolon|Quote|Comma|Period|Slash|Backquote)$/;
 stageVideo.addEventListener('keydown', (event) => {
   if (!inputAllowed()) return;
-  if (event.code === 'Escape') { event.preventDefault(); releaseKeys(); stageVideo.blur(); toast('Keyboard focus released. Click the screen to resume control.'); return; }
+  if (event.code === 'Escape') { event.preventDefault(); releaseKeys(); screenView.cancelGesture(); stageVideo.blur(); toast('Keyboard focus released. Click the screen to resume control.'); return; }
   if (!allowedCodes.test(event.code)) return; event.preventDefault();
   if (event.repeat) return; state.pressed.add(event.code); sendInput({ type: 'keydown', code: event.code, key: event.key.slice(0, 32) });
 });
@@ -1450,6 +1568,7 @@ function clearRemoteText() {
   $('remote-text-input').value = ''; remoteIME.composing = false; remoteIME.lastComposition = null; clearTimeout(remoteIME.timer);
 }
 function renderRemoteTools() {
+  screenView.syncControl();
   const enabled = Boolean(inputAllowed()); $('remote-tools').hidden = !enabled || presentation.active && !presentation.toolsOpen;
   if ($('remote-tools').hidden) {
     $('remote-keyboard-wrap').hidden = true; $('remote-keyboard-toggle').setAttribute('aria-expanded', 'false');
@@ -1594,6 +1713,8 @@ async function leaveRoom(stopHost = true) {
   // Stop outgoing media immediately, before native cleanup awaits. A lost
   // directory socket must never leave capture running during reconnect.
   state.rtc?.close(); state.rtc = null;
+  const outgoingDevice = state.systemAudio; state.systemAudio = null; outgoingDevice?.close();
+  state.audioMixer?.close(); state.audioMixer = null;
   for (const item of state.local.values()) item.stream.getTracks().forEach(track => track.stop());
   for (const audio of state.audioElements.values()) { audio.pause(); audio.srcObject = null; }
   const captureId = state.phoneScreen?.captureId;

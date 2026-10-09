@@ -86,7 +86,7 @@ test('encrypted media forwarding uses strict envelopes and ready same-room membe
   assert.equal(owner.take('signal'), null); assert.equal(s.store.mediaBudget.messages, limits.reservationMessages); assert.equal(guest.attachment.mediaLease, undefined);
 });
 
-test('encrypted media byte, packet, burst and room-time limits survive hibernation; UTC resets only global daily counters', async () => {
+test('encrypted media byte, packet and burst limits survive hibernation; connected rooms have no fixed time cutoff', async () => {
   const { Coordinator, WEBSOCKET_RELAY_LIMITS: limits } = await modulePromise;
   const env = { PAIRING_KEY, WEBSOCKET_RELAY: 'true' };
   const s = await setup({ env }); const owner = await s.host(); const guest = await s.guest(owner, 'Guest');
@@ -110,7 +110,7 @@ test('encrypted media byte, packet, burst and room-time limits survive hibernati
   resumed.mediaBudget.day = '2026-10-06'; await resumed.receive(guest.id, JSON.stringify(message)); assert.match(guest.take('error').message, /room.*byte/i);
   assert.equal(resumed.mediaBudget.messages, 0); resumed.mediaBudget.rooms[owner.room.roomId].bytes = 0;
   for (let i = 0; i < 60; i++) { s.advance(30000); resumed.touch(owner.id, s.now()); resumed.touch(guest.id, s.now()); }
-  await resumed.receive(guest.id, JSON.stringify(message)); assert.match(guest.take('error').message, /30-minute/);
+  await resumed.receive(guest.id, JSON.stringify(message)); assert.ok(owner.take('signal')); assert.equal(guest.take('error'), null);
   assert.equal(resumed.rooms.size, 1); assert.equal(owner.take('room-ended'), null); // Direct calls remain available.
 });
 
@@ -334,8 +334,41 @@ test('public lifetime, revocation and source budgets survive hibernation without
     restored: [owner, guest].map(ws => ({ transport: ws, attachment: structuredClone(ws.attachment) })) });
   assert.equal(resumed.ready([...resumed.rooms.values()][0]).length, 2); assert.equal(resumed.devices.size, 0);
   assert.equal(resumed.publicBudget.bootstrap, 2); assert.equal(resumed.publicBudget.create, 1);
-  for (let i = 0; i < 120; i++) { s.advance(30000); resumed.touch(owner.id, s.now()); resumed.touch(guest.id, s.now()); resumed.reap(); }
-  assert.equal(resumed.rooms.size, 0); assert.equal(resumed.sockets.size, 0); assert.ok(owner.closed); assert.ok(guest.closed);
+  for (let i = 0; i < 180; i++) { s.advance(30000); resumed.touch(owner.id, s.now()); resumed.touch(guest.id, s.now()); resumed.reap(); }
+  assert.equal(resumed.rooms.size, 1); assert.equal(resumed.sockets.size, 2); assert.equal(owner.closed, false);
+  resumed.disconnect(owner.id);
+  assert.equal(resumed.rooms.size, 0); assert.ok(guest.take('room-ended')); assert.equal(resumed.grants.size, 0);
+});
+
+test('an idle public room with healthy host heartbeats remains open until its owner leaves', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost();
+  assert.equal(owner.room.expiresAt, 0);
+  for (let i = 0; i < 240; i++) { s.advance(30000); await s.send(owner, { type: 'ping' }); s.engine.reap(); }
+  assert.equal(s.engine.rooms.size, 1); assert.equal(owner.closed, false);
+  await s.send(owner, { type: 'leave' }); assert.equal(s.engine.rooms.size, 0);
+});
+
+test('guest heartbeats cannot retain a room after the host connection is lost', async () => {
+  const s = await setup({ env: { PUBLIC_ROOMS: 'true' } }); const owner = await s.publicHost(); const guest = await s.publicGuest(owner);
+  for (let i = 0; i < 4; i++) { s.advance(30000); s.engine.touch(guest.id, s.now()); s.engine.reap(); }
+  assert.equal(owner.closed.code, 1000); assert.match(owner.closed.reason, /timed out/);
+  assert.equal(s.engine.rooms.size, 0); assert.ok(guest.take('room-ended'));
+});
+
+test('live public relay keys and charged media credits survive multi-hour hibernation without a timer reset', async () => {
+  const env = { PAIRING_KEY, PUBLIC_ROOMS: 'true', WEBSOCKET_RELAY: 'true' };
+  const s = await setup({ env }); const owner = await s.publicHost(); const guest = await s.publicGuest(owner);
+  await s.send(guest, relaySignal(owner.welcome.selfId, 16)); assert.ok(owner.take('signal'));
+  const reserved = structuredClone(s.store.mediaBudget); const { Coordinator } = await modulePromise;
+  for (let i = 0; i < 240; i++) { s.advance(30000); s.engine.touch(owner.id, s.now()); s.engine.touch(guest.id, s.now()); s.engine.reap(); }
+  const resumed = new Coordinator({ store: s.store, env, now: s.now, restored: [owner,guest].map(ws=>({transport:ws,attachment:structuredClone(ws.attachment)})) });
+  const room = [...resumed.rooms.values()][0]; const config = await resumed.websocketMedia(room);
+  assert.equal(config.websocketRelayEnabled, true); assert.equal(config.relayKey, owner.welcome.relayKey);
+  assert.equal(config.websocketRelayLimits.roomSeconds, 0);
+  assert.deepEqual(s.store.mediaBudget, reserved);
+  await resumed.receive(guest.id, JSON.stringify(relaySignal(owner.welcome.selfId,16,2))); assert.ok(owner.take('signal'));
+  resumed.disconnect(owner.id); assert.equal(resumed.rooms.size, 0); assert.ok(guest.take('room-ended'));
+  assert.equal((await resumed.websocketMedia(room)).websocketRelayEnabled, false);
 });
 
 test('source bootstrap and room creation caps cannot be reset by socket replacement or hibernation', async () => {

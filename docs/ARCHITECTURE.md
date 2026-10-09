@@ -1,6 +1,6 @@
 # Architecture
 
-The 0.4 desktop milestone focuses on screen presentation, optional microphone audio and attended input. Its bundled interface runs in isolated Electron renderers. Camera capture/media slots are removed. Android source remains for later delivery.
+The 0.6 app provides screen presentation, independently switchable microphone/device audio and attended input on Windows, Apple Silicon macOS and Android. Desktop renderers are isolated; AndroidRoomSession owns the live WebView independently of its Activity. Camera capture/media slots are excluded.
 
 ## Invitation rooms
 
@@ -15,19 +15,19 @@ flowchart LR
     C <-->|Encrypted fallback packets| M
 ```
 
-Bootstrap creates a short-lived connection-bound public identity without exposing private presence or replacing saved private credentials. Creation yields a room ID, 32-byte invitation capability and independent owner token. The A1 code/link encodes the capability; URL fragments stay out of HTTP requests. The landing page validates it before offering the installed-app link/copy fallback.
+Bootstrap creates a connection-bound public identity without exposing private presence or replacing saved private credentials. Creation yields a room ID, 32-byte invitation capability and independent owner token. The A1 code/link encodes the capability; URL fragments stay out of HTTP requests. The landing page validates it before offering the installed-app link/copy fallback.
 
 Invitation holders enter automatically while invitations are open. Server-assigned identities and ready/admitted membership govern signaling/media. The four-person cap includes the host. Pending/unrelated/removed sockets cannot receive media or forge senders. Owners remove guests, burn/rotate invitations or block the current connection and burn its invitation. This does not identify future anonymous apps permanently.
 
-Bootstrap/creation/command limits, room lifetime and global caps persist. Source throttles retain keyed hashes, not raw addresses. Host loss ends its room and consent bindings. Finite budgets bound free infrastructure use.
+Bootstrap/creation/command limits and global caps persist. Healthy host-connected rooms have no fixed lifetime; two-minute heartbeat expiry still detects lost connections. Source throttles retain keyed hashes, not raw addresses. Host loss ends its room and consent bindings. Finite budgets bound free infrastructure use.
 
 ## Media paths
 
 A four-person direct mesh uses perfect negotiation and distinct **audio + screen** transceivers. Source replacement preserves slots. Screens are video tracks: removing camera calls does not remove encoder/bandwidth requirements. Desktop capture targets ceilings up to 2560×1440 at 30 fps; diagnostics show actual received dimensions, frame rate, codec and route.
 
-When RTC fails and the service enables fallback, peers exchange authenticated AES-GCM envelopes over WSS. Direction/identity/epoch key derivation, counters and retired epochs reject tampering/replay. Queues, payloads and decoder dimensions are bounded. Teardown cancels work and disposes sources/decoders/generated tracks/audio contexts. JPEG is a low-frame-rate compatibility mode; encoded high-quality screens are tested separately. Microphone PCM uses AudioWorklets; playback restrictions appear as **Enable sound**.
+When RTC fails and the service enables fallback, peers exchange authenticated AES-GCM envelopes over WSS. Direction/identity/epoch key derivation, counters and retired epochs reject tampering/replay. Queues, payloads and decoder dimensions are bounded. Teardown cancels work and disposes sources/decoders/generated tracks/audio contexts. JPEG is a low-frame-rate compatibility mode; encoded high-quality screens are tested separately. Microphone and explicitly enabled device sources enter a 48 kHz stereo mixer. Relay negotiates 192 kbps stereo Opus with bounded stereo PCM compatibility; AudioWorklets feed bounded playback queues. Received room audio never enters the local source mix. Playback restrictions appear as **Enable sound**.
 
-Only exact encrypted relay envelopes get the larger 256 KiB ceiling; normal commands remain at 64 KiB. The coordinator verifies ready same-room membership, rewrites senders and reserves persistent allowances before forwarding. Current limits: 512 MiB/30 minutes per room, 1 GiB/300000 forwarded packets per day, plus a sender burst limit. Bounded byte/packet credits avoid a SQLite write for every frame; credits are never refunded. Attachment/persistence rules prevent healthy hibernation from reusing depleted credits. See [service budgets](../internet-service/README.md). Media payloads are not stored. The coordinator distributes relay keys, so this assumes a trusted coordinator.
+Only exact encrypted relay envelopes get the larger 256 KiB ceiling; normal commands remain at 64 KiB. The coordinator verifies ready same-room membership, rewrites senders and reserves persistent allowances before forwarding. Current limits: 512 MiB per room with no fixed time cutoff, 1 GiB/300000 forwarded packets per day, plus a sender burst limit. Bounded byte/packet credits avoid a SQLite write for every frame; credits are never refunded. Attachment/persistence rules prevent healthy hibernation from reusing depleted credits. See [service budgets](../internet-service/README.md). Media payloads are not stored. The coordinator distributes relay keys, so this assumes a trusted coordinator.
 
 Exhaustion visibly stops fallback without requiring unrelated direct peers to disconnect. TURN remains optional/disabled until provider free quota and expiry are verified; issuance counters alone are not a provider billing cap.
 

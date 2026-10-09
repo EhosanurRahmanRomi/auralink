@@ -108,11 +108,11 @@ try {
         $dexMagic = [Text.Encoding]::ASCII.GetString($dex, 0, 8)
         Assert-Verification ($dexMagic -match '^dex\n0[0-9]{2}\x00$') 'APK classes.dex does not contain a valid DEX header'
         $dexText = [Text.Encoding]::ASCII.GetString($dex)
-        foreach ($class in @('Llocal/auralink/mobile/MainActivity;','Llocal/auralink/mobile/AppInvitation;','Llocal/auralink/mobile/PinnedTls;','Llocal/auralink/mobile/PinnedRoomClient;','Llocal/auralink/mobile/Invitation;','Llocal/auralink/mobile/InternetServiceEndpoint;','Llocal/auralink/mobile/RoomMembership;','Llocal/auralink/mobile/ProjectionOwnership;','Llocal/auralink/mobile/RelayMediaPolicy;','Llocal/auralink/mobile/ScreenShareService;','Llocal/auralink/mobile/CallSessionService;','Llocal/auralink/mobile/AttendedAccessibilityService;','Llocal/auralink/mobile/AttendedControlPolicy;','Llocal/auralink/mobile/CallAudio;')) {
+        foreach ($class in @('Llocal/auralink/mobile/MainActivity;','Llocal/auralink/mobile/AndroidRoomSession;','Llocal/auralink/mobile/PlaybackAudio;','Llocal/auralink/mobile/AppInvitation;','Llocal/auralink/mobile/PinnedTls;','Llocal/auralink/mobile/PinnedRoomClient;','Llocal/auralink/mobile/Invitation;','Llocal/auralink/mobile/InternetServiceEndpoint;','Llocal/auralink/mobile/RoomMembership;','Llocal/auralink/mobile/ProjectionOwnership;','Llocal/auralink/mobile/RelayMediaPolicy;','Llocal/auralink/mobile/ScreenShareService;','Llocal/auralink/mobile/CallSessionService;','Llocal/auralink/mobile/AttendedAccessibilityService;','Llocal/auralink/mobile/AttendedControlPolicy;','Llocal/auralink/mobile/CallAudio;')) {
             Assert-Verification ($dexText.Contains($class)) "APK classes.dex is missing required native class: $class"
         }
         $assetResults = @()
-        foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js','brand-mark.png')) {
+        foreach ($file in @('index.html','styles.css','app.js','rtc.js','android-bridge.js','internet.js','desktop-internet.js','relay-media.js','audio-worklet.js','screen-view.js','audio-mixer.js','brand-mark.png')) {
             $packagedBytes = Read-ApkEntry $archive "assets/renderer/$file"
             $sourceHash = (Get-FileHash -LiteralPath (Join-Path $projectPath "src/renderer/$file") -Algorithm SHA256).Hash.ToLowerInvariant()
             $packagedHash = Get-BytesSHA256 $packagedBytes
@@ -122,7 +122,7 @@ try {
         $privateEntries = @($entryNames | Where-Object { $_ -match '(?i)(\.jks$|\.keystore$|signing-password|(^|/)\.private/|(^|/)\.tools/|^android/libs/|^src/.*\.java$)' })
         Assert-Verification ($privateEntries.Count -eq 0) 'APK unexpectedly contains private keys, build tools or unrequested project source'
         $evidence.Contents = [ordered]@{ EntryCount=$entryNames.Count; EntryPathsUseForwardSlashes=$true; IconAndResourceTablePresent=$true; IconMatchesCanonicalPNG=$true; IconSHA256=$packagedIconHash; LegalNoticesPresent=$true; HasClassesDEX=$true; ABIIndependentDEX=$true; DEXBytes=$dex.Length; DEXSHA256=(Get-BytesSHA256 $dex); RequiredNativeClassesPresent=$true; PrivateBuildMaterialPresent=$false; RendererAssets=$assetResults; AllRendererAssetsMatch=$true }
-        $evidence.Checks += 'APK includes executable DEX/native class descriptors and all ten renderer assets, including the supplied brand PNG, match current source SHA256 without private build material'
+        $evidence.Checks += 'APK includes executable DEX/native class descriptors and all twelve renderer assets, including audio mixing, screen zoom and the supplied brand PNG, match current source SHA256 without private build material'
     } finally { $archive.Dispose() }
     $buildRecordPath = Join-Path $projectPath 'release/Android-build.json'
     if (Test-Path -LiteralPath $buildRecordPath) {

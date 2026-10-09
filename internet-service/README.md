@@ -7,7 +7,7 @@ This Worker supplies signaling and bounded, client-encrypted media forwarding wh
 ## Connection flow
 
 1. An ephemeral public WebSocket authenticates with `bootstrap`. It receives a socket-bound identity, without a persistent account or device token. It cannot see the private device directory.
-2. The host creates an invitation room and joins using a separate server-issued host capability. A guest with the high-entropy invitation enters automatically, up to the four-person limit. Public identities and rooms expire within one hour; reconnecting creates a new identity and requires joining again.
+2. The host creates an invitation room and joins using a separate server-issued host capability. A guest with the high-entropy invitation enters automatically, up to the four-person limit. Healthy public sessions have no fixed time cutoff. Host departure or connection loss ends the room; reconnecting creates a new identity and requires joining again.
 3. Direct encrypted WebRTC carries screen sharing, microphone audio and remote input when it can connect. STUN helps discover addresses but cannot bypass every restrictive network. The current desktop flow has no camera call.
 4. If enabled, the client can forward encrypted compressed screen frames and mono PCM audio through the same verified WSS coordinator. Desktop WebCodecs uses H.264 or VP8 with an adaptive target up to 30 fps and a selectable resolution ceiling up to 1440p. Engines without a common codec use an explicitly labeled JPEG compatibility mode limited to 4 fps and a 1280-pixel long edge. This is an application fallback, not TURN. Actual quality depends on hardware, scene complexity, throughput and the free allowances below.
 5. A host can kick a participant, disable the invitation, generate a new invitation, or block a connection. Blocking also disables the old invitation. An anonymous person with a new identity and a newly shared code can return; this is not a permanent account ban.
@@ -69,12 +69,12 @@ Cloudflare Free has finite quotas; exhausted operations fail rather than creatin
 | Source new rooms per hour | 8 |
 | Public normal commands per UTC day / per room per hour | 20,000 / 2,000 |
 | Reserved encrypted media per UTC day, across all rooms | 300,000 packets and 1 GiB wire bytes |
-| Reserved media per room | 512 MiB wire bytes and 30 minutes from its first packet |
+| Reserved media per room | 512 MiB wire bytes, with no fixed time cutoff |
 | Forwarded media per sender | 600 packets and 6 MiB wire bytes per five-second window |
 | Durable per-socket reservation ceiling | 2 MiB byte credits and 256 packet credits |
 | Normal JSON / validated ciphertext signal wire size | 64 KiB / 256 KiB |
 
-Each forwarded ciphertext packet counts separately, including video fragments and copies sent to different recipients. For the two-desktop test, two 3 Mbps screen feeds use approximately 8 Mbps of base64url wire traffic before audio and metadata; a 512 MiB room therefore supports roughly nine minutes at that rate. Two 4.5 Mbps feeds use about 12 Mbps wire traffic and consume that room allowance in roughly six minutes. Static screens and lower quality can use less. These are illustrative bandwidth calculations, not promised durations. The 30-minute timer is an upper bound; byte or packet exhaustion can occur earlier. Direct WebRTC does not consume these forwarding allowances.
+Each forwarded ciphertext packet counts separately, including video fragments and copies sent to different recipients. For the two-desktop test, two 3 Mbps screen feeds use approximately 8 Mbps of base64url wire traffic before audio and metadata; a 512 MiB room therefore supports roughly nine minutes at that rate. Two 4.5 Mbps feeds use about 12 Mbps wire traffic and consume that room allowance in roughly six minutes. Static screens and lower quality can use less. These are illustrative bandwidth calculations, not promised durations. There is no fixed relay timer, but byte or packet exhaustion stops fallback. Direct WebRTC does not consume these forwarding allowances.
 
 Daily global counters reset at 00:00 UTC. A room's byte/time counters and a socket's burst counters survive hibernation and do not reset at midnight. Normal public commands and media use separate budgets. Heartbeats and local leave/forget cleanup do not consume the normal-command budget. Quota errors identify the exhausted allowance; direct WebRTC remains available after fallback exhaustion.
 

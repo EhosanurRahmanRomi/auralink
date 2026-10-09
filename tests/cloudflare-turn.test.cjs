@@ -68,3 +68,13 @@ test('Cloudflare short-lived room credentials are encrypted, reused after restor
   const cached = await restored.ice(restored.rooms.get(s.room.id)); assert.equal(cached.relaySecondsLimit, 540); assert.equal(cached.relayExpiresAt, deadline); assert.equal(s.calls(), 1);
   s.advance(540000); assert.equal((await restored.ice(restored.rooms.get(s.room.id))).relayEnabled, false); assert.equal(s.calls(), 1);
 });
+
+test('a host-connected public room retains finite optional provider expiry without interpreting zero as an expired room', async () => {
+  const s = await fixture(); s.room.expiresAt = 0;
+  const config = await s.engine.ice(s.room);
+  assert.equal(config.relayEnabled, true); assert.equal(config.relaySecondsLimit, 600);
+  assert.equal(config.relayExpiresAt, s.now() + 600000);
+  s.advance(600000);
+  assert.equal((await s.engine.ice(s.room)).relayEnabled, false);
+  assert.equal(s.calls(), 1, 'No unlimited provider credential is minted for an unlimited-duration room');
+});

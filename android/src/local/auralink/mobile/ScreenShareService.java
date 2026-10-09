@@ -35,6 +35,8 @@ public final class ScreenShareService extends Service {
         void started(int width, int height, int maxEdge);
         void frame(long sequence, String jpeg, int width, int height);
         void stopped(String reason);
+        default void audio(long sequence, String data, int frames) { }
+        default void audioStopped(String reason) { }
     }
     static final String STOP = "local.auralink.mobile.STOP_SCREEN";
     private static final int NOTIFICATION = 1041;
@@ -46,6 +48,8 @@ public final class ScreenShareService extends Service {
     private HandlerThread captureThread;
     private Handler capture;
     private MediaProjection projection;
+    private PlaybackAudio playbackAudio;
+    private long playbackGeneration;
     private VirtualDisplay display;
     private ImageReader reader;
     private Bitmap padded;
@@ -69,6 +73,30 @@ public final class ScreenShareService extends Service {
     static synchronized void cancelPreparation(String ticket) { if (ownership.cancelPending(ticket)) pendingListener = null; }
     static boolean active() { return instance != null && instance.running && !instance.stopping; }
     static boolean activeFullDisplay() { return active() && instance.fullDisplay; }
+    static void acknowledgePlaybackAudio(String ticket, long seq) {
+        ScreenShareService current = instance;
+        if (current != null && ticket != null && ticket.equals(current.activeTicket) && current.playbackAudio != null) current.playbackAudio.acknowledge(seq);
+    }
+    static boolean setPlaybackAudio(String ticket, boolean enabled) {
+        ScreenShareService current = instance;
+        if (current == null || ticket == null || !ticket.equals(current.activeTicket)) return false;
+        if (Looper.myLooper() != Looper.getMainLooper()) throw new IllegalStateException("Device audio consent must run on the Android main thread.");
+        current.stopPlaybackAudio();
+        if (!enabled) return true;
+        if (!current.running || current.stopping || current.projection == null || current.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) return false;
+        final long generation = current.playbackGeneration;
+        PlaybackAudio source = new PlaybackAudio(current, current.projection, new PlaybackAudio.Listener() {
+            public void chunk(long seq, String data, int frames) {
+                if (active() && current == instance && generation == current.playbackGeneration && current.listener != null && ticket.equals(current.activeTicket)) current.listener.audio(seq, data, frames);
+            }
+            public void stopped(String reason) {
+                if (current == instance && generation == current.playbackGeneration && current.listener != null && ticket.equals(current.activeTicket)) { current.stopPlaybackAudio(); current.listener.audioStopped(reason); }
+            }
+        });
+        current.playbackAudio = source;
+        try { source.start(); return true; } catch (RuntimeException failure) { current.playbackAudio = null; throw failure; }
+    }
+    private void stopPlaybackAudio() { playbackGeneration++; PlaybackAudio previous = playbackAudio; playbackAudio = null; if (previous != null) previous.stop(); }
     static void acknowledge(long seq) { ScreenShareService current = instance; if (current != null && current.inFlight == seq) current.inFlight = 0; }
     static void stopCurrent(String reason) { ScreenShareService current = instance; if (current != null) current.main.post(() -> current.stopSharing(reason)); else cancelPreparation(); }
     static void stopCurrent(String ticket, String reason) {
@@ -84,7 +112,8 @@ public final class ScreenShareService extends Service {
         notifications.createNotificationChannel(new NotificationChannel("screen-sharing", "Screen sharing and device control", NotificationManager.IMPORTANCE_LOW));
     }
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || STOP.equals(intent.getAction())) { stopSharing("Stopped from the Android notification."); return START_NOT_STICKY; }
+        if (intent == null) { stopSharing("Android ended screen sharing."); return START_NOT_STICKY; }
+        if (STOP.equals(intent.getAction())) { if (activeTicket != null && activeTicket.equals(intent.getStringExtra("ticket"))) stopSharing("Stopped from the Android notification."); return START_NOT_STICKY; }
         final String ticket = intent.getStringExtra("ticket");
         // A duplicate or delayed old service intent must not stop an active
         // projection or consume another owner consent waiting to start.
@@ -183,13 +212,14 @@ public final class ScreenShareService extends Service {
     }
     private Notification notification() {
         PendingIntent open = PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        PendingIntent stop = PendingIntent.getService(this, 1, new Intent(this, ScreenShareService.class).setAction(STOP), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        PendingIntent stop = PendingIntent.getService(this, 1, new Intent(this, ScreenShareService.class).setAction(STOP).putExtra("ticket", activeTicket), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         return new Notification.Builder(this, "screen-sharing").setSmallIcon(getApplicationInfo().icon)
             .setContentTitle("Glance-Port is sharing your screen").setContentText("Return to the app to manage consent. Stop ends sharing and control.")
             .setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).setContentIntent(open).addAction(new Notification.Action.Builder(null, "Stop sharing", stop).build()).build();
     }
     private void stopSharing(String reason) {
         if (stopping) return; stopping = true; running = false; fullDisplay = false; inFlight = 0;
+        stopPlaybackAudio();
         cancelPreparation(activeTicket); ownership.release(activeTicket);
         AttendedAccessibilityService control = AttendedAccessibilityService.current(); if (control != null) control.revoke(reason);
         try { ((DisplayManager)getSystemService(DISPLAY_SERVICE)).unregisterDisplayListener(rotationListener); } catch (Exception ignored) { }

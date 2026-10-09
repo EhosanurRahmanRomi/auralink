@@ -49,6 +49,8 @@ jobs:
         run: node tests/rtc-browser.cjs
       - name: Bidirectional decoded audio, autoplay recovery and microphone preflight
         run: node tests/audio-browser.cjs
+      - name: Device-only stereo audio, microphone mixing and encrypted Opus playback
+        run: node tests/system-audio-browser.cjs
       - name: Approved phone-style desktop controls
         run: node tests/mobile-control.cjs
       - name: Fullscreen presentation, mobile fallback and safe control exit

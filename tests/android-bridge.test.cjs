@@ -26,6 +26,34 @@ test('ordinary browser and Electron retain their original transport and privileg
   const desktop = { platform: 'win32', hostRoom: () => {} };
   assert.equal(setup({ existing: desktop }).bridge, desktop);
 });
+test('device audio requires an active exact projection and remains separate from microphone routing', async () => {
+  const {bridge,messages,receive}=setup({response:message=>message.method==='startScreenShare'?{captureId:'current-screen'}:{ok:true}});
+  for(const args of [{enabled:true,captureId:'missing'},{enabled:'true',captureId:'current-screen'},null]) await assert.rejects(bridge.setSystemAudio(args),/owner-approved/);
+  assert.equal(messages.length,0);
+  await bridge.startScreenShare({quality:'720p'});await bridge.setSystemAudio({enabled:true,captureId:'current-screen'});
+  assert.deepEqual(messages.map(item=>item.method),['startScreenShare','setSystemAudio']);
+  receive({event:'screen',type:'stopped',captureId:'current-screen'});
+  await assert.rejects(bridge.setSystemAudio({enabled:true,captureId:'current-screen'}),/owner-approved/);
+  assert.equal(messages.some(item=>item.method==='setAudioRoute'||item.method==='grantControl'),false);
+});
+test('device PCM accepts only bounded 48 kHz stereo packets and acknowledges even a failing consumer', async () => {
+  const {bridge,messages,receive}=setup({response:message=>message.method==='startScreenShare'?{captureId:'screen-a'}:{ok:true}});
+  await bridge.startScreenShare({});await bridge.setSystemAudio({enabled:true,captureId:'screen-a'});
+  const accepted=[];const remove=bridge.onSystemAudio(chunk=>accepted.push(chunk.seq));const removeThrowing=bridge.onSystemAudio(()=>{throw new Error('Fixture consumer failed');});
+  const frame={event:'system-audio',type:'chunk',captureId:'screen-a',seq:1,frames:1920,sampleRate:48000,channels:2,data:'A'.repeat(10240)};
+  for(const invalid of [{...frame,captureId:'old-screen'},{...frame,channels:1},{...frame,sampleRate:24000},{...frame,frames:1921},{...frame,data:'A'.repeat(10241)},{...frame,seq:NaN},{...frame,data:'$'.repeat(10240)}])receive(invalid);
+  assert.equal(accepted.length,0);receive(frame);receive(frame);await flush();assert.deepEqual(accepted,[1]);
+  const ack=messages.filter(item=>item.method==='ackSystemAudio');assert.equal(ack.length,1);assert.equal(ack[0].args.captureId,'screen-a');assert.equal(ack[0].args.seq,1);
+  remove();removeThrowing();receive({...frame,seq:2});await flush();assert.deepEqual(accepted,[1]);assert.equal(messages.filter(item=>item.method==='ackSystemAudio').length,2,'Unsubscribed valid packets still release the single bounded native slot');
+  await bridge.setSystemAudio({enabled:false,captureId:'screen-a'});receive({...frame,seq:3});await flush();assert.equal(messages.filter(item=>item.method==='ackSystemAudio').length,2);
+});
+test('old projection audio cannot enter a replacement room or revive after native session stop', async () => {
+  let capture='first';const {bridge,receive,messages}=setup({response:message=>message.method==='startScreenShare'?{captureId:capture}:{ok:true}});
+  const chunks=[];bridge.onSystemAudio(value=>chunks.push(value.seq));await bridge.startScreenShare({});await bridge.setSystemAudio({enabled:true,captureId:'first'});
+  capture='second';await bridge.startScreenShare({});await bridge.setSystemAudio({enabled:true,captureId:'second'});
+  const frame={event:'system-audio',type:'chunk',captureId:'first',seq:3,frames:1920,sampleRate:48000,channels:2,data:'A'.repeat(10240)};receive(frame);receive({...frame,captureId:'second'});await flush();assert.deepEqual(chunks,[3]);
+  receive({event:'session-stop'});receive({...frame,captureId:'second',seq:4});await flush();assert.deepEqual(chunks,[3]);assert.equal(messages.filter(item=>item.method==='ackSystemAudio').length,1);
+});
 
 test('Android presentation fullscreen accepts only booleans and leaves media and control untouched', async () => {
   const { bridge, messages } = setup({ response: message => ({ fullscreen: message.args }) });

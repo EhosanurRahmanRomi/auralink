@@ -68,7 +68,7 @@ async function main() {
     const metadata=JSON.parse(command('plutil',['-convert','json','-o','-',path.join(appBundle,'Contents','Info.plist')]));
     assert.equal(metadata.CFBundleIdentifier,'local.auralink.desktop');
     assert.equal(metadata.CFBundleShortVersionString,pkg.version);
-    for(const usage of ['NSMicrophoneUsageDescription','NSScreenCaptureUsageDescription','NSLocalNetworkUsageDescription']) assert.ok(metadata[usage]?.length>10,`${usage} must explain the local action`);
+    for(const usage of ['NSMicrophoneUsageDescription','NSScreenCaptureUsageDescription','NSAudioCaptureUsageDescription','NSLocalNetworkUsageDescription']) assert.ok(metadata[usage]?.length>10,`${usage} must explain the local action`);
     assert.equal(metadata.NSCameraUsageDescription, undefined, 'Screen-only app must not declare camera capture');
     assert.ok(metadata.CFBundleURLTypes?.some(item => item.CFBundleURLSchemes?.includes('auralink')), 'Installed room links must register the auralink scheme');
     command('lipo',[binary,'-verify_arch','arm64']);command('lipo',[helper,'-verify_arch','arm64']);
@@ -90,7 +90,7 @@ async function main() {
     const archive=path.join(resources,'app.asar');
     const sourceFiles=['src/main.cjs','src/preload.cjs','src/core/broker.cjs','src/core/invite.cjs','src/native/control.cjs','src/native/macos-input.swift',
       'src/renderer/index.html','src/renderer/styles.css','src/renderer/app.js','src/renderer/rtc.js','src/renderer/android-bridge.js',
-      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs','src/core/app-invitation.cjs','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/brand-mark.png','build/icon.png'];
+      'src/renderer/internet.js','src/renderer/desktop-internet.js','src/core/internet-client.cjs','src/core/app-invitation.cjs','src/renderer/relay-media.js','src/renderer/audio-worklet.js','src/renderer/screen-view.js','src/renderer/audio-mixer.js','src/renderer/brand-mark.png','build/icon.png'];
     const sourceParity=sourceFiles.map(file=>{const packagedSha256=hash(asar.extractFile(archive,file)),sourceSha256=hash(fs.readFileSync(path.join(project,file)));assert.equal(packagedSha256,sourceSha256,`${file} must match the tested source`);return {path:file,packagedSha256,sourceSha256,matches:true};});
     const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
     const coldCode=`A1.${crypto.randomUUID()}.${crypto.randomBytes(32).toString('base64url')}`;
