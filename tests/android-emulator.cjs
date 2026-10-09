@@ -189,6 +189,33 @@ function visible(node) {
   return bounds && +bounds[3]>+bounds[1] && +bounds[4]>+bounds[2] && +bounds[2]<1147 && +bounds[4]>136;
 }
 async function screenshot(name) {fs.writeFileSync(path.join(output,name),await adb(['exec-out','screencap','-p'],{encoding:null}));}
+async function nativeWindowState() {
+  // Keep only structural window/view facts. Dumpsys also carries intents and
+  // private room data, so never retain its complete output in evidence.
+  const activity=(await adb(['shell','dumpsys','activity','activities']));
+  const resumed=activity.split('\n').find(line=>line.includes('topResumedActivity=')) || '';
+  const top=await adb(['shell','dumpsys','activity','top']);
+  const nativeViews=top.split('\n').filter(line=>/android\.(?:webkit\.WebView|widget\.FrameLayout)\{/.test(line))
+    .map(line=>{
+      const className=line.match(/(android\.(?:webkit\.WebView|widget\.FrameLayout))\{/)[1];
+      const state=line.match(/\{[a-f0-9]+\s+([A-Z.a-z]{9})\s+([A-Z.a-z]{8})\s+(-?\d+),(-?\d+)-(-?\d+),(-?\d+)/);
+      return {class:className,viewFlags:state?.[1] || 'unavailable',privateFlags:state?.[2] || 'unavailable',
+        bounds:state?state.slice(3,7).map(Number):null};
+    }).slice(0,20);
+  const windows=await adb(['shell','dumpsys','window','windows']);
+  const appBlocks=windows.split(/(?=\n\s*Window #\d+ Window\{)/).filter(block=>/Window #\d+ Window\{[^\n]*local\.auralink\.mobile\/local\.auralink\.mobile\.MainActivity/.test(block));
+  const surfaces=appBlocks.slice(0,4).map(block=>({
+    viewVisibility:block.match(/mViewVisibility=(0x[0-9a-f]+)/)?.[1] || null,
+    hasSurface:block.match(/mHasSurface=(true|false)/)?.[1] || null,
+    drawState:block.match(/mDrawState=([A-Z_]+)/)?.[1] || null,
+    visibleRequested:block.match(/isVisibleRequested=(true|false)/)?.[1] || null,
+  }));
+  const services=await adb(['shell','dumpsys','activity','services','local.auralink.mobile']);
+  const serviceTypes=[...services.matchAll(/foregroundServiceType=(0x[0-9a-f]+)/g)].map(match=>match[1]).slice(0,8);
+  const projectionActive=(await adb(['shell','dumpsys','media_projection'])).includes('local.auralink.mobile');
+  const wakeLeaseHeld=/PARTIAL_WAKE_LOCK[^\n]*local\.auralink\.mobile:active-room/.test(await adb(['shell','dumpsys','power']));
+  return {appResumed:resumed.includes('local.auralink.mobile'),nativeViews,surfaces,serviceTypes,projectionActive,wakeLeaseHeld};
+}
 async function type(value) {
   assert.ok(!value.includes("'"));
   try {await adb(['shell',`input text '${value.replaceAll(' ','%s')}'`]);}
@@ -829,6 +856,9 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     assert.ok(lifecycleBefore.created>0,'The isolated emulator must expose the actual app Activity creation callback');
     assert.ok(screenBefore?.nonBlank && screenBefore.trackId);
     let lifecycleAfter,recreateAfter,screenAfter;
+    runtimeDiagnostics.activityRecreation={stage:'before configuration change',lifecycleBefore,originalFontScale,
+      nextFontScale,nativeBefore:await nativeWindowState()};
+    await screenshot('android-emulator-recreation-before.png');
     try {
       await adb(['shell','settings','put','system','font_scale',nextFontScale]);
       const recreationDeadline=Date.now()+30000;
@@ -840,6 +870,15 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       assert.ok(lifecycleAfter.created>lifecycleBefore.created && lifecycleAfter.destroyed>lifecycleBefore.destroyed && lifecycleAfter.relaunched>lifecycleBefore.relaunched,
         'The font change must cause real native Activity destruction, creation and WM relaunch');
       assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),processBefore);
+      await screenshot('android-emulator-recreation-after.png');
+      runtimeDiagnostics.activityRecreation={...runtimeDiagnostics.activityRecreation,stage:'native Activity callbacks completed',lifecycleAfter,
+        appliedFontScale:(await adb(['shell','settings','get','system','font_scale'])).trim(),sameProcess:true,nativeAfter:await nativeWindowState(),
+        decodedScreen:screenAfter?{width:screenAfter.width,height:screenAfter.height,frames:screenAfter.frames,hash:screenAfter.hash,
+          nonBlank:screenAfter.nonBlank,sameTrack:screenAfter.trackId===screenBefore.trackId}:null,
+        audioPackets:recreateAfter.row?.receivedAudioPackets || 0,playbackContextState:recreateAfter.row?.playbackContextState || 'off'};
+      checkpoint('sharingActivityRecreationProgress',runtimeDiagnostics.activityRecreation);
+      await page.locator('#public-screen').screenshot({path:path.join(output,'android-emulator-recreation-receiver.png')});
+      publicPhase('require recreated native room view and owner controls');
       await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
       await findNativeRoomAction(label('Turn microphone off'));
       assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
@@ -857,6 +896,12 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       checkpoint('sharingActivityRecreation',{passed:true,trigger:'Owner font-scale configuration change',actualCreateAndDestroyCallbacks:true,
         actualWindowManagerRelaunch:true,sameProcess:true,sameRoom:true,sameScreenTrack:true,projectionRemainedActive:true,changedDecodedPixels:true,microphonePacketsAdvanced:true,
         productionDebugBridgeUsed:false,physicalPhoneVerified:false});
+    } catch(error) {
+      runtimeDiagnostics.activityRecreation={...runtimeDiagnostics.activityRecreation,stage:'recreation check failed',
+        lifecycleAfter:await lifecycleCounts().catch(()=>null),nativeFailure:await nativeWindowState().catch(()=>null)};
+      await screenshot('android-emulator-recreation-after.png').catch(()=>{});
+      await page.locator('#public-screen').screenshot({path:path.join(output,'android-emulator-recreation-receiver.png')}).catch(()=>{});
+      throw error;
     } finally {
       if(originalFontScale==='null')await adb(['shell','settings','delete','system','font_scale']);
       else await adb(['shell','settings','put','system','font_scale',originalFontScale]);

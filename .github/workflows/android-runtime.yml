@@ -109,6 +109,10 @@ jobs:
             test-results/android-emulator-sharing.png
             test-results/android-emulator-native-control-consent.png
             test-results/android-emulator-remotely-opened-home.png
+            test-results/android-emulator-recreation-before.png
+            test-results/android-emulator-recreation-after.png
+            test-results/android-emulator-recreation-receiver.png
+            test-results/android-emulator-failure.png
           if-no-files-found: error
           retention-days: 7
       - name: Stop the isolated emulator
