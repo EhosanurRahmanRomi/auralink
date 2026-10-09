@@ -13,6 +13,7 @@ import android.view.accessibility.AccessibilityWindowInfo;
 import org.xmlpull.v1.XmlSerializer;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.util.ArrayList;
 import java.util.List;
 
 /** Isolated test observer. Never connects with the default service-suppressing flags. */
@@ -20,8 +21,11 @@ public final class HierarchyInstrumentation extends Instrumentation {
     private static final int MAX_NODES = 20000;
     private static final int MAX_DEPTH = 128;
     private int nodeCount;
+    private String expectedPackage;
 
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
+    @Override public void onCreate(Bundle arguments) {
+        super.onCreate(arguments); expectedPackage = arguments == null ? null : arguments.getString("expected_package"); start();
+    }
 
     @Override public void onStart() {
         Bundle result = new Bundle();
@@ -29,39 +33,52 @@ public final class HierarchyInstrumentation extends Instrumentation {
         File temporary = new File(getContext().getFilesDir(), "hierarchy.tmp");
         // A failed invocation must not expose a previous successful snapshot.
         destination.delete(); temporary.delete();
+        List<AccessibilityWindowInfo> windows = null;
+        List<AccessibilityNodeInfo> roots = new ArrayList<>();
         try {
+            if (expectedPackage != null && (expectedPackage.length() > 128 || !expectedPackage.matches("[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z][a-zA-Z0-9_]*)+")))
+                throw new IllegalArgumentException("Invalid expected package");
             UiAutomation automation = getUiAutomation(UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
             if (automation == null) throw new IllegalStateException("UiAutomation unavailable");
             AccessibilityServiceInfo info = automation.getServiceInfo();
             info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
             info.flags &= ~AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
             automation.setServiceInfo(info);
-            // A video call need not become idle. Wait only for nonempty window
-            // roots, then serialize actual current nodes without interacting.
+            // Cold UiAutomation can expose SystemUI before the app's root.
+            // Room observations optionally wait for that exact visible root,
+            // without requiring idle, interacting or suppressing services.
             long deadline = SystemClock.uptimeMillis() + 5000;
-            List<AccessibilityWindowInfo> windows;
+            boolean ready = false;
             do {
                 windows = automation.getWindows();
-                if (windows != null && !windows.isEmpty()) break;
+                if (windows != null) for (AccessibilityWindowInfo window : windows) roots.add(window.getRoot());
+                ready = expectedPackage == null ? windows != null && !windows.isEmpty() : hasExpectedRoot(roots);
+                if (ready && (expectedPackage == null || SystemClock.uptimeMillis() <= deadline)) break;
+                ready = false; recycleSnapshot(windows, roots); windows = null; roots.clear();
+                if (SystemClock.uptimeMillis() >= deadline) break;
                 SystemClock.sleep(100);
             } while (SystemClock.uptimeMillis() < deadline);
+            if (expectedPackage != null && !ready) throw new IllegalStateException("Expected visible app root unavailable");
             try (FileOutputStream stream = new FileOutputStream(temporary)) {
                 XmlSerializer xml = Xml.newSerializer(); xml.setOutput(stream, "UTF-8");
                 xml.startDocument("UTF-8", true); xml.startTag(null, "hierarchy");
                 xml.attribute(null, "observation-flags", "dont-suppress-accessibility-services");
+                if (expectedPackage != null) xml.attribute(null, "expected-package", expectedPackage);
                 if (windows != null) {
-                    for (AccessibilityWindowInfo window : windows) {
-                        try {
-                            AccessibilityNodeInfo root = window.getRoot();
+                    for (int windowIndex = 0; windowIndex < windows.size(); windowIndex++) {
+                            AccessibilityWindowInfo window = windows.get(windowIndex);
+                            AccessibilityNodeInfo root = roots.get(windowIndex);
                             if (root == null) continue;
                             xml.startTag(null, "window");
                             xml.attribute(null, "id", Integer.toString(window.getId()));
                             xml.attribute(null, "type", Integer.toString(window.getType()));
+                            // Serialize the SAME retained roots that proved
+                            // readiness; writeNode owns/recycles this root.
+                            roots.set(windowIndex, null);
                             writeNode(xml, root, 0, 0); xml.endTag(null, "window");
-                        } finally { window.recycle(); }
                     }
                 }
-                if (nodeCount == 0) {
+                if (nodeCount == 0 && expectedPackage == null) {
                     AccessibilityNodeInfo root = automation.getRootInActiveWindow();
                     if (root != null) writeNode(xml, root, 0, 0);
                 }
@@ -73,6 +90,7 @@ public final class HierarchyInstrumentation extends Instrumentation {
             result.putString("output", "files/hierarchy.xml");
             result.putInt("nodes", nodeCount);
             result.putBoolean("accessibility_services_preserved", true);
+            if (expectedPackage != null) result.putBoolean("expected_package_ready", true);
             finish(Activity.RESULT_OK, result);
         } catch (Exception failure) {
             temporary.delete(); destination.delete();
@@ -80,7 +98,21 @@ public final class HierarchyInstrumentation extends Instrumentation {
             result.putString("qa_hierarchy", "failed");
             result.putString("failure_type", failure.getClass().getSimpleName());
             finish(Activity.RESULT_CANCELED, result);
+        } finally { recycleSnapshot(windows, roots); }
+    }
+
+    private boolean hasExpectedRoot(List<AccessibilityNodeInfo> roots) {
+        for (AccessibilityNodeInfo root : roots) {
+            if (root == null || !expectedPackage.contentEquals(root.getPackageName() == null ? "" : root.getPackageName()) || !root.isVisibleToUser()) continue;
+            Rect bounds = new Rect(); root.getBoundsInScreen(bounds);
+            if (bounds.width() > 0 && bounds.height() > 0) return true;
         }
+        return false;
+    }
+
+    private void recycleSnapshot(List<AccessibilityWindowInfo> windows, List<AccessibilityNodeInfo> roots) {
+        for (AccessibilityNodeInfo root : roots) if (root != null) root.recycle();
+        if (windows != null) for (AccessibilityWindowInfo window : windows) window.recycle();
     }
 
     private void writeNode(XmlSerializer xml, AccessibilityNodeInfo node, int index, int depth) throws Exception {

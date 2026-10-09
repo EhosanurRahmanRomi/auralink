@@ -50,13 +50,16 @@ async function adb(args,options={}) {
   return result.stdout;
 }
 function decodeXML(value) {return value.replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');}
-async function hierarchy() {
-  const result=await adb(['shell','am','instrument','-w','local.auralink.qa/.HierarchyInstrumentation'],{timeout:60000});
+async function hierarchy(expectedPackage) {
+  assert.ok(expectedPackage===undefined || expectedPackage==='local.auralink.mobile','The room observer can only expect the production app package');
+  const result=await adb(['shell','am','instrument','-w',...(expectedPackage?['-e','expected_package',expectedPackage]:[]),'local.auralink.qa/.HierarchyInstrumentation'],{timeout:60000});
   assert.ok(!/INSTRUMENTATION_FAILED|FAILURES!!!|shortMsg=/.test(result),'The non-suppressing hierarchy observer must run successfully');
   assert.match(result,/qa_hierarchy=ok/,'The separate observer must report a fresh successful snapshot');
   assert.match(result,/accessibility_services_preserved=true/,'The observer must preserve Accessibility services');
+  if(expectedPackage)assert.match(result,/expected_package_ready=true/,'Room snapshots must observe the requested visible production app root');
   const xml=await adb(['exec-out','run-as','local.auralink.qa','cat','files/hierarchy.xml']);
   assert.match(xml,/observation-flags="dont-suppress-accessibility-services"/);
+  if(expectedPackage)assert.match(xml,/expected-package="local\.auralink\.mobile"/);
   return [...xml.matchAll(/<node\b([^>]*?)(?:\/>|>)/g)].map(match=>Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(pair=>[pair[1],decodeXML(pair[2])])));
 }
 function coordinates(node) {
@@ -70,9 +73,9 @@ const dismissImmersiveTutorial=createImmersiveTutorialHandler({tap,onDismissed:(
   console.log(JSON.stringify({androidFullscreenTutorial:runtimeDiagnostics.immersiveTutorial}));
 }});
 async function roomHierarchy() {
-  let nodes=await hierarchy();
+  let nodes=await hierarchy('local.auralink.mobile');
   if (await dismissImmersiveTutorial(nodes)) {
-    await delay(300);nodes=await hierarchy();
+    await delay(300);nodes=await hierarchy('local.auralink.mobile');
     await dismissImmersiveTutorial(nodes); // A persistent tutorial fails; never retry the tap or scroll it.
   }
   return nodes;
@@ -151,9 +154,21 @@ async function findNativeRoomAction(predicate,timeout=30000,observe) {
   } catch(error) { throw new Error(`${error.message} during ${phase}`); }
 }
 async function readNativePublicStat(labelText,valuePattern,timeout=30000) {
+  assert.ok(['Audio received','Audio playback processing'].includes(labelText),'Only the whitelisted native media statistics may be observed');
   let value;
   await findNativeRoomAction((node,nodes)=>(node.text || node['content-desc'])===labelText && diagnosticValue(node,nodes,valuePattern)!==null,
-    timeout,(nodes,node)=>{value=node ? diagnosticValue(node,nodes,valuePattern) : null;});
+    timeout,(nodes,node)=>{
+      value=node ? diagnosticValue(node,nodes,valuePattern) : null;
+      const safeNode=entry=>({class: /^android\.[\w.]+$/.test(entry.class || '') ? entry.class : '[unrecognized]',
+        bounds:/^\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]$/.test(entry.bounds || '') ? entry.bounds : '[malformed]',
+        text:entry.text || entry['content-desc'],visible:entry['visible-to-user']==='true'});
+      const labels=nodes.filter(entry=>entry.package==='local.auralink.mobile' && (entry.text || entry['content-desc'])===labelText).slice(0,8);
+      const values=nodes.filter(entry=>entry.package==='local.auralink.mobile' &&
+        /^(?:\d{1,15} packets|running|suspended|interrupted|off)$/.test(entry.text || entry['content-desc'] || '')).slice(0,24);
+      runtimeDiagnostics.nativeStatObservations ||= {};
+      runtimeDiagnostics.nativeStatObservations[labelText]={phase,appRootObserved:nodes.some(entry=>entry.package==='local.auralink.mobile'),
+        labels:labels.map(safeNode),values:values.map(safeNode),pairedValue:value};
+    });
   assert.ok(value!==null && value!==undefined,'Native diagnostics require a visible label and value in the same stable app snapshot');
   return value;
 }
