@@ -8,6 +8,58 @@ function rect(node) {
   return box && box.every(Number.isSafeInteger) && box[2] > box[0] && box[3] > box[1] ? box : null;
 }
 const appPackage = 'local.auralink.mobile';
+function parseNativeHierarchy(xml) {
+  const nodes=[],ancestors=[];let window=null,root;
+  const decode=value=>value.replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
+  for(const [,closing,tag,attributes,selfClosing] of xml.matchAll(/<(\/?)(window|node)\b([^>]*?)(\/?)>/g)) {
+    if(closing) {if(tag==='node')ancestors.pop();else {window=null;root=undefined;}continue;}
+    const values=Object.fromEntries([...attributes.matchAll(/([\w-]+)="([^"]*)"/g)].map(([,key,value])=>[key,decode(value)]));
+    if(tag==='window') {window=values;root=undefined;ancestors.length=0;continue;}
+    if(root===undefined)root=nodes.length;
+    const node={...values,_observerWindowId:window?.id,_observerWindowType:window?.type,_observerWindowRoot:root,
+      _observerAncestors:[...ancestors]};
+    nodes.push(node);if(!selfClosing)ancestors.push(nodes.length-1);
+  }
+  return nodes;
+}
+function nativeQualityOption(nodes,quality) {
+  if(!['720','1080'].includes(quality))return null;
+  const contained=(node,container)=>fits(node,rect(container));
+  const views=nodes.filter(node=>node.package===appPackage && node.class==='android.webkit.WebView' && node._observerWindowType==='1' && node._observerWindowId &&
+    node['visible-to-user']==='true' && rect(node)?.every(value=>value>=0));
+  const options=[];
+  for(const node of nodes) {
+    if(node.package!==appPackage || !['android.widget.CheckedTextView','android.widget.TextView'].includes(node.class) ||
+      node.text!==`${quality}p` || node.enabled!=='true' || node['visible-to-user']!=='true' ||
+      !rect(node) || node._observerWindowType!=='1' || !node._observerWindowId || !Array.isArray(node._observerAncestors))continue;
+    const root=nodes[node._observerWindowRoot];
+    if(!root || root.package!==appPackage || root._observerWindowId!==node._observerWindowId ||
+      root['visible-to-user']!=='true' || !rect(root)?.every(value=>value>=0) || !contained(node,root))continue;
+    const containers=node._observerAncestors.map(index=>nodes[index]).filter(parent=>parent && parent.package===appPackage &&
+      parent._observerWindowId===node._observerWindowId && parent.class==='android.widget.ListView' &&
+      parent['visible-to-user']==='true' && parent.enabled==='true' && contained(node,parent) && contained(parent,root));
+    if(containers.length!==1)continue;
+    // A native dropdown lives in its own observed application window. Require
+    // the row to fit the current visible WebView too, including owner resizes.
+    const view=views.find(value=>value._observerWindowId!==node._observerWindowId && contained(node,value));
+    if(!view)continue;
+    const container=containers[0];
+    options.push({node,container,root,view,identity:JSON.stringify([node._observerWindowId,node.class,node['resource-id'] || '',
+      node.text,node.bounds,container.class,container.bounds,root.bounds,view.bounds])});
+  }
+  return options.length===1 ? options[0] : null;
+}
+async function findNativeQualityOption(quality,{read,wait,now=Date.now,timeout=30000,observe}) {
+  const deadline=now()+timeout;let previous;
+  do {
+    const nodes=await read(),option=nativeQualityOption(nodes,quality);
+    observe?.(nodes,option);
+    if(now()>=deadline)break;
+    if(option && option.identity===previous)return option;
+    previous=option?.identity;await wait(300);
+  }while(now()<deadline);
+  throw new Error(`Native quality option ${quality}p did not expose stable contained bounds before the deadline`);
+}
 function viewport(nodes) {
   const view = rect(nodes.find(node => node.class === 'android.webkit.WebView' && node.package === appPackage &&
     node['visible-to-user'] === 'true' && rect(node) && rect(node)[0] >= 0 && rect(node)[1] >= 0));
@@ -155,4 +207,5 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
   throw new Error(observedViewport ? 'Room action did not expose stable fully visible native bounds before the deadline' :
     'Production WebView did not expose a valid observed viewport before the deadline');
 }
-module.exports = {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue};
+module.exports = {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue,
+  parseNativeHierarchy,nativeQualityOption,findNativeQualityOption};

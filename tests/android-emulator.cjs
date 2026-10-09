@@ -14,7 +14,7 @@ const selfsigned=require('selfsigned');
 const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
-const {findRoomAction,diagnosticValue,gestureBlockers}=require('./android-room-action.cjs');
+const {findRoomAction,diagnosticValue,gestureBlockers,parseNativeHierarchy,findNativeQualityOption}=require('./android-room-action.cjs');
 const {visibleInWebView,createImmersiveTutorialHandler}=require('./android-hierarchy.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
@@ -49,7 +49,6 @@ async function adb(args,options={}) {
   const result=await exec(adbPath,['-s',serial,...args],{encoding:'utf8',timeout:30000,maxBuffer:16*1024*1024,windowsHide:true,...options});
   return result.stdout;
 }
-function decodeXML(value) {return value.replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');}
 async function hierarchy(expectedPackage) {
   assert.ok(expectedPackage===undefined || expectedPackage==='local.auralink.mobile','The room observer can only expect the production app package');
   const result=await adb(['shell','am','instrument','-w',...(expectedPackage?['-e','expected_package',expectedPackage]:[]),'local.auralink.qa/.HierarchyInstrumentation'],{timeout:60000});
@@ -60,7 +59,7 @@ async function hierarchy(expectedPackage) {
   const xml=await adb(['exec-out','run-as','local.auralink.qa','cat','files/hierarchy.xml']);
   assert.match(xml,/observation-flags="dont-suppress-accessibility-services"/);
   if(expectedPackage)assert.match(xml,/expected-package="local\.auralink\.mobile"/);
-  return [...xml.matchAll(/<node\b([^>]*?)(?:\/>|>)/g)].map(match=>Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map(pair=>[pair[1],decodeXML(pair[2])])));
+  return parseNativeHierarchy(xml);
 }
 function coordinates(node) {
   const match=node.bounds?.match(/^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$/);assert.ok(match,`Missing bounds for ${node.text || node['content-desc']}`);
@@ -144,6 +143,29 @@ async function tapStable(predicate,timeout=30000) {
     previous=node?.bounds;await delay(300);
   }while(Date.now()<deadline);
   throw new Error(`Android action did not expose stable visible bounds during ${phase}`);
+}
+async function tapNativeQualityOption(quality) {
+  const started=Date.now(),search={quality,observations:[],observationCount:0,result:'in-progress'};
+  runtimeDiagnostics.nativeFullscreenQualityRoundTrip.popupSearches ||= [];
+  runtimeDiagnostics.nativeFullscreenQualityRoundTrip.popupSearches.push(search);
+  const structural=node=>node ? {class:node.class,package:node.package,resourceId:node['resource-id'] || '',bounds:node.bounds,
+    visible:node['visible-to-user']==='true',enabled:node.enabled==='true',windowId:node._observerWindowId,
+    windowType:node._observerWindowType} : null;
+  try {
+    const option=await findNativeQualityOption(quality,{read:()=>hierarchy('local.auralink.mobile'),wait:delay,observe:(nodes,found)=>{
+      search.observationCount++;
+      search.observations.push({atMs:Date.now()-started,selected:structural(found?.node),container:structural(found?.container),
+        windowRoot:structural(found?.root),webView:structural(found?.view),
+        qualityRows:nodes.filter(node=>node.package==='local.auralink.mobile' && ['Auto','720p','1080p','1440p'].includes(node.text) &&
+          ['android.widget.CheckedTextView','android.widget.TextView'].includes(node.class)).slice(0,12)
+          .map(node=>({...structural(node),text:node.text})),
+        containers:nodes.filter(node=>node.package==='local.auralink.mobile' &&
+          (node.class==='android.widget.ListView' || node.class==='android.webkit.WebView' || nodes[node._observerWindowRoot]===node))
+          .slice(0,16).map(structural)});
+      if(search.observations.length>20)search.observations.shift();
+    }});
+    await tap(option.node);search.result='tapped';
+  }catch(error){search.result='failed';throw new Error(`${error.message} during ${phase}`);}
 }
 async function tapRoomAction(predicate,timeout=30000) {
   const node=await findNativeRoomAction(predicate,timeout);await tap(node);return node;
@@ -1040,8 +1062,7 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
             const packetsBefore=(await relayStats()).row.receivedAudioPackets;
             const frameBefore=await page.evaluate(()=>publicScreenSnapshot());
             await tap(await findNode((node,nodes)=>node['resource-id']==='presentation-quality' && visibleInWebView(node,nodes) && node.enabled==='true'));
-            await tapStable(node=>['android.widget.CheckedTextView','android.widget.TextView'].includes(node.class) &&
-              ['local.auralink.mobile','android'].includes(node.package) && node.text===`${quality}p` && visible(node) && node.enabled==='true');
+            await tapNativeQualityOption(quality);
             await findNode((node,nodes)=>node['resource-id']==='presentation-quality' && visibleInWebView(node,nodes) &&
               (node.text===`${quality}p` || (node['content-desc'] || '').includes(`${quality}p`)));
             const nativeDeadline=Date.now()+15000;let display;

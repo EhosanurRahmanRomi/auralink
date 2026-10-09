@@ -1,7 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue} = require('./android-room-action.cjs');
+const {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue,
+  parseNativeHierarchy,nativeQualityOption,findNativeQualityOption} = require('./android-room-action.cjs');
 
 const packageName = 'local.auralink.mobile';
 const view = {class:'android.webkit.WebView',package:packageName,'visible-to-user':'true',bounds:'[0,136][720,1245]'};
@@ -15,6 +16,90 @@ function fixture(read) {
   return {swipes, options:{read:() => Promise.resolve(read(swipes)),swipe:(...coords) => {swipes.push(coords);},
     wait:async ms => {clock += ms;},now:() => clock,timeout:12000}};
 }
+function qualityPopupFixture() {
+  // Model the native dropdown below y1147 in the resized1080x1920 failure
+  // screenshot. These are representative rectangles, not a retained node dump.
+  return parseNativeHierarchy(`<hierarchy>
+    <window id="10" type="1"><node class="android.widget.FrameLayout" package="${packageName}" visible-to-user="true" bounds="[0,0][1080,1920]">
+      <node class="android.webkit.WebView" package="${packageName}" visible-to-user="true" bounds="[0,0][1080,1920]" />
+    </node></window>
+    <window id="11" type="1"><node class="android.widget.FrameLayout" package="${packageName}" visible-to-user="true" bounds="[830,1390][910,1640]">
+      <node class="android.widget.ListView" package="${packageName}" enabled="true" visible-to-user="true" bounds="[830,1390][910,1640]">
+        <node class="android.widget.CheckedTextView" package="${packageName}" resource-id="android:id/text1" text="Auto" enabled="true" visible-to-user="true" bounds="[830,1390][910,1450]" />
+        <node class="android.widget.CheckedTextView" package="${packageName}" resource-id="android:id/text1" text="720p" enabled="true" visible-to-user="true" bounds="[830,1450][910,1510]" />
+        <node class="android.widget.CheckedTextView" package="${packageName}" resource-id="android:id/text1" text="1080p" enabled="true" visible-to-user="true" bounds="[830,1510][910,1570]" />
+        <node class="android.widget.CheckedTextView" package="${packageName}" resource-id="android:id/text1" text="1440p" enabled="false" visible-to-user="true" bounds="[830,1570][910,1640]" />
+      </node>
+    </node></window></hierarchy>`);
+}
+test('quality popup visibility follows its observed resized window and native ListView rather than y1147', () => {
+  const nodes=qualityPopupFixture(),option=nativeQualityOption(nodes,'720');
+  assert.equal(option.node.text,'720p');assert.equal(option.node.bounds,'[830,1450][910,1510]');
+  assert.equal(option.container.class,'android.widget.ListView');assert.equal(option.root._observerWindowId,'11');
+  assert.equal(option.view.bounds,'[0,0][1080,1920]');
+  assert.equal(nativeQualityOption(nodes,'1080').node.text,'1080p');
+  assert.equal(nativeQualityOption(nodes,'1440'),null,'Android1440 is not an available outgoing ceiling');
+});
+test('native hierarchy parsing retains real parent and window identity across nested and leaf nodes', () => {
+  const nodes=qualityPopupFixture(),row=nodes.find(node=>node.text==='720p');
+  assert.deepEqual(row._observerAncestors.map(index=>nodes[index].class),['android.widget.FrameLayout','android.widget.ListView']);
+  assert.equal(nodes[row._observerWindowRoot]._observerWindowId,row._observerWindowId);
+  assert.equal(nodes.find(node=>node.class==='android.webkit.WebView')._observerWindowId,'10');
+  const escaped=parseNativeHierarchy('<window id="1" type="1"><node text="&lt;A&amp;B&gt;&quot;&apos;" bounds="[0,0][1,1]" /></window>');
+  assert.equal(escaped[0].text,'<A&B>"\'');assert.deepEqual(escaped[0]._observerAncestors,[]);
+});
+test('native quality rows reject hidden disabled clipped malformed foreign or unowned containers', () => {
+  const mutations=[
+    nodes=>{nodes.find(node=>node.text==='720p')['visible-to-user']='false';},
+    nodes=>{nodes.find(node=>node.text==='720p').enabled='false';},
+    nodes=>{nodes.find(node=>node.text==='720p').package='android';},
+    nodes=>{nodes.find(node=>node.text==='720p').text='720p screen';},
+    nodes=>{nodes.find(node=>node.text==='720p').class='android.widget.Button';},
+    nodes=>{nodes.find(node=>node.text==='720p').bounds='[829,1450][910,1510]';},
+    nodes=>{nodes.find(node=>node.text==='720p').bounds='[830,1450][910,1641]';},
+    nodes=>{nodes.find(node=>node.text==='720p').bounds='[830,1450][830,1510]';},
+    nodes=>{nodes.find(node=>node.text==='720p').bounds='[invalid]';},
+    nodes=>{nodes.find(node=>node.text==='720p')._observerWindowId='12';},
+    nodes=>{nodes.find(node=>node.text==='720p')._observerWindowType='3';},
+    nodes=>{nodes.find(node=>node.text==='720p')._observerAncestors=[];},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView').package='com.android.systemui';},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView')['visible-to-user']='false';},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView').enabled='false';},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView').bounds='[830,1451][910,1640]';},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView').bounds='[830,1390][911,1640]';},
+    nodes=>{nodes[2].package='com.android.systemui';},
+    nodes=>{nodes[2]['visible-to-user']='false';},
+    nodes=>{nodes[2].bounds='[-1,1390][910,1640]';},
+    nodes=>{nodes.find(node=>node.class==='android.webkit.WebView').bounds='[0,0][1080,1480]';},
+    nodes=>{nodes.find(node=>node.class==='android.webkit.WebView')['visible-to-user']='false';},
+    nodes=>{nodes.find(node=>node.class==='android.webkit.WebView').package='com.android.systemui';},
+    nodes=>{nodes.find(node=>node.class==='android.webkit.WebView')._observerWindowId='11';}
+  ];
+  for(const [index,mutate] of mutations.entries()) {
+    const nodes=qualityPopupFixture();mutate(nodes);assert.equal(nativeQualityOption(nodes,'720'),null,`mutation${index}`);
+  }
+});
+test('ambiguous quality rows or nested native list containers never select an arbitrary option', () => {
+  const duplicate=qualityPopupFixture();duplicate.push({...duplicate.find(node=>node.text==='720p')});
+  assert.equal(nativeQualityOption(duplicate,'720'),null);
+  const nested=qualityPopupFixture(),list=nested.find(node=>node.class==='android.widget.ListView');
+  const next=nested.length;nested.push({...list});nested.find(node=>node.text==='720p')._observerAncestors.push(next);
+  assert.equal(nativeQualityOption(nested,'720'),null);
+});
+test('quality selection requires two consecutive identical current row container and window bounds', async () => {
+  const first=qualityPopupFixture(),second=qualityPopupFixture(),third=qualityPopupFixture();
+  second[2].bounds=third[2].bounds='[830,1380][910,1640]';
+  let reads=0,clock=0;const snapshots=[first,second,third];
+  const found=await findNativeQualityOption('720',{read:async()=>snapshots[reads++],wait:async ms=>{clock+=ms;},now:()=>clock,timeout:2000});
+  assert.equal(reads,3);assert.equal(found.root.bounds,'[830,1380][910,1640]');
+});
+test('missing native popup fails within the original bounded deadline without selecting a DOM label', async () => {
+  const nodes=qualityPopupFixture().slice(0,2);nodes.push({...button('[830,1450][910,1510]'),text:'720p',class:'android.widget.TextView'});
+  let clock=0,observations=0;
+  await assert.rejects(findNativeQualityOption('720',{read:async()=>nodes,wait:async ms=>{clock+=ms;},now:()=>clock,
+    timeout:1200,observe:()=>observations++}),/stable contained bounds before the deadline/);
+  assert.equal(clock,1200);assert.equal(observations,4);
+});
 test('fully visible stable resource ID is found even when accessible text is the HTML title', async () => {
   const state = fixture(() => [view,navBand,nav,button('[66,843][655,911]')]);
   assert.equal((await findRoomAction(target,state.options)).bounds,'[66,843][655,911]');
