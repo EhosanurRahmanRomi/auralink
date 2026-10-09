@@ -1,16 +1,16 @@
 <div align="center">
 
-<img src="build/icon.png" width="144" alt="Glance-Port logo">
+<img src="docs/assets/glance-port-banner.svg" width="1200" alt="Glance-Port — a shared view, a closer connection">
 
 # Glance-Port
 
-[![Build & checks](https://github.com/EhosanurRahmanRomi/auralink/actions/workflows/ci.yml/badge.svg)](https://github.com/EhosanurRahmanRomi/auralink/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/EhosanurRahmanRomi/auralink?color=9ba7ff)](https://github.com/EhosanurRahmanRomi/auralink/releases/latest)
-[![MIT](https://img.shields.io/badge/License-MIT-71e7ef.svg)](LICENSE)
+[![Build & checks](https://github.com/EhosanurRahmanRomi/glance-port/actions/workflows/ci.yml/badge.svg)](https://github.com/EhosanurRahmanRomi/glance-port/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/EhosanurRahmanRomi/glance-port?color=f4adc3)](https://github.com/EhosanurRahmanRomi/glance-port/releases/latest)
+[![MIT](https://img.shields.io/badge/License-MIT-f6d3a1.svg)](LICENSE)
 
 **Share your screen. Talk it through. Help with permission.**
 
-[Download test builds](https://github.com/EhosanurRahmanRomi/auralink/releases/latest) · [Gallery](#gallery) · [Device tests](docs/TESTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Report an issue](https://github.com/EhosanurRahmanRomi/auralink/issues/new/choose)
+[Download test builds](https://github.com/EhosanurRahmanRomi/glance-port/releases/latest) · [Gallery](#gallery) · [Device tests](docs/TESTING.md) · [Architecture](docs/ARCHITECTURE.md) · [Report an issue](https://github.com/EhosanurRahmanRomi/glance-port/issues/new/choose)
 
 </div>
 
@@ -18,7 +18,7 @@ Glance-Port is an open-source screen-sharing and attended remote-control app for
 
 The room flow is **Open a room → copy its invitation → join from the other device**. Invitation holders enter automatically while invitations are open. Screen capture and remote control remain separate, deliberate actions.
 
-**0.5.0 introduces the Glance-Port name and supplied logo, fullscreen presentation with reachable call controls, and bounded Android background retention.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/auralink/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
+**0.5.0 introduces the Glance-Port name and supplied logo, fullscreen presentation with reachable call controls, and bounded Android background retention.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/glance-port/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
 
 ## Download and connect
 
@@ -81,6 +81,8 @@ macOS requires **Microphone**, **Screen Recording** and **Accessibility** only f
 Use Node.js 24, npm and Git. Source and outputs stay on your computer.
 
 ```sh
+git clone https://github.com/EhosanurRahmanRomi/glance-port.git
+cd glance-port
 npm ci
 npm start
 npm run dist:win:setup -- --publish never
