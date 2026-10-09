@@ -22,13 +22,15 @@ The room flow is **Open a room → copy its invitation → join from the other d
 
 ## Download and connect
 
-Expand **Assets** on the release page and choose a matching version:
+Download **Glance-Port 0.5.0** for your device below. Use the same version on every device.
 
-| Device | Package |
+| Device | Download installer |
 |---|---|
-| Windows 11 / x64 | Glance-Port-Setup-VERSION-Windows-x64.exe |
-| MacBook Air M4 / Apple Silicon, macOS 13+ | Glance-Port-VERSION-Mac-arm64.dmg |
-| Android 10+, including iQOO | Glance-Port-VERSION-Android.apk |
+| Windows 11 / x64 | [Download for Windows (.exe)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/Glance-Port-Setup-0.5.0-Windows-x64.exe) |
+| MacBook Air M4 / Apple Silicon, macOS 13+ | [Download for Mac (.dmg)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/Glance-Port-0.5.0-Mac-arm64.dmg) |
+| Android 10+, including iQOO | [Download for Android (.apk)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/Glance-Port-0.5.0-Android.apk) |
+
+[Installation guide](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/START-HERE.md) · [Source ZIP](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/Glance-Port-0.5.0-source.zip) · [Checksums](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/SHA256SUMS.txt) · [Verification report](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.5.0/RELEASE-VERIFICATION.json) · [All releases](https://github.com/EhosanurRahmanRomi/glance-port/releases)
 
 Releases include checksums, source and a report describing the exact build and completed checks. Windows test installers are unsigned; Mac test builds are ad-hoc signed and unnotarized. Android uses the project's stable local development signing identity.
 
