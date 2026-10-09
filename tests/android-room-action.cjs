@@ -63,6 +63,24 @@ async function findNativeQualityOption(quality,{read,wait,now=Date.now,timeout=3
   }while(now()<deadline);
   throw new Error(`Native quality option ${quality}p did not expose stable contained bounds before the deadline`);
 }
+// This function runs only in the isolated fixture receiver, whose publicRTC
+// is the real production RoomRTC. Internal relay peers count decoded blocks
+// as audioPackets; receivedAudioPackets belongs only to the projected stats row.
+function nativeQualityContinuity({id,trackId,frames,w,h,packetsBefore,diagnose=false}) {
+  const screen=publicScreenSnapshot(),peer=publicRTC.relayMedia.peers.get(id),audio=peer?.outputs.get('audio');
+  const result={screenPresent:Boolean(screen),nonBlank:screen?.nonBlank===true,
+    sameScreenTrack:screen?.trackId===trackId,width:screen?.width || 0,height:screen?.height || 0,
+    dimensionsMatch:screen?.width===w && screen?.height===h,frames:screen?.frames ?? 0,
+    framesAdvanced:Number.isSafeInteger(screen?.frames) && screen.frames>frames,
+    sameDeviceAudioOutput:Boolean(audio && audio===window.qualityAudioOutput),
+    sameDeviceAudioTrack:Boolean(audio?.track && audio.track===window.qualityAudioTrack),
+    playbackContextState:audio?.context?.state || 'off',
+    receivedAudioPackets:Number.isSafeInteger(peer?.audioPackets) ? peer.audioPackets : null,
+    audioPacketsAdvanced:Number.isSafeInteger(peer?.audioPackets) && peer.audioPackets>packetsBefore};
+  result.passed=result.screenPresent && result.nonBlank && result.sameScreenTrack && result.dimensionsMatch && result.framesAdvanced &&
+    result.sameDeviceAudioOutput && result.sameDeviceAudioTrack && result.playbackContextState==='running' && result.audioPacketsAdvanced;
+  return diagnose ? result : result.passed;
+}
 function viewport(nodes) {
   const view = rect(nodes.find(node => node.class === 'android.webkit.WebView' && node.package === appPackage &&
     node['visible-to-user'] === 'true' && rect(node) && rect(node)[0] >= 0 && rect(node)[1] >= 0));
@@ -211,4 +229,4 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
     'Production WebView did not expose a valid observed viewport before the deadline');
 }
 module.exports = {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue,
-  parseNativeHierarchy,nativeQualityOption,findNativeQualityOption};
+  parseNativeHierarchy,nativeQualityOption,findNativeQualityOption,nativeQualityContinuity};

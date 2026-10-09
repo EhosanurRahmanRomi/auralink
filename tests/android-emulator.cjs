@@ -14,7 +14,7 @@ const selfsigned=require('selfsigned');
 const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
-const {findRoomAction,diagnosticValue,gestureBlockers,parseNativeHierarchy,findNativeQualityOption}=require('./android-room-action.cjs');
+const {findRoomAction,diagnosticValue,gestureBlockers,parseNativeHierarchy,findNativeQualityOption,nativeQualityContinuity}=require('./android-room-action.cjs');
 const {visibleInWebView,createImmersiveTutorialHandler}=require('./android-hierarchy.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
@@ -1070,11 +1070,18 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
             assert.equal(display.identity,captureBefore.identity,'Quality changes must resize the same native virtual display');
             assert.equal(display.width,w);assert.equal(display.height,h);
             await adb(['shell','input','keyevent','24']);
-            await page.waitForFunction(({id,trackId,frames,w,h,packetsBefore})=>{
-              const screen=publicScreenSnapshot(),peer=publicRTC.relayMedia.peers.get(id),audio=peer?.outputs.get('audio');
-              return screen?.nonBlank && screen.trackId===trackId && screen.width===w && screen.height===h && screen.frames>frames &&
-                audio===window.qualityAudioOutput && audio?.track===window.qualityAudioTrack && audio.context.state==='running' && peer.receivedAudioPackets>packetsBefore;
-            },{id:peerId,trackId:qualityScreenBefore.trackId,frames:frameBefore.frames,w,h,packetsBefore},{timeout:25000});
+            const continuity={id:peerId,trackId:qualityScreenBefore.trackId,frames:frameBefore.frames,w,h,packetsBefore};
+            const observation={quality,baseline:{frames:frameBefore.frames,receivedAudioPackets:packetsBefore},
+              native:{width:display.width,height:display.height,sameVirtualDisplay:display.identity===captureBefore.identity},
+              before:await page.evaluate(nativeQualityContinuity,{...continuity,diagnose:true})};
+            runtimeDiagnostics.nativeFullscreenQualityRoundTrip.continuityObservations ||= [];
+            runtimeDiagnostics.nativeFullscreenQualityRoundTrip.continuityObservations.push(observation);
+            try {await page.waitForFunction(nativeQualityContinuity,continuity,{timeout:25000});}
+            finally {
+              observation.current=await page.evaluate(nativeQualityContinuity,{...continuity,diagnose:true}).catch(()=>({receiverUnavailable:true}));
+              const latest=await captureDisplay().catch(()=>null);
+              observation.currentNative=latest ? {width:latest.width,height:latest.height,sameVirtualDisplay:latest.identity===captureBefore.identity} : null;
+            }
             const decoded=await page.evaluate(()=>publicScreenSnapshot());
             assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
             await findNode((node,nodes)=>label('Turn microphone on')(node) && visibleInWebView(node,nodes));

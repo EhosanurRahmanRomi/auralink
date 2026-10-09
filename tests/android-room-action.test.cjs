@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {findRoomAction, fits, viewport, gesturePath, gesturePaths, gestureBlockers, diagnosticValue,
-  parseNativeHierarchy,nativeQualityOption,findNativeQualityOption} = require('./android-room-action.cjs');
+  parseNativeHierarchy,nativeQualityOption,findNativeQualityOption,nativeQualityContinuity} = require('./android-room-action.cjs');
 
 const packageName = 'local.auralink.mobile';
 const view = {class:'android.webkit.WebView',package:packageName,'visible-to-user':'true',bounds:'[0,136][720,1245]'};
@@ -118,6 +118,41 @@ test('missing native popup fails within the original bounded deadline without se
   await assert.rejects(findNativeQualityOption('720',{read:async()=>nodes,wait:async ms=>{clock+=ms;},now:()=>clock,
     timeout:1200,observe:()=>observations++}),/stable contained bounds before the deadline/);
   assert.equal(clock,1200);assert.equal(observations,4);
+});
+test('quality continuity observes actual decoded relay audioPackets and rejects stale missing or replacement media', () => {
+  const previous=Object.fromEntries(['publicScreenSnapshot','publicRTC','window'].map(key=>[key,Object.getOwnPropertyDescriptor(globalThis,key)]));
+  const expected={id:'fixture-peer',trackId:'screen-track',frames:100,w:720,h:1280,packetsBefore:40};
+  const reset=()=>{
+    const track={},audio={track,context:{state:'running'}};
+    globalThis.window={qualityAudioOutput:audio,qualityAudioTrack:track};
+    globalThis.publicRTC={relayMedia:{peers:new Map([['fixture-peer',{audioPackets:41,outputs:new Map([['audio',audio]])}]])}};
+    globalThis.publicScreenSnapshot=()=>({trackId:'screen-track',frames:101,width:720,height:1280,nonBlank:true});
+    return publicRTC.relayMedia.peers.get('fixture-peer');
+  };
+  try {
+    reset();assert.equal(nativeQualityContinuity(expected),true);
+    assert.equal(nativeQualityContinuity({...expected,diagnose:true}).receivedAudioPackets,41);
+    const defects=[
+      peer=>{peer.audioPackets=40;},peer=>{delete peer.audioPackets;peer.receivedAudioPackets=999;},
+      peer=>{peer.audioPackets=NaN;},peer=>{peer.audioPackets=41.5;},
+      peer=>{peer.outputs.set('audio',{track:{},context:{state:'running'}});},
+      peer=>{peer.outputs.get('audio').track={};},peer=>{peer.outputs.get('audio').context.state='suspended';},
+      peer=>{peer.outputs.delete('audio');},
+      ()=>{globalThis.publicScreenSnapshot=()=>null;},
+      ()=>{globalThis.publicScreenSnapshot=()=>({trackId:'screen-track',frames:100,width:720,height:1280,nonBlank:true});},
+      ()=>{globalThis.publicScreenSnapshot=()=>({trackId:'replacement',frames:101,width:720,height:1280,nonBlank:true});},
+      ()=>{globalThis.publicScreenSnapshot=()=>({trackId:'screen-track',frames:101,width:1080,height:1920,nonBlank:true});},
+      ()=>{globalThis.publicScreenSnapshot=()=>({trackId:'screen-track',frames:101,width:720,height:1280,nonBlank:false});}
+    ];
+    for(const [index,defect] of defects.entries()) {
+      defect(reset());assert.equal(nativeQualityContinuity(expected),false,`continuity defect${index}`);
+      assert.equal(nativeQualityContinuity({...expected,diagnose:true}).passed,false);
+    }
+  }finally {
+    for(const [key,descriptor] of Object.entries(previous)) {
+      if(descriptor)Object.defineProperty(globalThis,key,descriptor);else delete globalThis[key];
+    }
+  }
 });
 test('fully visible stable resource ID is found even when accessible text is the HTML title', async () => {
   const state = fixture(() => [view,navBand,nav,button('[66,843][655,911]')]);
