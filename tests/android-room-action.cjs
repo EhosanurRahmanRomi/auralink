@@ -12,11 +12,26 @@ function viewport(nodes) {
   const view = rect(nodes.find(node => node.class === 'android.webkit.WebView' && node.package === appPackage &&
     node['visible-to-user'] === 'true' && rect(node) && rect(node)[0] >= 0 && rect(node)[1] >= 0));
   if (!view) return null;
-  const nav = rect(nodes.find(node => node.package === appPackage && node['visible-to-user'] === 'true' &&
-    node.class === 'android.widget.Button' && (node.text === 'Rooms' || node['content-desc'] === 'Rooms')));
-  const container = nav && nodes.map(rect).filter(box => box && box[0] <= view[0] && box[2] >= view[2] &&
-    box[1] <= nav[1] && box[3] >= nav[3] && box[3] - box[1] <= 200).sort((a,b) => a[3]-a[1]-(b[3]-b[1]))[0];
-  const area = [view[0], view[1] + 8, view[2], Math.min(view[3], container?.[1] ?? (nav ? nav[1] - 20 : view[3])) - 8];
+  const navigation = nodes.filter(node => node.package === appPackage && node['visible-to-user'] === 'true' &&
+    node.class === 'android.widget.Button' && ['Rooms','Devices','Settings'].includes(node.text || node['content-desc']));
+  const nav = rect(navigation.find(node => (node.text || node['content-desc']) === 'Rooms'));
+  const atLowerEdge = box => box && box[1] >= view[1] + (view[3] - view[1]) / 2 &&
+    box[3] <= view[3] && view[3] - box[3] <= 200;
+  const horizontallyInside = box => box && box[0] >= view[0] && box[2] <= view[2];
+  // A wider Android display uses a vertical sidebar. Its Rooms button is not
+  // a bottom obstruction: require an observed lower horizontal band or row.
+  const container = horizontallyInside(nav) && atLowerEdge(nav) && nodes.filter(node => node.package === appPackage &&
+    node['visible-to-user'] === 'true').map(rect).filter(box => atLowerEdge(box) &&
+      box[0] <= view[0] && box[2] >= view[2] && box[1] <= nav[1] && box[3] >= nav[3] &&
+      box[3] - box[1] <= 200).sort((a,b) => a[3]-a[1]-(b[3]-b[1]))[0];
+  const horizontalRow = horizontallyInside(nav) && atLowerEdge(nav) && navigation.some(node => {
+    const box = rect(node);
+    return (node.text || node['content-desc']) !== 'Rooms' && horizontallyInside(box) && atLowerEdge(box) &&
+      Math.abs(box[1] - nav[1]) <= 3 && Math.abs(box[3] - nav[3]) <= 3 &&
+      (box[2] <= nav[0] || box[0] >= nav[2]);
+  });
+  const bottom = container?.[1] ?? (horizontalRow ? nav[1] - 20 : view[3]);
+  const area = [view[0], view[1] + 8, view[2], Math.min(view[3], bottom) - 8];
   return area[3] > area[1] ? area : null;
 }
 function fits(node, area) {
