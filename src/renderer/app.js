@@ -1300,9 +1300,10 @@ async function recoverScreenAccess(error, epoch, rtc) {
   openDialog('screen-access-dialog');
 }
 $('screen-access-dialog').addEventListener('close', () => { if (!$('screen-access-dialog').open) state.screenAccessHelp = null; });
+$('screen-access-close').addEventListener('click', closeScreenAccessHelp);
 $('screen-access-open-settings').addEventListener('click', async () => {
   const help = state.screenAccessHelp;
-  if (!help || !roomCurrent(help.epoch, help.rtc)) return closeScreenAccessHelp();
+  if (!$('screen-access-dialog').open || !help || !roomCurrent(help.epoch, help.rtc)) return closeScreenAccessHelp();
   $('screen-access-open-settings').disabled = true;
   try {
     await bridge.openPermissionSettings('screen');
@@ -1313,7 +1314,7 @@ $('screen-access-open-settings').addEventListener('click', async () => {
 });
 $('screen-access-retry').addEventListener('click', () => {
   const help = state.screenAccessHelp;
-  if (!help || !roomCurrent(help.epoch, help.rtc)) return closeScreenAccessHelp();
+  if (!$('screen-access-dialog').open || !help || !roomCurrent(help.epoch, help.rtc)) return closeScreenAccessHelp();
   closeScreenAccessHelp();
   $('share-button').click();
 });
