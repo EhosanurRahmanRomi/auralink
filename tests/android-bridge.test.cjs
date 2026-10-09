@@ -36,6 +36,28 @@ test('device audio requires an active exact projection and remains separate from
   await assert.rejects(bridge.setSystemAudio({enabled:true,captureId:'current-screen'}),/owner-approved/);
   assert.equal(messages.some(item=>item.method==='setAudioRoute'||item.method==='grantControl'),false);
 });
+test('live screen quality uses only supported ceilings and the exact active capture without restarting media', async () => {
+  const {bridge,messages,receive}=setup({response:message=>message.method==='startScreenShare'?{captureId:'owned-screen'}:{ok:true,width:720,height:1280,maxEdge:1280,fps:12}});
+  for(const args of [null,{captureId:'owned-screen',quality:'720p'}]) await assert.rejects(bridge.setScreenQuality(args),/owner-approved/);
+  assert.equal(messages.length,0);
+  await bridge.startScreenShare({quality:'720p'});
+  for(const args of [{captureId:'stale-screen',quality:'1080p'},{captureId:'owned-screen',quality:'1440p'},{captureId:'owned-screen',quality:'auto'},{captureId:'owned-screen',quality:720}])
+    await assert.rejects(bridge.setScreenQuality(args),/owner-approved/);
+  assert.equal(messages.length,1,'Malformed or stale requests never reach the native capture');
+  const result=await bridge.setScreenQuality({captureId:'owned-screen',quality:'1080p',untrusted:'discarded'});
+  assert.equal(result.ok,true);
+  assert.deepEqual({...messages.at(-1).args},{captureId:'owned-screen',quality:'1080p'});
+  await bridge.setScreenQuality({captureId:'owned-screen',quality:'720p'});
+  assert.deepEqual(messages.map(message=>message.method),['startScreenShare','setScreenQuality','setScreenQuality']);
+  receive({event:'screen',type:'stopped',captureId:'owned-screen'});
+  await assert.rejects(bridge.setScreenQuality({captureId:'owned-screen',quality:'1080p'}),/owner-approved/);
+});
+test('native refusal of live screen quality is surfaced without authorizing other media', async () => {
+  const {bridge,messages}=setup({response:message=>message.method==='startScreenShare'?{captureId:'owned-screen'}:{ok:false,reason:'That screen share ended.'}});
+  await bridge.startScreenShare({});
+  await assert.rejects(bridge.setScreenQuality({captureId:'owned-screen',quality:'720p'}),/screen share ended/);
+  assert.deepEqual(messages.map(message=>message.method),['startScreenShare','setScreenQuality']);
+});
 test('device PCM accepts only bounded 48 kHz stereo packets and acknowledges even a failing consumer', async () => {
   const {bridge,messages,receive}=setup({response:message=>message.method==='startScreenShare'?{captureId:'screen-a'}:{ok:true}});
   await bridge.startScreenShare({});await bridge.setSystemAudio({enabled:true,captureId:'screen-a'});

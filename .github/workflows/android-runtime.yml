@@ -112,6 +112,7 @@ jobs:
             test-results/android-emulator-recreation-before.png
             test-results/android-emulator-recreation-after.png
             test-results/android-emulator-recreation-receiver.png
+            test-results/android-emulator-fullscreen-quality.png
             test-results/android-emulator-failure.png
           if-no-files-found: error
           retention-days: 7

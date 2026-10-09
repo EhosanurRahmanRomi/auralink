@@ -38,6 +38,10 @@ public final class ScreenShareService extends Service {
         default void audio(long sequence, String data, int frames) { }
         default void audioStopped(String reason) { }
     }
+    interface QualityListener {
+        void changed(int width, int height, int maxEdge);
+        void failed(String reason);
+    }
     static final String STOP = "local.auralink.mobile.STOP_SCREEN";
     private static final int NOTIFICATION = 1041;
     private static ScreenShareService instance;
@@ -73,6 +77,32 @@ public final class ScreenShareService extends Service {
     static synchronized void cancelPreparation(String ticket) { if (ownership.cancelPending(ticket)) pendingListener = null; }
     static boolean active() { return instance != null && instance.running && !instance.stopping; }
     static boolean activeFullDisplay() { return active() && instance.fullDisplay; }
+    static void setQuality(String ticket, String quality, QualityListener result) {
+        if (Looper.myLooper() != Looper.getMainLooper()) throw new IllegalStateException("Screen quality must be selected on the Android main thread.");
+        final int nextEdge = ScreenCaptureQuality.maxEdge(quality);
+        final ScreenShareService current = instance;
+        if (current == null || ticket == null || !ticket.equals(current.activeTicket) || !current.running || current.stopping || current.capture == null) {
+            result.failed("That screen share has already ended."); return;
+        }
+        current.capture.post(() -> {
+            if (current != instance || !current.running || current.stopping || !ticket.equals(current.activeTicket)) {
+                current.main.post(() -> result.failed("That screen share has already ended.")); return;
+            }
+            try {
+                if (current.maxEdge != nextEdge) {
+                    current.maxEdge = nextEdge;
+                    current.reconfigureReader(current.contentWidth, current.contentHeight);
+                }
+                final int w = current.width, h = current.height;
+                current.main.post(() -> {
+                    if (current == instance && current.running && !current.stopping && ticket.equals(current.activeTicket)) result.changed(w, h, nextEdge);
+                    else result.failed("That screen share has already ended.");
+                });
+            } catch (Exception failure) {
+                current.main.post(() -> { result.failed("Screen quality could not change. Restart sharing to continue."); current.stopSharing("Screen quality changed; restart sharing to continue."); });
+            }
+        });
+    }
     static void acknowledgePlaybackAudio(String ticket, long seq) {
         ScreenShareService current = instance;
         if (current != null && ticket != null && ticket.equals(current.activeTicket) && current.playbackAudio != null) current.playbackAudio.acknowledge(seq);
@@ -164,9 +194,8 @@ public final class ScreenShareService extends Service {
         return new Rect(0, 0, metrics.widthPixels, metrics.heightPixels);
     }
     private void configureReader(int w, int h) {
-        if (w < 1 || h < 1 || w > 32768 || h > 32768) throw new IllegalArgumentException("Invalid screen dimensions.");
-        float scale = Math.min(1f, maxEdge / (float)Math.max(w, h));
-        width = Math.max(2, Math.round(w * scale) / 2 * 2); height = Math.max(2, Math.round(h * scale) / 2 * 2);
+        int[] dimensions = ScreenCaptureQuality.dimensions(w, h, maxEdge);
+        width = dimensions[0]; height = dimensions[1];
         reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
         reader.setOnImageAvailableListener(this::consumeFrame, capture);
     }
@@ -176,16 +205,22 @@ public final class ScreenShareService extends Service {
         if (contentWidth == w && contentHeight == h) return;
         contentWidth = w; contentHeight = h;
         main.post(() -> { AttendedAccessibilityService service = AttendedAccessibilityService.current(); if (service != null) service.revoke("Screen dimensions changed. Approve control again."); });
+        try { reconfigureReader(w, h); }
+        catch (Exception failure) { main.post(() -> stopSharing("Screen changed; restart sharing to continue.")); }
+    }
+    private void reconfigureReader(int w, int h) {
         ImageReader previous = reader; Bitmap previousBitmap = padded; padded = null;
         try {
             configureReader(w, h); display.setSurface(null); display.resize(width, height, getResources().getConfiguration().densityDpi); display.setSurface(reader.getSurface());
-        } catch (Exception failure) { main.post(() -> stopSharing("Screen changed; restart sharing to continue.")); }
-        finally { if (previous != null) previous.close(); if (previousBitmap != null) previousBitmap.recycle(); }
+        } finally { if (previous != null) previous.close(); if (previousBitmap != null) previousBitmap.recycle(); }
     }
     private void consumeFrame(ImageReader source) {
         Image image = null; Bitmap visible = null;
         try {
-            image = source.acquireLatestImage(); if (image == null || !running || stopping || source != reader) return;
+            // A queued callback from a resized, closed reader must not end the
+            // current projection by acquiring an image from that old reader.
+            if (!running || stopping || source != reader) return;
+            image = source.acquireLatestImage(); if (image == null) return;
             long now = SystemClock.elapsedRealtime();
             if (inFlight != 0 && now - sentAt > 3000) { main.post(() -> stopSharing("Screen delivery stalled. Return to Glance-Port and restart sharing.")); return; }
             if (inFlight != 0 || now - lastFrame < 83) return; // At most 12fps and one frame awaiting canvas acknowledgement.

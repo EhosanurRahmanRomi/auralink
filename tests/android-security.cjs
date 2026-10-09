@@ -106,6 +106,17 @@ async function sourcePolicies() {
   const backgroundMethods = [...pauseDispatch.matchAll(/!"([^"]+)"\.equals\(method\)/g)].map(match => match[1]);
   assert.deepEqual(backgroundMethods, ['sendSocket', 'closeSocket', 'ackScreenFrame', 'applyInput', 'revokeControl', 'stopScreenShare', 'setAudioRoute', 'setSystemAudio', 'ackSystemAudio'], 'Background bridge is confined to already-scoped transport, media routing, approved input and stop operations');
   const systemAudio = activity.slice(activity.indexOf('private void setSystemAudio('), activity.indexOf('private void cancelSystemAudioPermission('));
+  const screenQuality = activity.slice(activity.indexOf('private void setScreenQuality('), activity.indexOf('private void clearProjectionRequest('));
+  assert.match(screenQuality,/!trustedPage\(\)\s*\|\|\s*!roomMembership\.hasRoom\(\)/,'Live screen quality requires the foreground owner and an admitted room');
+  assert.match(screenQuality,/!ticket\.equals\(projectionId\)\s*\|\|\s*!ScreenShareService\.active\(\)/,'Live screen quality is bound to the exact active projection');
+  assert.match(screenQuality,/serial\s*!=\s*roomMembership\.epoch\(\)/,'A queued quality result cannot enter a replacement room');
+  assert.doesNotMatch(screenQuality,/startProjection|createScreenCaptureIntent|requestPermissions|prepare\(/,'Quality changes never request another capture or grant');
+  const qualityCapture = projection.slice(projection.indexOf('static void setQuality('),projection.indexOf('static void acknowledgePlaybackAudio('));
+  assert.match(qualityCapture,/current\.capture\.post\(/,'Live output resize is serialized with image conversion on the capture thread');
+  assert.match(qualityCapture,/!ticket\.equals\(current\.activeTicket\)/,'Queued resize rechecks capture ownership before modifying a surface');
+  assert.doesNotMatch(qualityCapture,/stopPlaybackAudio|revoke\(|createVirtualDisplay|getMediaProjection/,'Quality changes preserve playback and normalized full-display input ownership');
+  const consumeFrame = projection.slice(projection.indexOf('private void consumeFrame('),projection.indexOf('private Notification notification('));
+  assert.ok(consumeFrame.indexOf('source != reader')<consumeFrame.indexOf('source.acquireLatestImage()'),'Callbacks queued by a closed prior reader are ignored before image acquisition');
   assert.ok(systemAudio.indexOf('if (!enabled)') < systemAudio.indexOf('if (!trustedPage())'), 'Background device audio can only stop; enabling requires the visible local document');
   assert.match(systemAudio, /capture\.equals\(projectionId\)/, 'Device audio requests are scoped to the current capture ticket');
   assert.doesNotMatch(systemAudio, /request\.grant|RESOURCE_AUDIO_CAPTURE|getUserMedia/, 'Playback permission does not grant or open a microphone');
@@ -227,7 +238,7 @@ async function main() {
   evidence.checks.callAudioLifecycle = await runCallAudioHarness({ run, javac, java, fixtureDir, packageDir });
   const libs = ['Java-WebSocket-1.6.0.jar', 'slf4j-api-2.0.13.jar'].map(name => path.join(root, 'android', 'libs', name));
   const classpath = libs.join(path.delimiter);
-  const sources = ['Invitation.java', 'AppInvitation.java', 'InternetServiceEndpoint.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'RoomMembership.java', 'ProjectionOwnership.java', 'RelayMediaPolicy.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
+  const sources = ['Invitation.java', 'AppInvitation.java', 'InternetServiceEndpoint.java', 'PinnedTls.java', 'PinnedRoomClient.java', 'RoomMembership.java', 'ProjectionOwnership.java', 'ScreenCaptureQuality.java', 'RelayMediaPolicy.java', 'AttendedControlPolicy.java'].map(name => path.join(packageDir, name));
   await run(javac, ['--release', '8', '-cp', classpath, '-d', classesDir, ...sources, path.join(__dirname, 'android', 'AndroidSecurityHarness.java')]);
   evidence.checks.compile = { passed: true, javaTarget: 8, productionClasses: sources.map(filename => path.basename(filename)) };
   const now = Date.now();

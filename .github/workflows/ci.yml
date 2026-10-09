@@ -71,6 +71,8 @@ jobs:
         run: node tests/native-relay-capture.cjs
       - name: Native capture recovery when the preferred frame reader fails
         run: node tests/native-relay-capture.cjs --force-reader-failure
+      - name: Live outgoing resolution through native capture, direct RTC and encrypted relay
+        run: node tests/live-screen-quality.cjs
       - name: Keep test evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

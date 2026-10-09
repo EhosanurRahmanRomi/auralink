@@ -237,6 +237,14 @@
       },
       stopScreenShare: (args) => invoke('stopScreenShare', args),
       stopSharing: (args) => invoke('stopScreenShare', args),
+      setScreenQuality: (args) => {
+        if (typeof args?.captureId !== 'string' || !args.captureId || args.captureId !== screenCaptureId || !['720p', '1080p'].includes(args.quality))
+          return Promise.reject(new TypeError('Select 720p or 1080p for the current owner-approved screen share.'));
+        return invoke('setScreenQuality', {captureId:args.captureId,quality:args.quality}).then(result => {
+          if (result?.ok !== true) throw new Error(String(result?.reason || 'Android declined screen quality.'));
+          return result;
+        });
+      },
       setSystemAudio: (args) => {
         if (typeof args?.enabled !== 'boolean' || typeof args.captureId !== 'string' || args.captureId !== screenCaptureId) return Promise.reject(new TypeError('Use the current owner-approved screen share for device audio.'));
         const operation = ++systemAudioRequestNumber;

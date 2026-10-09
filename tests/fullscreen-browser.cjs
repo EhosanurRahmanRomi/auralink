@@ -128,10 +128,11 @@ async function presentationBounds(page) {
     return { viewport: { width: innerWidth, height: innerHeight }, stage: bounds(document.getElementById('stage')),
       video: bounds(document.getElementById('stage-video')), toolbar: bounds(document.getElementById('presentation-toolbar')),
       zoom: bounds(document.getElementById('screen-view-controls')), zoomButton: bounds(document.getElementById('screen-zoom-in')),
-      buttons: ['presentation-fullscreen-exit', 'presentation-control-button', 'presentation-mic-button', 'presentation-speaker-button', 'presentation-share-button', 'presentation-system-audio', 'presentation-leave-button'].map(id => {
+      buttons: ['presentation-fullscreen-exit', 'presentation-control-button', 'presentation-mic-button', 'presentation-speaker-button', 'presentation-share-button', 'presentation-system-audio', 'presentation-quality', 'presentation-leave-button'].map(id => {
         const element = document.getElementById(id), rect = bounds(element); return { id, ...rect,
           reachable: element.contains(document.elementFromPoint((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)) };
       }), active: document.body.classList.contains('presentation-mode'), mode: document.getElementById('stage').dataset.presentation,
+      quality: { selected: document.getElementById('presentation-quality').value, disabled: document.getElementById('presentation-quality').disabled, ownStreamLabel: document.getElementById('presentation-quality').getAttribute('aria-label') },
       decoded: { width: document.getElementById('stage-video').videoWidth, height: document.getElementById('stage-video').videoHeight }, captureCalls: qaCaptureCalls.slice() };
   });
 }
@@ -141,6 +142,8 @@ function checkBounds(proof) {
   assert.ok(proof.video.height > 80 && proof.video.width > 200, 'A useful live screen remains above the controls');
   assert.ok(proof.video.width >= proof.viewport.width - 1, 'The viewing viewport uses the full available window width');
   assert.ok(proof.video.bottom <= proof.toolbar.top + 1, 'Video must not be hidden behind the presentation controls');
+  assert.equal(proof.buttons.length, 8); assert.equal(proof.quality.disabled, true, 'A viewer cannot change the remote owner outgoing quality');
+  assert.ok(proof.toolbar.height <= (proof.viewport.width <= 650 ? 104 : proof.viewport.height <= 500 ? 55 : 56) + 1, 'The stream selector must not add presentation toolbar height');
   for (const button of proof.buttons) { assert.ok(button.reachable, `${button.id} must remain reachable`); assert.ok(button.left >= 0 && button.right <= proof.viewport.width + 1); }
   assert.deepEqual(proof.decoded, { width: 1280, height: 720 }); assert.deepEqual(proof.captureCalls, []);
 }
@@ -216,6 +219,17 @@ async function run(browser, mode) {
     if (mode === 'browser') await guest.waitForFunction(() => document.fullscreenElement?.id === 'stage');
     if (mode === 'electron') { await assertEventually(app, true); assert.equal(await guest.evaluate(() => document.fullscreenElement), null, 'Native app mode does not depend on browser fullscreen'); }
     proof.initialLayout = await presentationBounds(guest); checkBounds(proof.initialLayout);
+    phase = 'fullscreen quality ceiling belongs to the sharing device'; console.log(`Fullscreen ${mode}: ${phase}`);
+    assert.deepEqual(await guest.locator('#presentation-quality option').evaluateAll(options => options.map(option => option.value)), ['auto', '720', '1080', '1440']);
+    await noInputs(owner, () => guest.evaluate(() => { const select = document.getElementById('quality-select'); select.value = '720'; select.dispatchEvent(new Event('change', { bubbles: true })); }));
+    await guest.waitForFunction(() => document.getElementById('presentation-quality').value === '720' && document.getElementById('settings-quality').value === '720');
+    await noInputs(owner, () => guest.evaluate(() => { const select = document.getElementById('presentation-quality'); select.value = '1440'; select.dispatchEvent(new Event('change', { bubbles: true })); }));
+    assert.equal(await guest.locator('#presentation-quality').inputValue(), '720', 'A viewer cannot change its source preference through the disabled fullscreen control');
+    assert.equal(await guest.locator('#quality-select').inputValue(), '720');
+    await noInputs(owner, () => guest.evaluate(() => { const select = document.getElementById('quality-select'); select.value = 'auto'; select.dispatchEvent(new Event('change', { bubbles: true })); }));
+    assert.equal(await guest.evaluate(() => document.body.classList.contains('presentation-mode')), true);
+    if (mode === 'electron') await assertEventually(app, true);
+    proof.streamQuality = { viewerCannotChangeRemoteOwner: true, allSelectorsSynchronized: true, presetValues: ['auto', '720', '1080', '1440'], remainsFullscreen: true, inputEvents: 0, actualResolutionGuarantee: false };
     assert.equal(await guest.locator('#stage #toast-region').count(), 1, 'Fullscreen must retain visible consent and media notices in its top layer');
     if (mode === 'denied' || mode === 'mobile-unavailable') assert.equal(proof.initialLayout.mode, 'expanded');
     if (mode === 'mobile-unavailable') {
@@ -382,13 +396,60 @@ async function run(browser, mode) {
     await guest.waitForFunction(() => !document.getElementById('stage-video').hidden && document.getElementById('stage-video').videoWidth === 1280 && document.getElementById('screen-zoom-level').textContent === '100%');
     await noInputs(owner, () => guest.locator('#stage-video').click());
     proof.newSharingSessionResetsFit = true;
+
+    phase = 'owned synthetic screen changes quality without exiting fullscreen'; console.log(`Fullscreen ${mode}: ${phase}`);
+    if (app) await app.evaluate(({ ipcMain }) => {
+      // Explicit picker double only in this isolated test app. Do not enumerate
+      // physical screens or obtain system capture when testing these UI controls.
+      ipcMain.removeHandler('auralink:sources'); ipcMain.handle('auralink:sources', () => [{ id: 'synthetic-quality-source', name: 'Synthetic quality verification source' }]);
+      ipcMain.removeHandler('auralink:choose-screen'); ipcMain.handle('auralink:choose-screen', () => true);
+    });
+    await guest.evaluate(() => {
+      navigator.mediaDevices.getDisplayMedia = async () => {
+        qaCaptureCalls.push('syntheticDisplayMedia');
+        const canvas = document.createElement('canvas'); canvas.width = 2560; canvas.height = 1440;
+        const draw = canvas.getContext('2d'); draw.fillStyle = '#522536'; draw.fillRect(0, 0, canvas.width, canvas.height);
+        draw.fillStyle = '#ffe4b2'; draw.font = '48px sans-serif'; draw.fillText('Owned synthetic display — quality controls', 80, 180);
+        const stream = canvas.captureStream(12), track = stream.getVideoTracks()[0];
+        window.qaOwnedQualityTrack = track; window.qaOwnedQualityApplied = [];
+        const original = track.applyConstraints.bind(track);
+        track.applyConstraints = async constraints => { await original(constraints); const { width, height, frameRate, resizeMode } = track.getSettings(); qaOwnedQualityApplied.push({ requested: structuredClone(constraints), actual: { width, height, frameRate, resizeMode } }); };
+        return stream;
+      };
+    });
+    await noInputs(owner, () => guest.locator('#presentation-share-button').click());
+    if (app) await noInputs(owner, () => guest.locator('#screen-source-list .screen-source').click());
+    await guest.waitForFunction(() => !document.getElementById('presentation-quality').disabled && document.getElementById('stage-video').srcObject?.getVideoTracks()[0] === qaOwnedQualityTrack);
+    const qualitySnapshots = [];
+    for (const [value, width, height] of [['720', 1280, 720], ['1080', 1920, 1080], ['1440', 2560, 1440], ['auto', 1920, 1080]]) {
+      const count = await guest.evaluate(() => qaOwnedQualityApplied.length);
+      await noInputs(owner, () => guest.locator('#presentation-quality').selectOption(value));
+      await guest.waitForFunction(({ count, width, height }) => qaOwnedQualityApplied.length > count && qaOwnedQualityApplied.at(-1).requested.width.max === width && qaOwnedQualityApplied.at(-1).requested.height.max === height, { count, width, height });
+      const snapshot = await guest.evaluate(() => ({ selected: document.getElementById('presentation-quality').value, diagnostic: document.getElementById('quality-select').value, settings: document.getElementById('settings-quality').value, ...qaOwnedQualityApplied.at(-1), sameTrack: qaOwnedQualityTrack === document.getElementById('stage-video').srcObject.getVideoTracks()[0], fullscreen: document.body.classList.contains('presentation-mode') }));
+      assert.equal(snapshot.selected, value); assert.equal(snapshot.diagnostic, value); assert.equal(snapshot.settings, value); assert.equal(snapshot.sameTrack, true); assert.equal(snapshot.fullscreen, true);
+      assert.equal(snapshot.actual.width, width); assert.equal(snapshot.actual.height, height);
+      qualitySnapshots.push(snapshot);
+    }
+    await noInputs(owner, () => guest.evaluate(() => {
+      for (const value of ['1440', '1080', '720']) { const select = document.getElementById('presentation-quality'); select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }
+    }));
+    await guest.waitForFunction(() => qaOwnedQualityApplied.at(-1).requested.width.max === 1280 && qaOwnedQualityApplied.at(-1).requested.height.max === 720 && document.getElementById('presentation-quality').value === '720');
+    await noInputs(owner, () => guest.evaluate(() => { const select = document.getElementById('presentation-quality'); select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true })); }));
+    assert.equal(await guest.locator('#presentation-quality').inputValue(), '720', 'Unsupported preset values restore the current selected ceiling');
+    if (mode === 'browser') assert.equal(await guest.evaluate(() => document.fullscreenElement?.id), 'stage');
+    if (mode === 'electron') await assertEventually(app, true);
+    const ownLayout = await presentationBounds(guest); assert.ok(ownLayout.buttons.every(button => button.reachable)); assert.equal(ownLayout.buttons.length, 8); assert.ok(ownLayout.toolbar.height <= proof.initialLayout.toolbar.height + 1);
+    await guest.screenshot({ path: path.join(output, `fullscreen-quality-${mode}.png`) });
+    proof.liveQuality = { passed: true, disabledWhileOnlyViewing: proof.streamQuality.viewerCannotChangeRemoteOwner, selectorsSynchronized: true, sameScreenTrack: true, fullscreenRetained: true, finalSelectionApplied: true, noRemoteInput: true, finalQuality: '720', snapshots: qualitySnapshots, finalConstraints: await guest.evaluate(() => qaOwnedQualityApplied.at(-1)), layout: ownLayout, boundary: 'Explicit synthetic canvas display source and isolated picker double. Genuine track.applyConstraints and shipped renderer UI/RTC quality path; physical/native capture dimensions are checked separately.' };
+    await noInputs(owner, () => guest.locator('#presentation-share-button').click());
+    await guest.waitForFunction(() => document.getElementById('presentation-quality').disabled);
     await guest.locator('#presentation-fullscreen-exit').click(); await guest.waitForFunction(() => !document.body.classList.contains('presentation-mode'));
     if (mode === 'electron') await assertEventually(app, false);
 
     phase = 'leave from fullscreen'; console.log(`Fullscreen ${mode}: ${phase}`); await guest.locator('#fullscreen-button').click(); await guest.locator('#presentation-leave-button').click();
     await guest.waitForFunction(() => document.getElementById('session').hidden && !document.body.classList.contains('presentation-mode'));
     if (mode === 'electron') await assertEventually(app, false);
-    assert.deepEqual(await guest.evaluate(() => qaCaptureCalls), []); assert.deepEqual(errors, []); assert.deepEqual(await owner.page.evaluate(() => fixtureErrors), []);
+    assert.deepEqual(await guest.evaluate(() => qaCaptureCalls), ['syntheticDisplayMedia']); assert.deepEqual(errors, []); assert.deepEqual(await owner.page.evaluate(() => fixtureErrors), []);
     if (mode === 'electron') assert.ok(await app.evaluate(({ powerSaveBlocker }) => qaSessionPowerIds.length > 0 && qaSessionPowerIds.every(entry => !powerSaveBlocker.isStarted(entry.id))), 'Leaving the room must release every observed production power blocker');
     proof.passed = true; proof.verified = ['decoded remote display retained in fullscreen', 'viewport filled with reachable exit and consent controls',
       'viewing and pending request emit no input', 'owner approval works inside fullscreen', 'contained image centre maps to remote centre',
@@ -396,6 +457,7 @@ async function run(browser, mode) {
       'visible exit and leave actions restore the normal room', 'cursor-anchored zoom and trusted two-finger pinch retain the decoded track',
       'zoomed approved clicks invert to the original remote pixel', 'local pan and pinch never send remote input', 'Fit restores the whole screen',
       'ending and restarting a share resets zoom without restoring revoked control', 'no local screen or microphone capture'];
+    proof.verified.push('compact eight-control toolbar retains its height', 'fullscreen stream selector synchronizes the device preference and cannot change a remote owner stream', 'owned synthetic display preset and rapid final quality changes apply without replacing the track or exiting fullscreen');
     if (mode === 'electron') proof.verified.push('production native main/preload fullscreen entry and exit', 'native minimized window retains room and video track while actual remote packets and frames advance', 'admitted room owns prevent-app-suspension and leave releases it');
     return proof;
   } catch (error) {

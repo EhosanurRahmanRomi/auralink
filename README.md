@@ -64,7 +64,7 @@ Glance-Port 0.6.0 uses warm plum, rose, coral and gold gradients with the suppli
 
 ## Features and limits
 
-- Screen/window presentation with selectable ceilings up to **2560×1440**, fullscreen and live resolution/frame-rate/codec/route measurements.
+- Screen/window presentation with selectable ceilings up to **2560×1440**, a compact fullscreen **Stream** selector for live outgoing quality changes, and actual resolution/frame-rate/codec/route measurements. Android updates its existing capture up to a 1920-pixel long edge; viewers keep their own local zoom controls.
 - Independently switchable microphone and device audio, a 48 kHz stereo mix, 192 kbps Opus encrypted fallback, levels, speaker tests and playback unlocking.
 - Attended pointer, scrolling and supported desktop keyboard input, with one controller per shared full display.
 - Invitation rooms for up to four people, host removal, invitation closure/rotation and separate control consent.

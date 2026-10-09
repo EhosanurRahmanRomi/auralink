@@ -62,6 +62,7 @@ $('quick-name').value = preferences.name;
 $('join-name').value = preferences.name;
 $('settings-quality').value = preferences.quality;
 $('quality-select').value = preferences.quality;
+$('presentation-quality').value = preferences.quality;
 $('stun-server').value = preferences.stun;
 $('internet-service').value = String(preferences.internetOrigin || '').slice(0, 256);
 const internet = new InternetDirectory({
@@ -352,6 +353,11 @@ function renderPresentationControls() {
   const soundLabel = state.relayPlaybackBlocked || !$('audio-banner').hidden ? 'Enable sound' : bridge?.setAudioRoute ? state.speaker ? 'Speaker on' : 'Earpiece' : 'Check sound';
   sound.disabled = !state.joined; sound.innerHTML = icon('volume') + `<span>${soundLabel}</span>`; sound.setAttribute('aria-label', soundLabel);
   $('presentation-leave-button').disabled = !state.joined;
+  const quality = $('presentation-quality');
+  quality.value = preferences.quality;
+  quality.disabled = !state.joined || !state.local.has('screen') || Boolean(state.sharingPending);
+  quality.title = quality.disabled ? 'Share your own screen to change its outgoing quality ceiling. This does not change the screen you are viewing.' : 'Your outgoing screen quality ceiling. Actual resolution depends on the source and connection.';
+  quality.setAttribute('aria-label', `Your outgoing screen quality ceiling: ${preferences.quality === 'auto' ? 'Auto' : `${preferences.quality}p`}`);
   $('presentation-control-status').textContent = state.grant ? $('control-banner-text').textContent : state.controlling ? 'Control approved · click the screen to use it · Esc exits fullscreen' : state.pendingControl ? 'Waiting for the screen owner to approve control' : 'Viewing only · the screen owner must approve control';
 }
 function setPresentationLayout(active) {
@@ -633,13 +639,27 @@ $('save-settings').addEventListener('click', async () => {
   editedDeviceSelections.clear();
   const speakers = configureSpeakers(preferences.speaker);
   $('quality-select').value = preferences.quality;
+  $('presentation-quality').value = preferences.quality; renderPresentationControls();
   savePreferences();
   await Promise.all([updateQuality(), speakers]);
   $('settings-saved').textContent = 'Preferences saved. Network changes apply to the next room.';
   toast('Preferences saved on this device.');
 });
-$('quality-select').addEventListener('change', async () => {
-  preferences.quality = $('quality-select').value; $('settings-quality').value = preferences.quality; savePreferences(); await updateQuality();
+async function selectQuality(value) {
+  if (!['auto', '720', '1080', '1440'].includes(value) || bridge?.platform === 'android' && value === '1440') {
+    for (const id of ['quality-select', 'settings-quality', 'presentation-quality']) $(id).value = preferences.quality;
+    renderPresentationControls(); return;
+  }
+  preferences.quality = value;
+  for (const id of ['quality-select', 'settings-quality', 'presentation-quality']) $(id).value = value;
+  savePreferences(); renderPresentationControls(); await updateQuality();
+}
+$('quality-select').addEventListener('change', () => void selectQuality($('quality-select').value));
+for (const type of ['pointerdown', 'focus']) $('presentation-quality').addEventListener(type, () => { releaseKeys(); clearRemoteText(); screenView.cancelGesture(); });
+$('presentation-quality').addEventListener('change', () => {
+  releaseKeys(); clearRemoteText();
+  if (!state.joined || !state.local.has('screen') || state.sharingPending) { renderPresentationControls(); return; }
+  void selectQuality($('presentation-quality').value);
 });
 
 function send(message) {
@@ -767,7 +787,7 @@ async function handleMessage(message) {
       if (message.room?.name || message.name || message.roomName) $('room-title').textContent = message.room?.name || message.roomName || message.name;
       state.rtc = new RoomRTC({ selfId: state.selfId, signal: (to, data) => send({ type: 'signal', to, data }), iceServers: state.room?.internet ? message.iceServers || [] : preferences.stun ? [{ urls: preferences.stun }] : [], relaySecondsLimit: state.room?.internet ? message.relaySecondsLimit : 0, relayBytesLimit: state.room?.internet ? message.relayBytesLimit : 0, iceTransportPolicy: message.iceTransportPolicy || 'all', relayKey: message.relayKey, websocketRelayEnabled: message.websocketRelayEnabled === true, relayLimits: message.websocketRelayLimits });
       $('internet-relay-note').hidden = !state.room?.internet;
-      $('internet-relay-note').textContent = message.websocketRelayEnabled ? 'Direct connection first, with encrypted Secure relay when needed. Connection details show actual quality. Free relay time and data limits apply.' : message.relayEnabled ? 'Direct connection first. Relay availability depends on the free allowance; this test room stops when its relay safety limit is reached.' : 'Direct connection only. Relay is unavailable, so some mobile and restricted networks cannot connect.';
+      $('internet-relay-note').textContent = message.websocketRelayEnabled ? 'Direct connection first, with encrypted Secure relay when needed. Connection details show actual quality. Free relay data and service limits apply.' : message.relayEnabled ? 'Direct connection first. Relay availability depends on the free allowance; this test room stops when its relay safety limit is reached.' : 'Direct connection only. Relay is unavailable, so some mobile and restricted networks cannot connect.';
       state.rtc.setVideoLimits(preferences.quality);
       bindRTC();
       for (const peer of message.peers || []) addPeer(peer);
@@ -1244,9 +1264,9 @@ async function pickScreen(epoch = state.epoch, rtc = state.rtc) {
   }
   openDialog('screen-dialog');
 }
-function captureConstraints() {
+function captureConstraints(quality = preferences.quality) {
   const sizes = { auto: [1920, 1080], '720': [1280, 720], '1080': [1920, 1080], '1440': [2560, 1440] };
-  const [width, height] = sizes[preferences.quality];
+  const [width, height] = sizes[quality] || sizes.auto;
   return { width: { ideal: width, max: width }, height: { ideal: height, max: height }, frameRate: { ideal: 30, max: 30 } };
 }
 async function beginSharing(epoch = state.epoch, rtc = state.rtc) {
@@ -1363,11 +1383,31 @@ async function stopSharing() {
   updateButtons(); renderParticipants(); renderStage();
   } finally { if (ownedOperation && state.sharingPending === operation) state.sharingPending = false; updateButtons(); }
 }
-async function updateQuality() {
-  const track = state.local.get('screen')?.track;
-  if (state.phoneScreen) { toast('Phone capture quality applies when you start sharing again. Phone capture currently targets 12 fps up to 1080p.'); await state.rtc?.setVideoLimits(preferences.quality); return; }
-  if (track) { try { await track.applyConstraints(captureConstraints()); } catch (error) { toast(`This source could not apply the requested ceiling: ${cleanError(error)}`, true); } }
-  await state.rtc?.setVideoLimits(preferences.quality);
+let qualityUpdateChain = Promise.resolve();
+let qualityUpdateSequence = 0;
+function updateQuality() {
+  const quality = preferences.quality, sequence = ++qualityUpdateSequence;
+  const rtc = state.rtc, epoch = state.epoch, item = state.local.get('screen'), capture = state.phoneScreen;
+  const current = () => sequence === qualityUpdateSequence && roomCurrent(epoch, rtc)
+    && state.local.get('screen') === item && state.phoneScreen === capture;
+  const operation = qualityUpdateChain.catch(() => {}).then(async () => {
+    if (!current()) return;
+    if (capture) {
+      try {
+        if (!bridge?.setScreenQuality) throw new Error('Update this Android app to change resolution during sharing.');
+        await bridge.setScreenQuality({ captureId: capture.captureId, quality: quality === '720' || quality === 'auto' ? '720p' : '1080p' });
+      } catch (error) {
+        if (current()) toast(`Phone capture could not apply the requested ceiling: ${cleanError(error)}`, true);
+        return;
+      }
+    } else if (item?.track) {
+      try { await item.track.applyConstraints(captureConstraints(quality)); }
+      catch (error) { if (current()) toast(`This source could not apply the requested ceiling: ${cleanError(error)}`, true); }
+    }
+    if (current()) await rtc.setVideoLimits(quality);
+  });
+  qualityUpdateChain = operation;
+  return operation;
 }
 
 $('request-control').addEventListener('click', () => {
@@ -1752,10 +1792,10 @@ async function initialize() {
   $('android-help').hidden = bridge?.platform !== 'android';
   if (bridge?.platform === 'android') {
     if (preferences.quality === '1440') { preferences.quality = '1080'; savePreferences(); }
-    for (const id of ['quality-select', 'settings-quality']) {
+    for (const id of ['quality-select', 'settings-quality', 'presentation-quality']) {
       const select = $(id); select.value = preferences.quality;
-      const maximum = select.querySelector('option[value="1440"]'); if (maximum) { maximum.disabled = true; maximum.textContent = '1440p · desktop only'; }
-      const phoneMaximum = select.querySelector('option[value="1080"]'); if (phoneMaximum) phoneMaximum.textContent = '1080p · phone maximum';
+      const maximum = select.querySelector('option[value="1440"]'); if (maximum) { maximum.disabled = true; if (id !== 'presentation-quality') maximum.textContent = '1440p · desktop only'; }
+      const phoneMaximum = select.querySelector('option[value="1080"]'); if (phoneMaximum && id !== 'presentation-quality') phoneMaximum.textContent = '1080p · phone maximum';
     }
     $('profile-platform').textContent = 'Android companion';
     $('host-mode').value = 'internet'; $('host-button').title = 'Open an invitation room';

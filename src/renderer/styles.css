@@ -458,6 +458,13 @@ body.presentation-mode #toast-region { bottom: calc(var(--presentation-toolbar-h
 .presentation-actions { gap: 5px; }
 .presentation-action { min-height: 36px; padding: 7px 9px; gap: 5px; font-size: 10px; border-radius: 9px; white-space: nowrap; }
 .presentation-action svg, .presentation-action [data-icon] svg { width: 15px; height: 15px; }
+.presentation-quality { padding: 0; gap: 2px; cursor: pointer; }
+.presentation-quality > span { padding-left: 8px; font-size: 9px; color: #d7c6e9; }
+.presentation-quality select { width: 62px; min-height: 34px; padding: 5px 3px; border: 0; border-radius: 8px; background: transparent; font-size: 10px; }
+.presentation-quality:has(select:disabled) { opacity: .45; cursor: default; }
+.presentation-quality select:disabled { cursor: default; }
+.presentation-quality:focus-within { border-color: #e8c4ec; }
+.presentation-quality select:focus-visible { outline-offset: 1px; }
 .presentation-room-status { font-size: 10px; }
 #presentation-control-status { max-width: 220px; }
 .stage.presentation-active .screen-view-controls, .stage:fullscreen .screen-view-controls { top: calc(9px + env(safe-area-inset-top)); left: calc(10px + env(safe-area-inset-left)); }
@@ -472,14 +479,21 @@ body.presentation-mode #toast-region { bottom: calc(var(--presentation-toolbar-h
   #screen-zoom-level { width: 34px; font-size: 10px; }
   .stage-fullscreen, .stage-tools-toggle { width: 44px; height: 44px; border: 0; box-shadow: none; background: #312942b8; }
   .presentation-action { min-height: 44px; }
+  .presentation-quality select { min-height: 42px; }
 }
 @media (max-width: 650px) {
   .stage.presentation-active .presentation-toolbar, .stage:fullscreen .presentation-toolbar { min-height: 104px; padding: 5px max(10px, env(safe-area-inset-right)) calc(5px + env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); }
   .presentation-actions { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
   .presentation-action { flex-direction: column; min-height: 44px; padding: 5px 3px; gap: 3px; font-size: 9px; border-radius: 8px; }
+  .presentation-quality { padding: 1px 0; gap: 0; }
+  .presentation-quality > span { padding: 0; line-height: 12px; font-size: 8px; }
+  .presentation-quality select { width: 100%; min-height: 29px; padding: 3px 7px; font-size: 10px; }
 }
 @media (max-height: 500px) and (orientation: landscape) {
   .stage.presentation-active .presentation-toolbar, .stage:fullscreen .presentation-toolbar { min-height: 54px; padding-top: 5px; padding-bottom: calc(5px + env(safe-area-inset-bottom)); }
   .presentation-actions { display: flex; gap: 4px; }
   .presentation-action { flex-direction: row; min-height: 44px; padding: 6px 8px; font-size: 10px; }
+  .presentation-quality { padding: 0; gap: 2px; }
+  .presentation-quality > span { padding-left: 7px; }
+  .presentation-quality select { width: 61px; min-height: 42px; padding: 4px 2px; }
 }

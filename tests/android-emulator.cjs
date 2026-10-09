@@ -975,6 +975,73 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       }
       await findNativeRoomAction(label('Turn microphone on'));
       assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),deviceProcess);
+      if(testedMajor>0 || testedMinor>=6) {
+        publicPhase('native fullscreen outgoing quality changes retain screen and device audio');
+        const originalDisplaySize=await adb(['shell','wm','size']);
+        const originalOverride=/Override size:\s*(\d+x\d+)/.exec(originalDisplaySize)?.[1];
+        const captureDisplay=async()=>{
+          const dump=await adb(['shell','dumpsys','display']);
+          const owned=[...dump.matchAll(/DisplayDeviceInfo\{"Glance-Port attended screen":[^\r\n]*?uniqueId="([^"]+)"[^\r\n]*?\b(\d+) x (\d+)\b/g)];
+          assert.ok(owned.length>0,'The actual native projection virtual display must be observable');
+          return {identity:owned[0][1],width:Number(owned[0][2]),height:Number(owned[0][3])};
+        };
+        const captureBefore=await captureDisplay(),qualityScreenBefore=await page.evaluate(()=>publicScreenSnapshot());
+        assert.ok(qualityScreenBefore?.nonBlank && qualityScreenBefore.trackId);
+        await page.evaluate(id=>{
+          const output=publicRTC.relayMedia.peers.get(id)?.outputs.get('audio');
+          window.qualityAudioOutput=output;window.qualityAudioTrack=output?.track;
+        },peerId);
+        const dimensions=[];let enteredQualityFullscreen=false;
+        runtimeDiagnostics.nativeFullscreenQualityRoundTrip={displayLongEdge:1920,steps:dimensions,stage:'before fullscreen quality selection'};
+        try {
+          // The ordinary 720x1280 emulator cannot distinguish these ceilings.
+          // An explicit owner display-size change provides real 1080p pixels;
+          // native and remotely decoded dimensions must both follow selection.
+          await adb(['shell','wm','size','1080x1920']);
+          assert.match(await adb(['shell','wm','size']),/Override size:\s*1080x1920/);
+          await tapRoomAction(node=>node['resource-id']==='fullscreen-button');enteredQualityFullscreen=true;
+          await findNode((node,nodes)=>node['resource-id']==='presentation-quality' && visibleInWebView(node,nodes) && node.enabled==='true');
+          for(const [quality,maxEdge,w,h] of [['720',1280,720,1280],['1080',1920,1080,1920],['720',1280,720,1280]]) {
+            publicPhase(`native fullscreen owner selects ${quality}p outgoing ceiling`);
+            runtimeDiagnostics.nativeFullscreenQualityRoundTrip.stage=`selecting ${quality}p`;
+            const packetsBefore=(await relayStats()).row.receivedAudioPackets;
+            const frameBefore=await page.evaluate(()=>publicScreenSnapshot());
+            await tap(await findNode((node,nodes)=>node['resource-id']==='presentation-quality' && visibleInWebView(node,nodes) && node.enabled==='true'));
+            await tapStable(node=>['android.widget.CheckedTextView','android.widget.TextView'].includes(node.class) &&
+              ['local.auralink.mobile','android'].includes(node.package) && node.text===`${quality}p` && visible(node) && node.enabled==='true');
+            await findNode((node,nodes)=>node['resource-id']==='presentation-quality' && visibleInWebView(node,nodes) &&
+              (node['content-desc'] || '').includes(`${quality}p`));
+            const nativeDeadline=Date.now()+15000;let display;
+            do {display=await captureDisplay();if(display.width===w && display.height===h)break;await delay(300);} while(Date.now()<nativeDeadline);
+            assert.equal(display.identity,captureBefore.identity,'Quality changes must resize the same native virtual display');
+            assert.equal(display.width,w);assert.equal(display.height,h);
+            await adb(['shell','input','keyevent','24']);
+            await page.waitForFunction(({id,trackId,frames,w,h,packetsBefore})=>{
+              const screen=publicScreenSnapshot(),peer=publicRTC.relayMedia.peers.get(id),audio=peer?.outputs.get('audio');
+              return screen?.nonBlank && screen.trackId===trackId && screen.width===w && screen.height===h && screen.frames>frames &&
+                audio===window.qualityAudioOutput && audio?.track===window.qualityAudioTrack && audio.context.state==='running' && peer.receivedAudioPackets>packetsBefore;
+            },{id:peerId,trackId:qualityScreenBefore.trackId,frames:frameBefore.frames,w,h,packetsBefore},{timeout:25000});
+            const decoded=await page.evaluate(()=>publicScreenSnapshot());
+            assert.match(await adb(['shell','dumpsys','media_projection']),/local\.auralink\.mobile/);
+            await findNode((node,nodes)=>label('Turn microphone on')(node) && visibleInWebView(node,nodes));
+            await findNode((node,nodes)=>label('Turn device audio off')(node) && visibleInWebView(node,nodes));
+            dimensions.push({quality,maxEdge,native:{width:display.width,height:display.height},received:{width:decoded.width,height:decoded.height},sameVirtualDisplay:true,sameScreenTrack:true,sameDeviceAudioOutput:true,audioPacketsAdvanced:true,actualFullscreenSelector:true});
+          }
+          await screenshot('android-emulator-fullscreen-quality.png');
+        } finally {
+          try { if(enteredQualityFullscreen)await adb(['shell','input','keyevent','4']); }
+          finally {
+            try { await adb(['shell','wm','size',originalOverride || 'reset']); }
+            finally { await page.evaluate(()=>{window.qualityAudioOutput=null;window.qualityAudioTrack=null;}).catch(()=>{}); }
+          }
+        }
+        await findNativeRoomAction(label('Turn microphone on'));await findNativeRoomAction(label('Turn device audio off'));
+        await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
+        assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),deviceProcess);
+        checkpoint('nativeFullscreenQualityRoundTrip',{passed:true,displayLongEdge:1920,steps:dimensions,sameProcess:true,sameRoom:true,
+          sameNativeVirtualDisplay:true,sameScreenTrack:true,deviceAudioStayedEnabled:true,microphoneStayedOff:true,noNewProjectionConsent:true,
+          actualNativeAndDecodedDimensions:true,physicalDeviceVerified:false,audibleSoundDuringQualityChangesVerified:false});
+      }
       publicPhase('owner turns device audio off without stopping the shared screen');
       const deviceScreenBefore=await page.evaluate(()=>publicScreenSnapshot());
       await tapRoomAction(label('Turn device audio off'));await findNativeRoomAction(label('Turn device audio on'));

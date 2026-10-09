@@ -104,7 +104,7 @@ public final class AndroidSecurityHarness {
     new PinnedRoomClient(lan, noop).onSetSSLParameters(pinned);
     check(pinned.getEndpointIdentificationAlgorithm() == null, "LAN pin verification remains separately scoped");
   }
-  private static void membershipPolicies() {
+  private static void membershipPolicies() throws Exception {
     RoomMembership membership = new RoomMembership();
     String owner = "owner-123", controller = "controller-456";
     check(!membership.hasRoom() && !membership.allows(controller), "Directory connection alone authorizes no native room access");
@@ -144,7 +144,18 @@ public final class AndroidSecurityHarness {
     check(!membership.expectAdmission("invalid\nroom", false) && !membership.acceptsWelcome(owner, "room-123"), "Malformed explicit room join fails closed");
     projectionOwnershipPolicies();
   }
-  private static void projectionOwnershipPolicies() {
+  private static void projectionOwnershipPolicies() throws Exception {
+    check(ScreenCaptureQuality.maxEdge("720p")==1280 && ScreenCaptureQuality.maxEdge("1080p")==1920,"Phone capture exposes only its supported resolution ceilings");
+    for(final String quality:new String[]{null,"auto","480p","1440p","1080"," 720p","720P"})
+      refuses(()->ScreenCaptureQuality.maxEdge(quality),"Unsupported or malformed capture quality is rejected");
+    check(java.util.Arrays.equals(ScreenCaptureQuality.dimensions(1080,1920,1280),new int[]{720,1280}),"Portrait capture scales to actual 720p output dimensions");
+    check(java.util.Arrays.equals(ScreenCaptureQuality.dimensions(1080,1920,1920),new int[]{1080,1920}),"Portrait 1080p retains native pixels");
+    check(java.util.Arrays.equals(ScreenCaptureQuality.dimensions(1920,1080,1280),new int[]{1280,720}),"Landscape capture keeps its orientation and aspect ratio");
+    check(java.util.Arrays.equals(ScreenCaptureQuality.dimensions(720,1280,1920),new int[]{720,1280}),"Selecting a higher ceiling never upscales a smaller display");
+    int[] odd=ScreenCaptureQuality.dimensions(1081,1921,1280);
+    check(odd[0]%2==0 && odd[1]%2==0 && Math.max(odd[0],odd[1])<=1280,"Scaled image dimensions stay even and within the selected bound");
+    for(final int[] invalid:new int[][]{{0,1920,1280},{1080,-1,1920},{32769,1920,1280},{1080,1920,2560}})
+      refuses(()->ScreenCaptureQuality.dimensions(invalid[0],invalid[1],invalid[2]),"Malformed source geometry or ceiling is rejected");
     ProjectionOwnership ownership = new ProjectionOwnership();
     String oldTicket = "old-owner-consent", replacement = "new-owner-consent";
     ownership.prepare(oldTicket);

@@ -18,7 +18,7 @@ An invitation is a long capability, not a guessable six-digit number. Blocking r
 Put Windows on home Wi-Fi/Ethernet and the Mac on a separate Internet connection. Same-PC/same-Wi-Fi clients do not establish different-network connectivity.
 
 1. Share a full display. Confirm readable text and changing content on the receiver; an online badge is insufficient.
-2. Record actual resolution, frame rate, codec, route and traffic from **Connection details** after ten seconds. Try Auto, 720p, 1080p and 1440p.
+2. Record actual resolution, frame rate, codec, route and traffic from **Connection details** after ten seconds. While sharing in fullscreen, use **Stream** to try Auto, 720p, 1080p and desktop 1440p. Confirm the same share continues, the other quality selectors match, and received dimensions stay within the selected ceiling. Android is limited to a 1920-pixel long edge and needs a source display larger than 1280 pixels to demonstrate both live capture sizes.
 3. Test Windows→Mac and Mac→Windows independently. A selector is a maximum; report received dimensions.
 4. Scroll text and move a window to check motion/delay. Test minimizing/backgrounding and returning. Static content can hide a stalled encoder.
 5. With blocked direct RTC, verify **Secure relay** or a useful failure. Direct success does not establish relay.

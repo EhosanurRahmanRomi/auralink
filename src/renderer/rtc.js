@@ -371,23 +371,34 @@ export class RoomRTC extends EventTarget {
   }
 
   async setVideoLimits(quality = this.quality || 'auto') {
-    this.quality = quality;
     const caps = { auto: 3500000, '720': 2200000, '1080': 4500000, '1440': 7000000 };
+    this.quality = Object.hasOwn(caps, quality) ? quality : 'auto';
+    const generation = this.videoLimitsGeneration = (this.videoLimitsGeneration || 0) + 1;
+    const pending = [];
     for (const entry of this.peers.values()) {
-      for (const [kind, sender] of entry.senders) {
-        if (kind !== 'screen') continue;
-        if (!sender.track) continue;
-        try {
-          const params = sender.getParameters();
-          if (!params.encodings?.length) params.encodings = [{}];
-          const otherPeers = Math.max(1, this.peers.size);
-          params.encodings[0].maxBitrate = Math.round(caps[quality] / (otherPeers > 2 ? 1.4 : 1));
-          params.encodings[0].maxFramerate = 30;
-          params.degradationPreference = 'maintain-resolution';
-          await sender.setParameters(params);
-        } catch { /* Some WebRTC builds do not support all sender parameters. */ }
-      }
+      // Negotiation and owner UI changes can tune the same sender concurrently.
+      // Serialize per peer so an older browser operation cannot complete last
+      // and restore an obsolete cap. Healthy peers never wait on another peer.
+      const current = () => !this.closed && generation === this.videoLimitsGeneration &&
+        !entry.relayActive && this.peers.get(entry.info.id) === entry;
+      entry.videoLimitsQueue = (entry.videoLimitsQueue || Promise.resolve()).catch(() => {}).then(async () => {
+        if (!current()) return;
+        for (const [kind, sender] of entry.senders) {
+          if (kind !== 'screen' || !sender.track || !current()) continue;
+          try {
+            const params = sender.getParameters();
+            if (!params.encodings?.length) params.encodings = [{}];
+            const otherPeers = Math.max(1, this.peers.size);
+            params.encodings[0].maxBitrate = Math.round(caps[this.quality] / (otherPeers > 2 ? 1.4 : 1));
+            params.encodings[0].maxFramerate = 30;
+            params.degradationPreference = 'maintain-resolution';
+            await sender.setParameters(params);
+          } catch { /* Some WebRTC builds do not support all sender parameters. */ }
+        }
+      });
+      pending.push(entry.videoLimitsQueue);
     }
+    await Promise.all(pending);
   }
 
   sendData(peerId, data) {

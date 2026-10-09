@@ -372,6 +372,8 @@ final class AndroidRoomSession extends ContextWrapper {
                 String code = consumePendingInvitation(); reply(id, code == null ? JSONObject.NULL : code);
             } else if ("startScreenShare".equals(method)) {
                 startProjection(id, args instanceof JSONObject ? (JSONObject)args : new JSONObject());
+            } else if ("setScreenQuality".equals(method)) {
+                setScreenQuality(id, args instanceof JSONObject ? (JSONObject)args : new JSONObject());
             } else if ("setSystemAudio".equals(method)) {
                 setSystemAudio(id, args instanceof JSONObject ? (JSONObject)args : new JSONObject());
             } else if ("ackSystemAudio".equals(method)) {
@@ -639,6 +641,21 @@ final class AndroidRoomSession extends ContextWrapper {
             }
         } catch (Exception ignored) { /* Renderer handles malformed/unrecognized room messages. */ }
         return true;
+    }
+    private void setScreenQuality(String requestId, JSONObject options) {
+        if (!trustedPage() || !roomMembership.hasRoom() || !(options.opt("captureId") instanceof String) || !(options.opt("quality") instanceof String))
+            throw new IllegalArgumentException("Select screen quality from the active room.");
+        final String ticket = options.optString("captureId"); final long serial = roomMembership.epoch();
+        if (!ticket.equals(projectionId) || !ScreenShareService.active()) throw new IllegalArgumentException("That screen share has already ended.");
+        ScreenShareService.setQuality(ticket, options.optString("quality"), new ScreenShareService.QualityListener() {
+            public void changed(int width, int height, int maxEdge) {
+                if (destroyed || serial != roomMembership.epoch() || !roomMembership.hasRoom() || !ticket.equals(projectionId)) {
+                    reject(requestId, "That screen share has already ended."); return;
+                }
+                reply(requestId, json("ok", true, "width", width, "height", height, "maxEdge", maxEdge, "fps", 12));
+            }
+            public void failed(String reason) { reject(requestId, reason); }
+        });
     }
     private void clearProjectionRequest() {
         cancelSystemAudioPermission("Screen sharing changed or ended.");
