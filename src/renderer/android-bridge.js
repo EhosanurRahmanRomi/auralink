@@ -1,8 +1,8 @@
 /* Optional native Android adapter. Desktop and ordinary browsers use no bridge. */
 (() => {
   'use strict';
-  const native = window.AuralinkNative;
-  if (!native || typeof native.postMessage !== 'function' || window.auralink) return;
+  const native = window.GlancePortNative;
+  if (!native || typeof native.postMessage !== 'function' || window.glancePort) return;
 
   const requests = new Map();
   const sockets = new Map();
@@ -189,8 +189,8 @@
     else request.reject(new Error(String(message.error || 'The Android service declined this action.').slice(0, 240)));
   }
 
-  Object.defineProperty(window, '__auralinkNativeReceive', { value: receive, writable: false, configurable: false });
-  Object.defineProperty(window, 'auralink', {
+  Object.defineProperty(window, '__glancePortNativeReceive', { value: receive, writable: false, configurable: false });
+  Object.defineProperty(window, 'glancePort', {
     value: Object.freeze({
       platform: 'android',
       setSessionActive: () => Promise.resolve({active:false}), // Admission owns the foreground service natively.

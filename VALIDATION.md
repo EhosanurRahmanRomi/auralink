@@ -2,6 +2,12 @@
 
 Tests record specific behavior. They do not certify unrestricted device control, physical media quality, internet reachability or absolute security.
 
+## 0.6.1 Mac screen recovery and identity revision
+
+Screen-source tests cover denied, restricted and unknown access; one native request for first consent; permitted display-only fallback; exact selected-source revalidation; source/room cancellation; permission revocation; and shared deadlines including a stalled main loop. Main-process fixtures verify that only trusted native IPC opens the fixed Mac settings page. The real renderer runs through an actual local HTTPS room with a declared Mac bridge fixture and generated screen track to exercise settings, explicit retry, capture refusal, cancellation and replacement-room safety. These are simulated Mac permissions and generated media, not physical macOS TCC or display-capture proof.
+
+The Mac bundle check verifies the new `local.glanceport.desktop` identity, signed microphone entitlements, application source parity and launch from an isolated writable copy outside the DMG. Separate startup tests verify the fresh Glance-Port profile without old-cookie migration. The published report records installer, Android native runtime and live service evidence at their exact commit. The user's recently updated Mac still requires an Applications installation, fresh screen/microphone/Accessibility grants when used, and physical Windows↔Mac acceptance.
+
 ## 0.6.0 audio, zoom and Android session revision
 
 The new audio fixture exercises the shipped controls and stereo mixer using declared 440/880 Hz device tones and a separate 200 Hz microphone. It requires device-only capture to make zero microphone calls, independent toggles, stereo separation after actual encrypted 48 kHz/192 kbps Opus decode, honest missing-loopback errors and cleanup of late permissions. Generated tones establish the software path; physical Windows/macOS loopback permissions, protected source apps and audible speakers require device acceptance.
@@ -62,7 +68,7 @@ The 0.3.0 source added a private Internet directory and coordinator alongside Ne
 | Actual workerd / SQLite tests | Production Workers WebSocket upgrades, real persistence/alarms, pending consent through idle time, and a mocked provider fetched through the Workers runtime with encrypted room-cache reuse |
 | Live public native clients | Normal TLS/WSS, authenticated private presence, owner admission, sender identity, consent through an idle period, production heartbeat, exact native membership/grant, replay rejection and device cleanup |
 | Local and public browser integration | Real WebRTC video/audio and encrypted input fixture between two contexts on this Windows PC; delayed capture, microphone permission and control approval cannot attach to a replacement room/share; rapid leave/rejoin is ordered by acknowledgment |
-| Actual Electron integration | Production renderer/preload/native WSS, an approved native guest and actual capture of the Auralink app window; stopping capture and leaving retain directory presence |
+| Actual Electron integration | Production renderer/preload/native WSS, an approved native guest and actual capture of the Glance-Port app window; stopping capture and leaving retain directory presence |
 | Two actual Electron apps | Separate fresh app profiles, production native WSS and owner admission, bidirectional displayed synthetic camera video and decoded microphone energy, microphone restart and acknowledged device cleanup; production permission rules remain unchanged |
 | Native desktop lifecycle tests | Canceled asynchronous room preparation cannot replace a newer broker or leave a late listener running; stale screen enumeration cannot authorize a source |
 | Android policy and bridge tests | Normal Internet CA/hostname verification remains separate from LAN pinning; room/socket loss invalidates consent immediately; capture IDs keep late results, frames and stops scoped to the originating share |

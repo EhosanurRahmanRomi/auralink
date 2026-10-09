@@ -36,21 +36,21 @@ function icon(name) { return `<svg viewBox="0 0 24 24" aria-hidden="true">${icon
 function paintIcons(root = document) { root.querySelectorAll('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon); }); }
 paintIcons();
 const $ = (id) => document.getElementById(id);
-const bridge = window.auralink;
+const bridge = window.glancePort;
 const state = {
   socket: null, rtc: null, selfId: null, hostId: null, isHost: false, joined: false, joining: false,
   peers: new Map(), tracks: new Map(), requests: new Map(), local: new Map(),
   room: null, selected: null, sourceId: null, grant: null, controlling: null, controlRequest: null,
   pendingControl: null, controlTimer: null, grantTimer: null, audioElements: new Map(), speakerPool: [], nativeInfo: null,
   audioContext: null, silentOutput: null, microphoneMonitor: null, microphoneTest: null, speaker: true, phoneScreen: null,
-  mediaPending: new Map(), sharingPending: false,
+  mediaPending: new Map(), sharingPending: false, screenAccessHelp: null,
   systemAudio: null, audioMixer: null, audioSync: Promise.resolve(),
   relayPlaybackBlocked: false, relayCaptureSuspended: false, relayCompatibilityNotified: false,
   leaving: false, epoch: 0, preparing: null, preparingHost: false, preparingInternet: false,
   started: 0, lastMove: 0, seq: 0, pressed: new Set(), pressedButtons: new Set(), lastPoint: { x: .5, y: .5 }, statsTimer: null, durationTimer: null,
 };
 let preferences;
-try { preferences = JSON.parse(localStorage.getItem('auralink.preferences') || '{}'); } catch { preferences = {}; }
+try { preferences = JSON.parse(localStorage.getItem('glance-port.preferences') || '{}'); } catch { preferences = {}; }
 preferences = { name: 'My device', quality: 'auto', stun: '', microphone: '', speaker: '', internetOrigin: '', internetOnline: false, ...preferences };
 delete preferences.camera;
 if (!['auto', '720', '1080', '1440'].includes(preferences.quality)) preferences.quality = 'auto';
@@ -71,16 +71,20 @@ const internet = new InternetDirectory({
 });
 
 function savePreferences() {
-  try { localStorage.setItem('auralink.preferences', JSON.stringify(preferences)); } catch { /* Private-browser storage can be unavailable. */ }
+  try { localStorage.setItem('glance-port.preferences', JSON.stringify(preferences)); } catch { /* Private-browser storage can be unavailable. */ }
   $('profile-name').textContent = preferences.name;
   $('profile-initial').textContent = initials(preferences.name);
 }
 function initials(name) { return String(name).trim().split(/\s+/).slice(0, 2).map((part) => part[0] || '').join('').toUpperCase() || '?'; }
-function cleanError(error) { return String(error?.message || error || 'Something went wrong').slice(0, 260); }
+function cleanError(error) {
+  return String(error?.reason || error?.message || error || 'Something went wrong')
+    .replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/i, '').slice(0, 260);
+}
 function roomCurrent(epoch, rtc) { return state.joined && !state.leaving && state.epoch === epoch && state.rtc === rtc && !rtc?.closed; }
 function admissionCurrent(epoch) { return !state.leaving && state.epoch === epoch && state.joining; }
 function beginAdmission(dialog = null, mode = null) {
   if (state.joined || state.joining || state.leaving) return null;
+  closeScreenAccessHelp();
   state.joining = true; state.preparing = dialog; state.preparingHost = dialog === 'host-dialog' && mode === 'nearby'; state.preparingInternet = mode === 'internet'; const epoch = ++state.epoch;
   updateButtons(); renderDevices(); return epoch;
 }
@@ -1239,13 +1243,19 @@ $('share-button').addEventListener('click', async () => {
     else await beginSharing();
   } catch (error) {
     if (roomCurrent(epoch, rtc)) { if (state.phoneScreen || state.local.has('screen')) await stopSharing().catch(() => { if (roomCurrent(epoch, rtc)) { state.local.delete('screen'); clearPhoneCapture(); } });
-    if (roomCurrent(epoch, rtc)) toast(`Screen sharing: ${cleanError(error)}`, true); }
+    if (roomCurrent(epoch, rtc)) await recoverScreenAccess(error, epoch, rtc); }
   }
   finally { if (state.sharingPending === operation) state.sharingPending = false; updateButtons(); }
 });
 async function pickScreen(epoch = state.epoch, rtc = state.rtc) {
-  const sources = await bridge.sources();
+  const result = await bridge.sources();
   if (!roomCurrent(epoch, rtc)) return;
+  if (result?.ok === false) {
+    if (result.code !== 'SCREEN_SELECTION_CANCELED') await recoverScreenAccess(result, epoch, rtc);
+    return;
+  }
+  // Older renderer fixtures and compatible native bridges may return the list.
+  const sources = Array.isArray(result) ? result : result?.sources;
   if (!sources?.length) throw new Error('No displays or windows were available. Check screen-capture permissions.');
   $('screen-source-list').replaceChildren();
   for (const source of sources) {
@@ -1257,13 +1267,56 @@ async function pickScreen(epoch = state.epoch, rtc = state.rtc) {
       const operation = {}; state.sharingPending = operation; updateButtons();
       $('screen-source-list').querySelectorAll('button').forEach(sourceButton => { sourceButton.disabled = true; });
       try { await bridge.chooseScreen(source.id); if (!roomCurrent(epoch, rtc)) return; state.sourceId = source.id; $('screen-dialog').close(); await beginSharing(epoch, rtc); }
-      catch (error) { if (roomCurrent(epoch, rtc)) { state.sourceId = null; try { await bridge?.stopSharing?.(); } catch {} toast(`Screen sharing: ${cleanError(error)}`, true); } }
+      catch (error) { if (roomCurrent(epoch, rtc)) { state.sourceId = null; try { await bridge?.stopSharing?.(); } catch {} if (roomCurrent(epoch, rtc)) await recoverScreenAccess(error, epoch, rtc); } }
       finally { if (state.sharingPending === operation) state.sharingPending = false; updateButtons(); $('screen-source-list').querySelectorAll('button').forEach(sourceButton => { sourceButton.disabled = false; }); }
     });
     $('screen-source-list').append(button);
   }
   openDialog('screen-dialog');
 }
+function closeScreenAccessHelp() {
+  state.screenAccessHelp = null;
+  if ($('screen-access-dialog').open) $('screen-access-dialog').close();
+}
+async function recoverScreenAccess(error, epoch, rtc) {
+  if (!roomCurrent(epoch, rtc)) return;
+  if (bridge?.platform !== 'darwin') { toast(`Screen sharing: ${cleanError(error)}`, true); return; }
+  let info;
+  try { info = await bridge.getInfo?.(); } catch {}
+  if (!roomCurrent(epoch, rtc)) return;
+  const failure = error?.ok === false ? error : info?.screenCapture || error;
+  if (failure?.code === 'SCREEN_SELECTION_CANCELED') return;
+  const status = failure?.status || info?.permissions?.screen || 'unknown';
+  const permitted = status === 'granted';
+  state.screenAccessHelp = { epoch, rtc };
+  if ($('screen-dialog').open) $('screen-dialog').close();
+  $('screen-access-title').textContent = permitted ? 'Let’s restore screen sharing' : 'Allow your Mac screen to be shared';
+  $('screen-access-description').textContent = permitted
+    ? 'macOS could not prepare the selected display. Try sharing a full display again. If it still fails, check Glance-Port’s screen-recording access and quit and reopen the app.'
+    : 'macOS needs your approval before Glance-Port can capture your screen. Open the privacy settings and enable Glance-Port under Screen & System Audio Recording (called Screen Recording on some versions).';
+  $('screen-access-status').textContent = permitted ? 'Screen-recording access is enabled.' : `Screen-recording access: ${status.replaceAll('-', ' ')}.`;
+  $('screen-access-open-settings').disabled = !bridge?.openPermissionSettings;
+  $('screen-access-retry').disabled = false;
+  openDialog('screen-access-dialog');
+}
+$('screen-access-dialog').addEventListener('close', () => { if (!$('screen-access-dialog').open) state.screenAccessHelp = null; });
+$('screen-access-open-settings').addEventListener('click', async () => {
+  const help = state.screenAccessHelp;
+  if (!help || !roomCurrent(help.epoch, help.rtc)) return closeScreenAccessHelp();
+  $('screen-access-open-settings').disabled = true;
+  try {
+    await bridge.openPermissionSettings('screen');
+    if (state.screenAccessHelp === help && roomCurrent(help.epoch, help.rtc)) $('screen-access-status').textContent = 'Enable Glance-Port in Settings. If macOS asks you to quit and reopen, do that before sharing again.';
+  } catch (error) {
+    if (state.screenAccessHelp === help && roomCurrent(help.epoch, help.rtc)) $('screen-access-status').textContent = `Open System Settings → Privacy & Security → Screen & System Audio Recording. ${cleanError(error)}`;
+  } finally { if (state.screenAccessHelp === help) $('screen-access-open-settings').disabled = false; }
+});
+$('screen-access-retry').addEventListener('click', () => {
+  const help = state.screenAccessHelp;
+  if (!help || !roomCurrent(help.epoch, help.rtc)) return closeScreenAccessHelp();
+  closeScreenAccessHelp();
+  $('share-button').click();
+});
 function captureConstraints(quality = preferences.quality) {
   const sizes = { auto: [1920, 1080], '720': [1280, 720], '1080': [1920, 1080], '1440': [2560, 1440] };
   const [width, height] = sizes[quality] || sizes.auto;
@@ -1735,6 +1788,7 @@ function updateDuration() {
 $('end-button').addEventListener('click', () => leaveRoom());
 async function leaveRoom(stopHost = true) {
   if (state.leaving) return;
+  closeScreenAccessHelp();
   const exitFullscreen = exitPresentation();
   const globalRoom = state.room?.internet === true || state.preparingInternet;
   const stopNearbyHost = stopHost && !globalRoom && (state.isHost || state.preparingHost);

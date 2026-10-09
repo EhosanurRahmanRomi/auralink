@@ -107,8 +107,8 @@ async function main() {
       });
       client.page.on('pageerror', () => { void client.page.evaluate(() => qaPageErrors++).catch(() => {}); });
       await client.page.reload(); await client.page.locator('#host-button').waitFor();
-      assert.equal(await client.page.evaluate(() => typeof window.auralink.internetOpen), 'function');
-      assert.equal((await client.page.evaluate(() => window.auralink.getInfo())).testing, true);
+      assert.equal(await client.page.evaluate(() => typeof window.glancePort.internetOpen), 'function');
+      assert.equal((await client.page.evaluate(() => window.glancePort.getInfo())).testing, true);
       if (diagnosticPermissions) {
         // Diagnostic run only, after an unmodified baseline. Scope the temporary
         // network exception to this app's exact trusted main frame. Fake media
@@ -148,7 +148,7 @@ async function main() {
     for (const client of clients) {
       await client.page.locator('.nav-item[data-view="settings"]').click(); await client.page.locator('#internet-forget').click();
       await client.page.waitForFunction(() => document.getElementById('internet-status').textContent === 'Offline');
-      assert.equal(await client.page.evaluate(value => localStorage.getItem(`auralink.internet.identity:${value}`), origin), null); client.forgotten = true;
+      assert.equal(await client.page.evaluate(value => localStorage.getItem(`glance-port.internet.identity:${value}`), origin), null); client.forgotten = true;
     }
     proof.bothDevicesForgottenWithAcknowledgment = true; assert.ok((await Promise.all(clients.map(client => snapshot(client.page)))).every(item => item.pageErrors === 0)); proof.passed = true;
   } catch {
@@ -157,7 +157,7 @@ async function main() {
     for (const client of clients) {
       if (!client.forgotten) {
         let identity;
-        try { identity = await client.page.evaluate(value => JSON.parse(localStorage.getItem(`auralink.internet.identity:${value}`) || 'null'), origin); await forgetIdentity(identity); client.forgotten = true; }
+        try { identity = await client.page.evaluate(value => JSON.parse(localStorage.getItem(`glance-port.internet.identity:${value}`) || 'null'), origin); await forgetIdentity(identity); client.forgotten = true; }
         catch {
           if (identity) { const recovery = path.join(root, '.private', `electron-media-cleanup-${nameSuffix}-${clients.indexOf(client)}.json`); fs.mkdirSync(path.dirname(recovery), { recursive: true }); fs.writeFileSync(recovery, JSON.stringify({ origin, identity })); }
           proof.cleanupRequiresPrivateRecovery = true;

@@ -226,7 +226,7 @@ test('blocked browser storage does not prevent starting nearby mode or explicit 
 
 test('public bootstrap never sends or overwrites a saved private identity, and reconnect never resumes a room', async () => {
   const { InternetDirectory } = await moduleReady; const saved = storage(); const sockets = []; const sequence = [];
-  const savedPrivate = JSON.stringify({ deviceId: 'device-a', deviceToken: token }); saved.setItem(`auralink.internet.identity:${origin}`, savedPrivate);
+  const savedPrivate = JSON.stringify({ deviceId: 'device-a', deviceToken: token }); saved.setItem(`glance-port.internet.identity:${origin}`, savedPrivate);
   const directory = new InternetDirectory({ storage: saved, reconnectDelays: [0], trust: async address => sequence.push(`trust:${address}`), socketFactory: url => {
     sequence.push('socket'); const socket = new Socket(url, (socket, packet) => {
       if (packet.type === 'bootstrap') socket.receive({ type: 'registered', deviceId: `public-${sockets.length}`, mode: 'public' });
@@ -239,12 +239,12 @@ test('public bootstrap never sends or overwrites a saved private identity, and r
     assert.deepEqual(sockets[0].sent, [{ type: 'bootstrap', name: 'Anonymous phone' }]);
     sockets[0].receive({ type: 'paired', deviceId: 'attack', deviceToken: 'attack-credential-1234567890' });
     sockets[0].receive({ type: 'presence', devices: [{ id: 'not-public', name: 'Private identity', online: true }] });
-    assert.equal(saved.getItem(`auralink.internet.identity:${origin}`), savedPrivate); assert.deepEqual(directory.devices, []);
+    assert.equal(saved.getItem(`glance-port.internet.identity:${origin}`), savedPrivate); assert.deepEqual(directory.devices, []);
     directory.joinRoom({ roomId: 'room-a', roomKey: 'private-room-capability' }); sockets[0].close(); await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(directory.status, 'online'); assert.equal(directory.deviceId, 'public-2');
     assert.deepEqual(sockets[1].sent, [{ type: 'bootstrap', name: 'Anonymous phone' }]);
     await directory.forget(); assert.equal(directory.status, 'offline'); assert.equal(directory.deviceId, null);
-    assert.equal(saved.getItem(`auralink.internet.identity:${origin}`), savedPrivate);
+    assert.equal(saved.getItem(`glance-port.internet.identity:${origin}`), savedPrivate);
     assert.ok(!sockets.flatMap(socket => socket.sent).some(packet => ['pair', 'register', 'forget'].includes(packet.type)));
   } finally { directory.close(); }
 });
@@ -258,7 +258,7 @@ test('public policy close rejects bootstrap promptly and stops retries without e
     t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     const saved = storage(), sockets = [], statuses = [];
     const privateIdentity = JSON.stringify({ deviceId: 'private-device', deviceToken: token });
-    saved.setItem(`auralink.internet.identity:${origin}`, privateIdentity);
+    saved.setItem(`glance-port.internet.identity:${origin}`, privateIdentity);
     const directory = new InternetDirectory({ storage: saved, timeout: 12000, reconnectDelays: [0, 100], socketFactory: url => {
       const socket = new Socket(url, () => {}); sockets.push(socket); return socket;
     } });
@@ -276,7 +276,7 @@ test('public policy close rejects bootstrap promptly and stops retries without e
       assert.equal(directory.status, 'offline'); assert.equal(directory.socket, null); assert.equal(directory.deviceId, null);
       await rejected; t.mock.timers.tick(60000); await tick();
       assert.equal(sockets.length, 1); assert.equal(disconnects, 1); assert.ok(!statuses.includes('retrying'));
-      assert.equal(saved.getItem(`auralink.internet.identity:${origin}`), privateIdentity);
+      assert.equal(saved.getItem(`glance-port.internet.identity:${origin}`), privateIdentity);
     } finally { directory.close(); }
   });
 });
@@ -352,6 +352,6 @@ test('invitation codes contain the complete strong capability and reject truncat
   assert.equal(roomCode({ ...parsed, url: origin, access: 'invite' }), '', 'Custom origins use a link so the service is never guessed incorrectly');
   for (const invalid of [code.slice(0, -1), code + '.extra', 'A1.123456.123456', code.replace(roomId, 'not-a-room'), code.replace(roomKey, '*'.repeat(43))]) assert.throws(() => roomInvitation(invalid));
   assert.throws(() => roomInvitation(`${DEFAULT_PUBLIC_ORIGIN}/#internet=1&room=${roomId}&key=${roomKey}&key=${roomKey}`));
-  assert.deepEqual(roomInvitation(`auralink://join#code=${code}`), parsed);
-  for (const invalid of [`auralink://join/#code=${code}`, `auralink://join:443#code=${code}`, `auralink://user@join#code=${code}`, `auralink://join?x=1#code=${code}`, `auralink://join#code=${code}&code=${code}`, `auralink://join#code=${code.replace('A1.', 'A1%2e')}`, `auralink://join#code=${code}\n`, code.slice(0, -1) + 'B']) assert.throws(() => roomInvitation(invalid));
+  for (const scheme of ['glance-port', 'auralink']) assert.deepEqual(roomInvitation(`${scheme}://join#code=${code}`), parsed);
+  for (const scheme of ['glance-port', 'auralink']) for (const invalid of [`${scheme}://join/#code=${code}`, `${scheme}://join:443#code=${code}`, `${scheme}://user@join#code=${code}`, `${scheme}://join?x=1#code=${code}`, `${scheme}://join#code=${code}&code=${code}`, `${scheme}://join#code=${code.replace('A1.', 'A1%2e')}`, `${scheme}://join#code=${code}\n`, code.slice(0, -1) + 'B']) assert.throws(() => roomInvitation(invalid));
 });

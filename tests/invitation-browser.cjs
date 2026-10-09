@@ -101,7 +101,7 @@ async function main() {
     for (const [width, height, phone] of [[1380, 940, false], [412, 915, true], [412, 915, true]]) {
       const context = await browser.newContext({ viewport: { width, height }, isMobile: phone, hasTouch: phone, permissions: ['microphone'] }); contexts.push(context);
       await context.addInitScript(({ origin, phone }) => {
-        if (!localStorage.getItem('auralink.preferences')) localStorage.setItem('auralink.preferences', JSON.stringify({ name: 'My device', quality: '1440' }));
+        if (!localStorage.getItem('glance-port.preferences')) localStorage.setItem('glance-port.preferences', JSON.stringify({ name: 'My device', quality: '1440' }));
         window.qaSentTypes = []; window.qaCaptureCalls = []; window.qaStreams = []; window.qaPCs = []; window.qaTrustCalls = []; window.qaGrants = []; window.qaCopies = []; window.qaRoutes = [];
         window.qaHoldTrust = false; window.qaInvitationListeners = new Set();
         window.qaDeliverInvitation = code => { for (const listener of qaInvitationListeners) listener(code); };
@@ -119,7 +119,7 @@ async function main() {
           window.qaSourcePaints = 0; let frame = 0; const paint = () => { qaSourcePaints++; context.fillStyle = '#102737'; context.fillRect(0, 0, canvas.width, canvas.height); context.fillStyle = '#a8f4d4'; context.fillRect(100 + frame * 18 % 2000, 250, 360, 340); context.fillStyle = '#eef9ff'; context.font = '52px sans-serif'; context.fillText('2560 × 1440 shared desktop · frame ' + frame++, 90, 120); }; paint(); const timer = setInterval(paint, 1000 / 30);
           const stream = canvas.captureStream(30); stream.getVideoTracks()[0].addEventListener('ended', () => clearInterval(timer)); qaStreams.push(stream); return stream;
         };
-        window.auralink = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); if (qaHoldTrust) await new Promise(resolve => { window.qaReleaseTrust = () => { qaHoldTrust = false; resolve(); }; }); }, requestMedia: async () => ({ ok: true }), copyText: async value => { await new Promise(resolve => setTimeout(resolve, 75)); qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async () => {}, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {}, onEmergencyStop: listener => { window.qaEmergencyStop = listener; return () => { window.qaEmergencyStop = null; }; }, onInvitation: listener => { qaInvitationListeners.add(listener); return () => qaInvitationListeners.delete(listener); }, getPendingInvitation: async () => { const code = sessionStorage.getItem('qa.pendingInvitation'); sessionStorage.removeItem('qa.pendingInvitation'); if (sessionStorage.getItem('qa.duplicateInvitation')) { sessionStorage.removeItem('qa.duplicateInvitation'); qaDeliverInvitation(code); } return code; } };
+        window.glancePort = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); if (qaHoldTrust) await new Promise(resolve => { window.qaReleaseTrust = () => { qaHoldTrust = false; resolve(); }; }); }, requestMedia: async () => ({ ok: true }), copyText: async value => { await new Promise(resolve => setTimeout(resolve, 75)); qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async () => {}, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {}, onEmergencyStop: listener => { window.qaEmergencyStop = listener; return () => { window.qaEmergencyStop = null; }; }, onInvitation: listener => { qaInvitationListeners.add(listener); return () => qaInvitationListeners.delete(listener); }, getPendingInvitation: async () => { const code = sessionStorage.getItem('qa.pendingInvitation'); sessionStorage.removeItem('qa.pendingInvitation'); if (sessionStorage.getItem('qa.duplicateInvitation')) { sessionStorage.removeItem('qa.duplicateInvitation'); qaDeliverInvitation(code); } return code; } };
       }, { origin: proxy.origin, phone });
     }
     const host = await contexts[0].newPage(); const guest = await contexts[1].newPage(); const outsider = await contexts[2].newPage();
@@ -143,20 +143,20 @@ async function main() {
     const firstCode = await host.locator('#room-code').inputValue(); assert.match(firstCode, /^A1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i);
     assert.deepEqual(await host.evaluate(() => qaSentTypes.slice(0, 3)), ['bootstrap', 'create-room', 'join']);
     assert.deepEqual(await host.evaluate(() => qaCaptureCalls), []);
-    assert.equal(await host.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('auralink.internet.identity:')).length), 0);
+    assert.equal(await host.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('glance-port.internet.identity:')).length), 0);
     proof.oneClickRoomWithoutPairingOrCapture = true;
     phase = 'startup native invitation admission'; await guest.evaluate(code => {
       sessionStorage.setItem('qa.pendingInvitation', code); sessionStorage.setItem('qa.duplicateInvitation', '1');
       const service = 'https://auralink-private-coordinator.auralink-internet-service.workers.dev';
-      localStorage.setItem(`auralink.internet.identity:${service}`, JSON.stringify({ deviceId: 'saved-private-device', deviceToken: 'saved-private-token-never-sent' }));
-      localStorage.setItem('auralink.preferences', JSON.stringify({ ...JSON.parse(localStorage.getItem('auralink.preferences')), internetOrigin: service, internetOnline: true }));
+      localStorage.setItem(`glance-port.internet.identity:${service}`, JSON.stringify({ deviceId: 'saved-private-device', deviceToken: 'saved-private-token-never-sent' }));
+      localStorage.setItem('glance-port.preferences', JSON.stringify({ ...JSON.parse(localStorage.getItem('glance-port.preferences')), internetOrigin: service, internetOnline: true }));
     }, firstCode); await guest.reload();
     await guest.waitForFunction(() => !document.getElementById('mic-button').disabled);
     assert.equal(await guest.locator('#incoming-invite-banner').isVisible(), false, 'The same startup/live invitation is consumed once');
     assert.equal(await guest.evaluate(() => sessionStorage.getItem('qa.pendingInvitation')), null);
     assert.deepEqual(await guest.evaluate(() => qaSentTypes.slice(0, 2)), ['bootstrap', 'join'], 'An OS invitation takes priority over restoring a private directory');
-    assert.equal(await guest.evaluate(() => JSON.parse(localStorage.getItem('auralink.internet.identity:https://auralink-private-coordinator.auralink-internet-service.workers.dev')).deviceToken), 'saved-private-token-never-sent');
-    await guest.evaluate(() => { localStorage.removeItem('auralink.internet.identity:https://auralink-private-coordinator.auralink-internet-service.workers.dev'); localStorage.setItem('auralink.preferences', JSON.stringify({ ...JSON.parse(localStorage.getItem('auralink.preferences')), internetOnline: false })); });
+    assert.equal(await guest.evaluate(() => JSON.parse(localStorage.getItem('glance-port.internet.identity:https://auralink-private-coordinator.auralink-internet-service.workers.dev')).deviceToken), 'saved-private-token-never-sent');
+    await guest.evaluate(() => { localStorage.removeItem('glance-port.internet.identity:https://auralink-private-coordinator.auralink-internet-service.workers.dev'); localStorage.setItem('glance-port.preferences', JSON.stringify({ ...JSON.parse(localStorage.getItem('glance-port.preferences')), internetOnline: false })); });
     assert.equal(await host.locator('#pending-banner').isVisible(), false); assert.deepEqual(await guest.evaluate(() => qaCaptureCalls), []);
     assert.ok(!(await host.evaluate(() => qaSentTypes)).includes('approve')); assert.ok(!(await guest.evaluate(() => qaSentTypes)).includes('pair'));
     proof.invitationJoinsWithoutOwnerAdmission = true;
@@ -223,7 +223,7 @@ async function main() {
         socket.close = () => { void nativeCall('closeSocket', () => { if (ownedSocket === socket) ownedSocket = null; close(); }); };
         return socket;
       };
-      window.auralink = { platform: 'android', getInfo: async () => ({ platform: 'Android single-socket fixture' }), getPendingInvitation: async () => null,
+      window.glancePort = { platform: 'android', getInfo: async () => ({ platform: 'Android single-socket fixture' }), getPendingInvitation: async () => null,
         trustInternetService: address => nativeCall('trustInternetService', () => { if (ownedSocket) throw new Error('Disconnect before selecting another service.'); }),
         createInternetSocket: openSocket, createSocket: openSocket,
         trustInvite: invitation => nativeCall('trustInvite', () => {
@@ -236,7 +236,7 @@ async function main() {
         grantControl: async () => { qaAndroidGrants.push('control'); return { ok: true }; }, requestMedia: async () => ({ ok: true }) };
       navigator.mediaDevices.getUserMedia = async () => { qaAndroidCaptures.push('microphone'); throw new Error('Transition must not request media'); };
       navigator.mediaDevices.getDisplayMedia = async () => { qaAndroidCaptures.push('screen'); throw new Error('Transition must not request media'); };
-      localStorage.setItem('auralink.internet.identity:https://saved-private.example', JSON.stringify({ deviceId: 'preserved-device', deviceToken: 'preserved-private-token' }));
+      localStorage.setItem('glance-port.internet.identity:https://saved-private.example', JSON.stringify({ deviceId: 'preserved-device', deviceToken: 'preserved-private-token' }));
     }, { origin: proxy.origin, nearbyOrigin: proxy.nearbyOrigin });
     const android = await androidContext.newPage(); android.on('pageerror', error => errors.push(`${phase}: ${error.message}`)); await android.goto(proxy.origin);
     await android.locator('#host-button').click(); await android.waitForFunction(() => !document.getElementById('mic-button').disabled);
@@ -249,8 +249,8 @@ async function main() {
     assert.equal(proxy.nearbyApprovals(), 1, 'The actual Nearby broker must receive and approve exactly one guest request');
     assert.deepEqual(await android.evaluate(() => qaNativeCalls.slice(0, 3)), ['trustInternetService', 'closeSocket', 'trustInvite'], 'Native closeSocket must precede Nearby certificate trust');
     assert.equal(await android.locator('#internet-status').textContent(), 'Offline');
-    assert.equal(await android.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).internetOnline), false);
-    assert.equal(await android.evaluate(() => JSON.parse(localStorage.getItem('auralink.internet.identity:https://saved-private.example')).deviceToken), 'preserved-private-token');
+    assert.equal(await android.evaluate(() => JSON.parse(localStorage.getItem('glance-port.preferences')).internetOnline), false);
+    assert.equal(await android.evaluate(() => JSON.parse(localStorage.getItem('glance-port.internet.identity:https://saved-private.example')).deviceToken), 'preserved-private-token');
     assert.deepEqual(await android.evaluate(() => qaAndroidCaptures), []); assert.deepEqual(await android.evaluate(() => qaAndroidGrants), []);
     proof.androidPublicExitToNearby = { passed: true, actualRendererUI: true, singleNativeSocketFixture: true, delayedOrderedNativeQueue: true,
       nativeCallOrder: await android.evaluate(() => qaNativeCalls.slice(0, 3)), actualNearbyHostApprovals: proxy.nearbyApprovals(), internetDirectoryOffline: true,
@@ -258,7 +258,7 @@ async function main() {
     await android.locator('#end-button').click(); await android.waitForFunction(() => !document.getElementById('host-button').disabled); await androidContext.close();
     phase = 'teardown'; await guest.locator('#end-button').click(); await guest.waitForFunction(() => document.getElementById('host-button').disabled === false); await host.locator('#end-button').click(); await host.waitForFunction(() => document.getElementById('host-button').disabled === false);
     for (const page of [host, guest, outsider]) {
-      assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('auralink.internet.identity:')).length), 0);
+      assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('glance-port.internet.identity:')).length), 0);
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     }
     assert.deepEqual(errors, []); proof.status = 'passed'; proof.boundary = 'Local workerd/TLS fixture remaps the public-origin socket. Real same-PC Chromium WebRTC, synthetic media/native permission fixtures. No cross-network relay or physical Android proof.';

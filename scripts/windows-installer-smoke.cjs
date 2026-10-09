@@ -117,17 +117,17 @@ async function run() {
     const page = await application.firstWindow();
     page.on('pageerror', (error) => evidence.errors.push(error.message));
     await page.locator('#host-button').waitFor();
-    await page.waitForFunction(() => !!window.auralink && document.querySelector('#profile-platform').textContent !== 'Local workspace');
+    await page.waitForFunction(() => !!window.glancePort && document.querySelector('#profile-platform').textContent !== 'Local workspace');
     evidence.runtime = await application.evaluate(({ app }) => ({ isPackaged: app.isPackaged,
       appPath: app.getAppPath(), version: app.getVersion(), userData: app.getPath('userData') }));
     assert.equal(evidence.runtime.isPackaged, true);
     assert.equal(evidence.runtime.version, config.version);
     assert.equal(path.resolve(evidence.runtime.userData), path.join(payload, 'qa-profile'));
-    evidence.info = await page.evaluate(() => window.auralink.getInfo());
+    evidence.info = await page.evaluate(() => window.glancePort.getInfo());
     assert.equal(evidence.info.nativeControl, true);
     assert.equal(evidence.info.testing, true);
-    const room = await page.evaluate(() => window.auralink.hostRoom({ name: 'Installer payload QA', port: 0 }));
-    const invitation = await page.evaluate((value) => window.auralink.trustInvite(value), room.invite);
+    const room = await page.evaluate(() => window.glancePort.hostRoom({ name: 'Installer payload QA', port: 0 }));
+    const invitation = await page.evaluate((value) => window.glancePort.trustInvite(value), room.invite);
     assert.equal(invitation.fingerprint, room.fingerprint);
     evidence.runtime.room = { url: room.url, invitationCertificateVerified: true };
     evidence.runtime.helper = await application.evaluate(async ({ app }) => {
@@ -136,10 +136,10 @@ async function run() {
       try { await adapter.ready(); await adapter.releaseAll(); return { ready: true, releaseAcknowledged: true, inputEventsSent: 0, path: adapter.helperPath }; }
       finally { await adapter.dispose(); }
     });
-    const refused = await page.evaluate(() => window.auralink.grantControl({ peerId: 'qa', sessionId: 'setup-test-session', screenId: 'screen:qa' }));
+    const refused = await page.evaluate(() => window.glancePort.grantControl({ peerId: 'qa', sessionId: 'setup-test-session', screenId: 'screen:qa' }));
     assert.equal(refused.ok, false);
     assert.match(refused.reason, /disabled.*test/i);
-    assert.equal((await page.evaluate(() => window.auralink.stopRoom())).ok, true);
+    assert.equal((await page.evaluate(() => window.glancePort.stopRoom())).ok, true);
     evidence.checks.push('Extracted installed-layout app launches with workspace-isolated preferences, HTTPS room and native helper protocol; no native input sent');
     await application.close();
     application = null;

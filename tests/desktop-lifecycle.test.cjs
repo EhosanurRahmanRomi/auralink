@@ -10,7 +10,7 @@ const { EventEmitter } = require('node:events');
 const defer = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 async function fixture(options = {}) {
   const handlers = new Map(); let window; let permissionRequest, permissionCheck, displayRequest; let revocations = 0;
-  const sentEvents = [], fullscreenCalls = [], powerStarts = [], powerStops = [];
+  const sentEvents = [], fullscreenCalls = [], powerStarts = [], powerStops = [], profileDirectories = [], profilePaths = [], protocolRegistrations = [];
   let windowOptions, fullscreen = false, pendingFullscreen = null, destroyed = false, adapterDisposals = 0;
   const displayEvents = new EventEmitter();
   class Window extends EventEmitter {
@@ -27,9 +27,14 @@ async function fixture(options = {}) {
     show() {} async loadFile() {}
   }
   const app = new EventEmitter(); app.setName = () => {}; app.whenReady = () => Promise.resolve(); app.getVersion = () => '0.3.0';
+  app.isPackaged = Boolean(options.packaged); app.requestSingleInstanceLock = () => true;
+  app.commandLine = { hasSwitch: name => name === 'user-data-dir' && options.explicitProfile === true };
+  app.getPath = name => { assert.equal(name, 'appData'); return path.join(__dirname, 'isolated-profile-fixture'); };
+  app.setPath = (name, value) => profilePaths.push({name, value});
+  app.setAsDefaultProtocolClient = scheme => protocolRegistrations.push(scheme);
   const session = { defaultSession: { setCertificateVerifyProc() {}, setPermissionRequestHandler(handler) { permissionRequest = handler; }, setPermissionCheckHandler(handler) { permissionCheck = handler; }, setDisplayMediaRequestHandler(handler) { displayRequest = handler; } } };
   const electron = { app, BrowserWindow: Window, ipcMain: { handle(name, handler) { handlers.set(name, handler); } }, session,
-    desktopCapturer: { getSources: options.sources || (async () => []) }, screen: displayEvents, dialog: {}, globalShortcut: { register() {}, unregisterAll() {} }, clipboard: {}, systemPreferences: { getMediaAccessStatus: () => 'granted', ...options.systemPreferences }, shell: {},
+    desktopCapturer: { getSources: options.sources || (async () => []) }, screen: displayEvents, dialog: {}, globalShortcut: { register() {}, unregisterAll() {} }, clipboard: {}, systemPreferences: { getMediaAccessStatus: () => 'granted', isTrustedAccessibilityClient: () => false, ...options.systemPreferences }, shell: {},
     powerSaveBlocker: { start(type) { powerStarts.push(type); return powerStarts.length; }, stop(id) { powerStops.push(id); } } };
   class Gate { async revoke() { revocations++; } }
   const mainFile = path.resolve(__dirname, '../src/main.cjs');
@@ -40,19 +45,21 @@ async function fixture(options = {}) {
     './native/control.cjs': { ControlGate: Gate, createAdapter: () => ({ available: false, dispose() { adapterDisposals++; } }) },
     './core/internet-client.cjs': {},
     './core/app-invitation.cjs': require('../src/core/app-invitation.cjs'),
+    './core/screen-sources.cjs': require('../src/core/screen-sources.cjs'),
+    'node:fs': { mkdirSync: (directory, settings) => { assert.deepEqual({...settings}, {recursive:true}); profileDirectories.push(directory); } },
   };
   vm.runInNewContext(fs.readFileSync(mainFile, 'utf8'), { require: name => Object.hasOwn(dependencies, name) ? dependencies[name] : require(name), __dirname: path.dirname(mainFile), process: { ...process, platform: options.platform || process.platform }, URL, Map, Set, Date, String, Number, Boolean }, { filename: mainFile });
   await new Promise(resolve => setImmediate(resolve));
   assert.ok(window, 'Production native IPC registered');
   return {
-    invoke(name, args) { return handlers.get(`auralink:${name}`)({ sender: window.webContents, senderFrame: window.webContents.mainFrame }, args); },
-    invokeAs(name, args, event) { return handlers.get(`auralink:${name}`)(event, args); },
+    invoke(name, args) { return handlers.get(`glance-port:${name}`)({ sender: window.webContents, senderFrame: window.webContents.mainFrame }, args); },
+    invokeAs(name, args, event) { return handlers.get(`glance-port:${name}`)(event, args); },
     permission(mediaTypes, isMainFrame=true) { return new Promise(resolve => permissionRequest(window.webContents, 'media', resolve, { mediaTypes, isMainFrame })); },
     permissionFor(name, contents = window.webContents, details = { isMainFrame: true }) { return new Promise(resolve => permissionRequest(contents, name, resolve, details)); },
     checkPermission(name, contents = window.webContents, details = { isMainFrame: true }) { return permissionCheck(contents, name, '', details); },
     capture() { return new Promise(resolve => displayRequest({frame:window.webContents.mainFrame},resolve)); },
     checkCamera() { return permissionCheck(window.webContents, 'media', '', { mediaType: 'video', isMainFrame: true }); },
-    app, window, windowOptions, sentEvents, fullscreenCalls, powerStarts, powerStops,
+    app, window, windowOptions, sentEvents, fullscreenCalls, powerStarts, powerStops, profileDirectories, profilePaths, protocolRegistrations,
     pendingFullscreen: () => pendingFullscreen,
     finishFullscreenTransition() {
       assert.ok(options.delayedFullscreen && pendingFullscreen !== null, 'An OS fullscreen animation must be pending');
@@ -63,6 +70,26 @@ async function fixture(options = {}) {
     displayEvents, revocations: () => revocations
   };
 }
+
+test('packaged Mac starts with a fresh Glance-Port identity without reading or copying legacy cookies', async () => {
+  const native = await fixture({platform:'darwin', packaged:true});
+  const expected = path.join(__dirname, 'isolated-profile-fixture', 'Glance-Port');
+  assert.deepEqual(native.profileDirectories, [expected]);
+  assert.deepEqual(native.profilePaths, [{name:'userData', value:expected}]);
+  const info = await native.invoke('info');
+  assert.equal(info.profileName, 'Glance-Port'); assert.equal(info.applicationId, 'local.glanceport.desktop');
+  assert.deepEqual(native.protocolRegistrations, [], 'Mac registrations come from the signed bundle metadata');
+  const explicit = await fixture({platform:'darwin', packaged:true, explicitProfile:true});
+  assert.deepEqual(explicit.profileDirectories, []); assert.deepEqual(explicit.profilePaths, []);
+});
+
+test('Windows packaged updates retain installed identity and register new plus legacy invitation links', async () => {
+  const native = await fixture({platform:'win32', packaged:true});
+  const info = await native.invoke('info');
+  assert.equal(info.profileName, 'Auralink'); assert.equal(info.applicationId, 'local.auralink.desktop');
+  assert.deepEqual(native.protocolRegistrations, ['glance-port', 'auralink']);
+  assert.deepEqual(native.profilePaths, [{name:'userData', value:path.join(__dirname, 'isolated-profile-fixture', 'Auralink')}]);
+});
 
 test('canceling native host preparation prevents late certificate work from opening a room', async () => {
   const pending = defer(); let generated = 0, opened = 0;
@@ -87,10 +114,12 @@ test('a broker finishing after cancellation is stopped without replacing the act
 
 test('screen enumeration finishing after room teardown cannot authorize a stale source', async () => {
   const pending = defer(); const native = await fixture({ sources: () => pending.promise });
-  const enumeration = native.invoke('sources'); const rejected = assert.rejects(enumeration, /canceled/);
+  const enumeration = native.invoke('sources');
   await native.invoke('stop');
   pending.resolve([{ id: 'screen:old', name: 'Old display', display_id: '1', thumbnail: { toDataURL: () => 'data:image/png;base64,' } }]);
-  await rejected; await assert.rejects(native.invoke('choose-screen', 'screen:old'), /available screen/);
+  const result = await enumeration;
+  assert.equal(result.ok, false); assert.equal(result.code, 'SCREEN_SELECTION_CANCELED');
+  await assert.rejects(native.invoke('choose-screen', 'screen:old'), /available screen/);
 });
 
 test('screen-only desktop refuses camera capture while microphone remains an explicit option', async () => {
@@ -111,10 +140,11 @@ test('display geometry changes revoke input and invalidate pending screen select
   const before = native.revocations();
   native.displayEvents.emit('display-metrics-changed', {}, {}, ['workArea']);
   assert.equal(native.revocations(), before, 'Work area alone does not change display coordinates');
-  const enumeration = native.invoke('sources'); const rejected = assert.rejects(enumeration, /canceled/);
+  const enumeration = native.invoke('sources');
   native.displayEvents.emit('display-metrics-changed', {}, {}, ['bounds', 'scaleFactor']);
   assert.equal(native.revocations(), before + 1);
-  pending.resolve([source]); await rejected;
+  pending.resolve([source]); const result = await enumeration;
+  assert.equal(result.ok, false); assert.equal(result.code, 'SCREEN_SELECTION_CANCELED');
   await assert.rejects(native.invoke('choose-screen', source.id), /available screen/);
   native.displayEvents.emit('display-removed', {}, {});
   native.displayEvents.emit('display-added', {}, {});
@@ -176,7 +206,8 @@ test('a failed source refresh invalidates the earlier chooser selection', async 
   const source={id:'screen:1',name:'Display',display_id:'1',thumbnail:{toDataURL:()=>''}};let calls=0;
   const native=await fixture({sources:async()=>{if(++calls===1)return[source];throw new Error('Native enumeration refused');}});
   await native.invoke('sources');await native.invoke('choose-screen',source.id);
-  await assert.rejects(native.invoke('sources'),/enumeration refused/);
+  const result = await native.invoke('sources');
+  assert.equal(result.ok, false); assert.equal(result.code, 'SCREEN_SOURCES_UNAVAILABLE');
   assert.equal(await native.permission([]),false);
   await assert.rejects(native.invoke('choose-screen',source.id),/available screen/);
 });
@@ -219,8 +250,8 @@ test('native presentation fullscreen validates booleans and reports actual enter
   native.window.emit('leave-full-screen');
   assert.deepEqual(native.fullscreenCalls, [true, false]);
   assert.deepEqual(native.sentEvents.map(({ name, value }) => ({ name, fullscreen: value.fullscreen })), [
-    { name: 'auralink:presentation-fullscreen', fullscreen: true },
-    { name: 'auralink:presentation-fullscreen', fullscreen: false },
+    { name: 'glance-port:presentation-fullscreen', fullscreen: true },
+    { name: 'glance-port:presentation-fullscreen', fullscreen: false },
   ]);
   native.markDestroyed(); native.window.emit('enter-full-screen');
   assert.equal(native.sentEvents.length, 2, 'A destroyed view receives no native fullscreen event');
@@ -257,7 +288,7 @@ test('a delayed Mac fullscreen entry cannot overrule an immediate request to exi
   assert.equal(native.window.isFullScreen(), false);
   assert.equal(native.pendingFullscreen(), null);
   assert.deepEqual(native.sentEvents.map(({ name, value }) => ({ name, fullscreen: value.fullscreen })), [
-    { name: 'auralink:presentation-fullscreen', fullscreen: false },
+    { name: 'glance-port:presentation-fullscreen', fullscreen: false },
   ]);
 });
 
@@ -278,8 +309,8 @@ test('a new Mac fullscreen entry request survives a delayed exit confirmation', 
   assert.equal(native.window.isFullScreen(), true);
   assert.equal(native.pendingFullscreen(), null);
   assert.deepEqual(native.sentEvents.map(({ name, value }) => ({ name, fullscreen: value.fullscreen })), [
-    { name: 'auralink:presentation-fullscreen', fullscreen: true },
-    { name: 'auralink:presentation-fullscreen', fullscreen: true },
+    { name: 'glance-port:presentation-fullscreen', fullscreen: true },
+    { name: 'glance-port:presentation-fullscreen', fullscreen: true },
   ]);
   // Once the latest requested state is confirmed, subsequent native changes
   // (for example the Mac window control) must still reach the renderer.

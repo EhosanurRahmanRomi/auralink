@@ -18,23 +18,23 @@ Glance-Port is an open-source screen-sharing and attended remote-control app for
 
 The room flow is **Open a room → copy its invitation → join from the other device**. Invitation holders enter automatically while invitations are open. Screen capture and remote control remain separate, deliberate actions.
 
-**0.6.0 adds stereo device audio, cursor zoom and phone pinch, smaller fullscreen controls, and Android session retention across Activity recreation.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/glance-port/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
+**0.6.1 fixes macOS screen-permission recovery and finishes the Glance-Port native identity and invitation branding.** Check the version and completed checks on [the published release page](https://github.com/EhosanurRahmanRomi/glance-port/releases/latest). All devices must use the matching build. [Validation](VALIDATION.md) distinguishes synthetic, packaged and physical-device evidence.
 
 ## Download and connect
 
-Download **Glance-Port 0.6.0** for your device below. Use the same version on every device.
+Download **Glance-Port 0.6.1** for your device below. Use the same version on every device.
 
 | Device | Download installer |
 |---|---|
-| Windows 11 / x64 | [Download for Windows (.exe)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/Glance-Port-Setup-0.6.0-Windows-x64.exe) |
-| MacBook Air M4 / Apple Silicon, macOS 13+ | [Download for Mac (.dmg)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/Glance-Port-0.6.0-Mac-arm64.dmg) |
-| Android 10+, including iQOO | [Download for Android (.apk)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/Glance-Port-0.6.0-Android.apk) |
+| Windows 11 / x64 | [Download for Windows (.exe)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/Glance-Port-Setup-0.6.1-Windows-x64.exe) |
+| MacBook Air M4 / Apple Silicon, macOS 13+ | [Download for Mac (.dmg)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/Glance-Port-0.6.1-Mac-arm64.dmg) |
+| Android 10+, including iQOO | [Download for Android (.apk)](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/Glance-Port-0.6.1-Android.apk) |
 
-[Installation guide](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/START-HERE.md) · [Source ZIP](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/Glance-Port-0.6.0-source.zip) · [Checksums](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/SHA256SUMS.txt) · [Verification report](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.0/RELEASE-VERIFICATION.json) · [All releases](https://github.com/EhosanurRahmanRomi/glance-port/releases)
+[Installation guide](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/START-HERE.md) · [Source ZIP](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/Glance-Port-0.6.1-source.zip) · [Checksums](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/SHA256SUMS.txt) · [Verification report](https://github.com/EhosanurRahmanRomi/glance-port/releases/download/v0.6.1/RELEASE-VERIFICATION.json) · [All releases](https://github.com/EhosanurRahmanRomi/glance-port/releases)
 
 Releases include checksums, source and a report describing the exact build and completed checks. Windows test installers are unsigned; Mac test builds are ad-hoc signed and unnotarized. Android uses the project's stable local development signing identity.
 
-Glance-Port was previously named Auralink. The internal app IDs, `auralink://` invitation links and existing Auralink profile directories remain compatible. The local Android signing key is retained for updates; do not delete its private key. A separately generated CI test APK may have a different signing identity.
+macOS now uses a dedicated Glance-Port application identity and fresh local profile. Previous cookies and preferences are not copied; grant Screen Recording, Microphone and Accessibility access to Glance-Port when you use those features. New app links use `glance-port://`; earlier `auralink://` invitations are still accepted. Windows and Android keep their installed package identities and the private Android signing key for updates. A separately generated CI test APK may have a different signing identity.
 
 1. Launch Glance-Port and click **Open a room**. Its built-in coordinator supplies the address; guests need no domain, account or pairing form.
 2. Share **Copy link** or **Copy code** privately. Open the link in Glance-Port or paste it into **Join room**. Native links depend on the installed package's protocol registration.
@@ -60,7 +60,7 @@ For a same-Wi-Fi test without hosted coordination, use **Other connection option
 |---|---|
 | ![Glance-Port desktop workspace](docs/assets/glance-port-desktop.png) | ![Glance-Port Android layout](docs/assets/glance-port-mobile.png) |
 
-Glance-Port 0.6.0 uses warm plum, rose, coral and gold gradients with the supplied logo. These gallery captures show the actual renderer at desktop and phone viewport sizes in a browser; the release report distinguishes native-app and emulator checks.
+Glance-Port 0.6.1 uses warm plum, rose, coral and gold gradients with the supplied logo. These gallery captures show the actual renderer at desktop and phone viewport sizes in a browser; the release report distinguishes native-app and emulator checks.
 
 ## Features and limits
 

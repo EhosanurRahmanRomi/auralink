@@ -23,7 +23,7 @@ async function main(){
     page=await application.firstWindow();
     page.on('pageerror',error=>errors.push(error.message));
     await page.waitForSelector('#host-button');
-    await page.waitForFunction(()=>window.auralink && document.querySelector('#profile-platform').textContent!=='Local workspace');
+    await page.waitForFunction(()=>window.glancePort && document.querySelector('#profile-platform').textContent!=='Local workspace');
     await page.evaluate(()=>{window.__desktopSmokeToasts=[];new MutationObserver(()=>{const message=document.querySelector('#toast-region').textContent;if(message)window.__desktopSmokeToasts.push(message);}).observe(document.querySelector('#toast-region'),{childList:true,subtree:true});});
     await page.screenshot({path:path.join(out,'desktop-lobby.png'),fullPage:true});
     await page.locator('[data-view="settings"]').click();

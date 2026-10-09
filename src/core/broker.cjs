@@ -57,7 +57,7 @@ async function createBroker(options = {}) {
   const hostToken = options.hostToken || randomSecret();
   const roomKey = randomSecret();
   const roomId = crypto.randomUUID();
-  const roomName = cleanName(options.name) || 'AuraLink room';
+  const roomName = cleanName(options.name) || 'Glance-Port room';
   const admissionTimeoutMs = options.admissionTimeoutMs ?? 60000;
   if (!Number.isInteger(admissionTimeoutMs) || admissionTimeoutMs < 100 || admissionTimeoutMs > 60000) {
     throw new TypeError('Admission timeout must be between 100 and 60000 milliseconds.');

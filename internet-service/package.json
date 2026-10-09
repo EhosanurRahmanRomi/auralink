@@ -1,6 +1,6 @@
 {
-  "name": "auralink-internet-service",
-  "version": "0.6.0",
+  "name": "glance-port-internet-service",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "description": "Invitation rooms, private paired-device signaling and bounded encrypted media forwarding on Cloudflare Workers Free",

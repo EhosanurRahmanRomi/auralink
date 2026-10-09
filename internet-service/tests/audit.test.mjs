@@ -64,6 +64,6 @@ test('actual nonce-protected landing script uses the canonical parser and never 
     const elements = new Map();
     const document = { getElementById(id) { if (!elements.has(id)) elements.set(id, { classList: { remove() {} }, removeAttribute() {}, addEventListener() {} }); return elements.get(id); } };
     vm.runInNewContext(script, { document, location: { hash: fragment }, URLSearchParams });
-    assert.equal(elements.get('open').href, valid ? `auralink://join#code=A1.${room}.${key}` : undefined);
+    assert.equal(elements.get('open').href, valid ? `glance-port://join#code=A1.${room}.${key}` : undefined);
   }
 });

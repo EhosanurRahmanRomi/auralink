@@ -77,7 +77,7 @@ async function main() {
       Image.prototype.decode = () => Promise.reject(new Error('DOM image decode is unavailable in this background regression'));
       const fixture = window.qaPhone = { started: 0, stops: 0, sequence: 0, acked: [], inputs: [], routes: [], grant: null, timer: null, frame: null, stop: null, emergency: null };
       const canvas = document.createElement('canvas'); canvas.width = 720; canvas.height = 1280; const draw = canvas.getContext('2d');
-      window.auralink = Object.freeze({ platform: 'android',
+      window.glancePort = Object.freeze({ platform: 'android',
         getInfo: async () => ({ platform: 'Android fixture', capabilities: { screenShare: true, remoteInputHost: true }, accessibilityEnabled: true }),
         setAudioRoute: async route => { fixture.routes.push(route); return { ok: true }; },
         startScreenShare: async options => {

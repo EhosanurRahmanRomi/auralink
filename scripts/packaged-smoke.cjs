@@ -21,7 +21,7 @@ async function run() {
     const page = await application.firstWindow();
     page.on('pageerror', (error) => evidence.errors.push(error.message));
     await page.locator('#host-button').waitFor();
-    await page.waitForFunction(() => !!window.auralink && document.querySelector('#profile-platform').textContent !== 'Local workspace');
+    await page.waitForFunction(() => !!window.glancePort && document.querySelector('#profile-platform').textContent !== 'Local workspace');
     evidence.app = await application.evaluate(({ app }) => ({ appPath: app.getAppPath(), isPackaged: app.isPackaged, version: app.getVersion() }));
     assert.equal(evidence.app.isPackaged, true);
     assert.match(evidence.app.appPath, /[\\/]app\.asar$/);
@@ -50,16 +50,16 @@ async function run() {
     evidence.checks.push('Packaged emergency-stop shortcut is registered');
     evidence.checks.push('All ten critical packaged source files exactly match current source SHA256');
 
-    evidence.info = await page.evaluate(() => window.auralink.getInfo());
+    evidence.info = await page.evaluate(() => window.glancePort.getInfo());
     assert.equal(evidence.info.nativeControl, true, 'The unpacked Windows native helper must be discoverable');
     assert.equal(evidence.info.testing, true, 'Automated tests must disable production control approval');
     evidence.checks.push('Packaged preload and trusted main-process IPC return device/native capabilities');
 
-    const room = await page.evaluate(() => window.auralink.hostRoom({ name: 'Packaged verification room', port: 0 }));
+    const room = await page.evaluate(() => window.glancePort.hostRoom({ name: 'Packaged verification room', port: 0 }));
     assert.match(room.url, /^https:\/\/127\.0\.0\.1:\d+$/);
     assert.match(room.fingerprint, /^[a-f0-9]{64}$/);
     assert.ok(room.port > 0);
-    const invitation = await page.evaluate((value) => window.auralink.trustInvite(value), room.invite);
+    const invitation = await page.evaluate((value) => window.glancePort.trustInvite(value), room.invite);
     assert.equal(invitation.fingerprint, room.fingerprint);
     evidence.room = { name: room.name, url: room.url, port: room.port, fingerprint: room.fingerprint,
       invitationCertificateVerified: true, advertisedAddresses: room.invites.length };
@@ -85,12 +85,12 @@ async function run() {
     assert.equal(evidence.helper.inputEventsSent, 0);
     evidence.checks.push('Native module inside app.asar launches its unpacked helper and completes readiness/release/shutdown without input injection');
 
-    const rejected = await page.evaluate(() => window.auralink.grantControl({ peerId: 'qa', sessionId: 'isolated-qa-session', screenId: 'screen:qa' }));
+    const rejected = await page.evaluate(() => window.glancePort.grantControl({ peerId: 'qa', sessionId: 'isolated-qa-session', screenId: 'screen:qa' }));
     assert.equal(rejected.ok, false);
     assert.match(rejected.reason, /disabled.*test/i);
     evidence.checks.push('Packaged smoke mode refuses remote-control approval');
 
-    assert.equal((await page.evaluate(() => window.auralink.stopRoom())).ok, true);
+    assert.equal((await page.evaluate(() => window.glancePort.stopRoom())).ok, true);
     const teardown = await application.evaluate(async (_, url) => {
       const https = process.mainModule.require('node:https');
       return new Promise((resolve) => {
@@ -116,20 +116,20 @@ async function run() {
       try {
         const page = await application.firstWindow();
         evidence.preferenceCleanup = await page.evaluate(() => {
-          const saved = localStorage.getItem('auralink.preferences');
+          const saved = localStorage.getItem('glance-port.preferences');
           if (!saved) return { changed: false, reason: 'No saved test preferences' };
           let preferences;
           try { preferences = JSON.parse(saved); } catch (_) { return { changed: false, reason: 'Existing value preserved' }; }
           if (!preferences || typeof preferences !== 'object' || Array.isArray(preferences) || preferences.name !== 'Desktop QA') return { changed: false, reason: 'No test display name to remove' };
           const otherBefore = JSON.stringify(Object.entries(preferences).filter(([key]) => key !== 'name'));
           preferences.name = 'My device';
-          localStorage.setItem('auralink.preferences', JSON.stringify(preferences));
-          const updated = JSON.parse(localStorage.getItem('auralink.preferences'));
+          localStorage.setItem('glance-port.preferences', JSON.stringify(preferences));
+          const updated = JSON.parse(localStorage.getItem('glance-port.preferences'));
           return { changed: true, name: updated.name,
             otherSettingsPreserved: otherBefore === JSON.stringify(Object.entries(updated).filter(([key]) => key !== 'name')) };
         });
         if (evidence.preferenceCleanup.changed) assert.equal(evidence.preferenceCleanup.otherSettingsPreserved, true);
-        await page.evaluate(() => window.auralink.stopRoom());
+        await page.evaluate(() => window.glancePort.stopRoom());
       } catch (error) { evidence.cleanupError = error.message; }
       await application.close().catch(() => {});
     }

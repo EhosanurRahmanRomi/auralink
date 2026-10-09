@@ -229,7 +229,8 @@ public final class AndroidSecurityHarness {
   private static void appInvitationPolicies() throws Exception {
     final String key = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
     final String code = "A1.550e8400-e29b-41d4-a716-446655440000." + key;
-    final String link = "auralink://join#code=" + code;
+    final String link = "glance-port://join#code=" + code;
+    check(AppInvitation.parse("auralink://join#code=" + code).equals(code), "Legacy public room invitation remains valid");
     check(AppInvitation.parse(link).equals(code), "An external app link supplies only its exact room capability");
     for (final String invalid : new String[] {
       "https://join#code=" + code, "auralink://other#code=" + code, "auralink://user@join#code=" + code,

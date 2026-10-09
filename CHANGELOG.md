@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1 — Mac screen recovery and completed product identity
+
+- Replaced raw screen-list errors with a Mac recovery dialog that opens Screen & System Audio Recording settings and offers an explicit retry. It also handles capture refusal after selecting a source.
+- Added a bounded screen-only fallback when the permitted window/thumbnail pipeline fails. Revalidation uses the exact selected source type and ID, with current permission, room and cancellation checks.
+- Gave the Mac app its own Glance-Port bundle identity and fresh profile. Prior cookies and preferences are not copied; permissions must be granted to the new identity. Windows and Android keep their installation IDs and Android update signature.
+- Completed the native bridge, storage-key and invitation branding. New invitations use `glance-port://`; earlier links remain accepted. Removed unused gallery images carrying the earlier product name.
+- Mac packaging checks now copy the signed application out of the DMG before launch and verify its identity, source and new invitation scheme. Simulated permission tests do not establish physical Mac screen capture.
+
 ## 0.6.0 — Device audio and focused screen viewing
 
 - Added independently switchable device audio during sharing, separate from the microphone. Desktop capture uses the selected display's loopback audio; Android uses the owner's active MediaProjection and captures only playback allowed by the source app.

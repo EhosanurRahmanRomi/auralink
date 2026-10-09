@@ -57,8 +57,8 @@ async function visitRooms(page) { await page.locator('.nav-item[data-view="rooms
 async function setupPreflightProof(desktop, mobile, origin) {
   const pc = await desktop.newPage(); const phone = await mobile.newPage();
   try {
-    await pc.addInitScript(() => { window.auralink.hostRoom = async () => { throw new Error('Nearby hosting is not exercised by this Internet fixture.'); }; });
-    await phone.addInitScript(() => { window.auralink.platform = 'android'; });
+    await pc.addInitScript(() => { window.glancePort.hostRoom = async () => { throw new Error('Nearby hosting is not exercised by this Internet fixture.'); }; });
+    await phone.addInitScript(() => { window.glancePort.platform = 'android'; });
     await pc.goto(origin); await phone.goto(origin);
     await pc.waitForFunction(() => document.getElementById('profile-platform').textContent !== 'Loading…');
     await pc.locator('.advanced-connections > summary').click(); await phone.locator('.advanced-connections > summary').click();
@@ -101,12 +101,12 @@ async function setupPreflightProof(desktop, mobile, origin) {
     assert.equal(await phone.evaluate(() => document.activeElement.id), 'internet-pairing-code');
     assert.equal(await phone.locator('#join-invite').inputValue(), invite);
     const custom = 'https://kept-private-group.example';
-    await phone.evaluate(custom => localStorage.setItem(`auralink.internet.identity:${custom}`, JSON.stringify({ deviceId: 'qa-preserved-device', deviceToken: 'qa-preserved-token-123456789' })), custom);
+    await phone.evaluate(custom => localStorage.setItem(`glance-port.internet.identity:${custom}`, JSON.stringify({ deviceId: 'qa-preserved-device', deviceToken: 'qa-preserved-token-123456789' })), custom);
     await phone.locator('#internet-service').fill(custom); await visitRooms(phone); await phone.locator('#join-button').click(); await phone.locator('#join-submit').click();
     assert.equal(await phone.locator('#internet-service').inputValue(), custom);
     assert.match(await phone.locator('#internet-setup-hint').innerText(), /current service and saved device credentials have been kept/);
-    assert.equal(await phone.evaluate(custom => JSON.parse(localStorage.getItem(`auralink.internet.identity:${custom}`)).deviceId, custom), 'qa-preserved-device');
-    await phone.evaluate(custom => localStorage.removeItem(`auralink.internet.identity:${custom}`), custom);
+    assert.equal(await phone.evaluate(custom => JSON.parse(localStorage.getItem(`glance-port.internet.identity:${custom}`)).deviceId, custom), 'qa-preserved-device');
+    await phone.evaluate(custom => localStorage.removeItem(`glance-port.internet.identity:${custom}`), custom);
     for (const page of [pc, phone]) {
       assert.deepEqual(await page.evaluate(() => ({ sockets: qaSocketConstructions, audioContexts: qaAudioContextConstructions, capture: qaCaptureCalls.length, trust: qaInternetTrustCalls })), { sockets: 0, audioContexts: 0, capture: 0, trust: 0 });
       assert.equal(await page.locator('#advanced-host-button').isDisabled(), false);
@@ -208,7 +208,7 @@ async function main() {
         navigator.mediaDevices.getDisplayMedia = async () => { await qaPause('display'); const canvas = document.createElement('canvas'); canvas.width = 960; canvas.height = 540; const context = canvas.getContext('2d'); let frame = 0;
           const timer = setInterval(() => { context.fillStyle = frame++ % 2 ? '#244360' : '#287f69'; context.fillRect(0, 0, 960, 540); context.fillStyle = 'white'; context.font = '40px sans-serif'; context.fillText(`Synthetic shared desktop ${frame}`, 60, 120); }, 70);
           const stream = canvas.captureStream(12); const track = stream.getVideoTracks()[0]; track.addEventListener('ended', () => clearInterval(timer)); track.applyConstraints = async () => { await qaPause('constraints'); }; qaStreams.push(stream); return stream; };
-        window.auralink = { platform: 'qa-browser-fixture', getInfo: async () => ({ platform: 'Browser test fixture' }), trustInternetService: async () => { qaInternetTrustCalls++; }, requestMedia: async () => { await qaPause('permission'); return { ok: true }; }, sources: async () => { await qaPause('sources'); return [{ id: 'screen:qa', name: 'Synthetic desktop' }]; }, chooseScreen: async () => { await qaPause('selection'); }, stopSharing: async () => {},
+        window.glancePort = { platform: 'qa-browser-fixture', getInfo: async () => ({ platform: 'Browser test fixture' }), trustInternetService: async () => { qaInternetTrustCalls++; }, requestMedia: async () => { await qaPause('permission'); return { ok: true }; }, sources: async () => { await qaPause('sources'); return [{ id: 'screen:qa', name: 'Synthetic desktop' }]; }, chooseScreen: async () => { await qaPause('selection'); }, stopSharing: async () => {},
           onScreenStopped: listener => { window.qaScreenStopped = listener; return () => {}; },
           grantControl: async request => { qaNative.grants.push(request); await qaPause('grant'); return { ok: true }; }, revokeControl: async () => { qaNative.revokes++; }, applyInput: async input => { qaNative.inputs.push(input); } };
       }, { signalDelay });
@@ -220,8 +220,8 @@ async function main() {
     await guest.locator('.nav-item[data-view="devices"]').click(); const hostCard = guest.locator('#online-device-list .device-card').filter({ has: guest.getByRole('heading', { name: hostName, exact: true }) });
     await hostCard.waitFor(); assert.match(await hostCard.innerText(), /Online/); assert.equal(await hostCard.getByRole('button', { name: 'Request connection' }).isDisabled(), true);
     if (!publicMode) { await host.screenshot({ path: path.join(output, 'internet-settings-desktop.png'), fullPage: true }); await guest.screenshot({ path: path.join(output, 'internet-devices-phone.png'), fullPage: true }); }
-    phase = 'paired offline device reconnects safely'; const pairedCredential = await host.evaluate(origin => localStorage.getItem(`auralink.internet.identity:${origin}`), serviceOrigin); await host.locator('#internet-go-offline').click(); await host.waitForFunction(() => document.getElementById('internet-status').textContent === 'Offline');
-    await visitRooms(host); await host.locator('#advanced-host-button').click(); assert.equal(await host.locator('#host-dialog').evaluate(dialog => dialog.open), true); assert.equal(await host.locator('#internet-status').textContent(), 'Offline'); assert.equal(await host.evaluate(origin => localStorage.getItem(`auralink.internet.identity:${origin}`), serviceOrigin), pairedCredential);
+    phase = 'paired offline device reconnects safely'; const pairedCredential = await host.evaluate(origin => localStorage.getItem(`glance-port.internet.identity:${origin}`), serviceOrigin); await host.locator('#internet-go-offline').click(); await host.waitForFunction(() => document.getElementById('internet-status').textContent === 'Offline');
+    await visitRooms(host); await host.locator('#advanced-host-button').click(); assert.equal(await host.locator('#host-dialog').evaluate(dialog => dialog.open), true); assert.equal(await host.locator('#internet-status').textContent(), 'Offline'); assert.equal(await host.evaluate(origin => localStorage.getItem(`glance-port.internet.identity:${origin}`), serviceOrigin), pairedCredential);
     phase = 'cancel an Internet room before its creation reply'; await host.locator('#host-mode').selectOption('internet'); await host.locator('#host-name').fill('Cancelled Internet room'); await host.evaluate(() => qaHold('room-created')); await host.locator('#create-room').click(); await host.waitForFunction(() => qaWaiting.includes('room-created')); proof.pairedOfflineRoomActionReconnectsWithoutPairingCode = true;
     await host.evaluate(() => qaHold('room-left')); await host.locator('#host-dialog [data-close]').click(); await host.waitForFunction(() => qaWaiting.includes('room-left')); assert.equal(await host.locator('#advanced-host-button').isDisabled(), true); assert.equal(await host.locator('#join-button').isDisabled(), true); await host.evaluate(() => qaRelease('room-left'));
     await host.waitForFunction(() => !document.getElementById('advanced-host-button').disabled); assert.equal(await host.locator('#internet-status').textContent(), 'Online'); proof.roomExitDisablesReplacementAdmissionUntilAcknowledged = true;
@@ -297,10 +297,10 @@ async function main() {
       const canvas = document.createElement('canvas'); canvas.width = 720; canvas.height = 1280; const drawing = canvas.getContext('2d'); drawing.fillStyle = '#168471'; drawing.fillRect(0, 0, 720, 1280);
       phone.jpeg = canvas.toDataURL('image/jpeg', .7);
       phone.send = captureId => phone.frame?.({ captureId, seq: ++phone.seq, data: phone.jpeg, width: 720, height: 1280 });
-      Object.assign(window.auralink, { platform: 'android',
+      Object.assign(window.glancePort, { platform: 'android',
         startScreenShare: async () => { const captureId = `qa-projection-${phone.starts.length + 1}`; phone.starts.push(captureId); phone.active = captureId; if (phone.starts.length === 1) await qaPause('phone-start'); return { id: 'android-screen', captureId, width: 720, height: 1280 }; },
         stopScreenShare: async request => { phone.stops.push(request || null); if (!request?.captureId || request.captureId === phone.active) { phone.active = ''; clearInterval(phone.timer); phone.timer = null; } if (request?.captureId) await qaPause(`phone-stop:${request.captureId}`); return { ok: true }; },
-        stopSharing: async request => { phone.aliasStops.push(request || null); return window.auralink.stopScreenShare(request); },
+        stopSharing: async request => { phone.aliasStops.push(request || null); return window.glancePort.stopScreenShare(request); },
         onScreenFrame: listener => { phone.frame = listener; return () => { if (phone.frame === listener) phone.frame = null; }; },
         ackScreenFrame: async packet => { phone.acks.push(packet); return { ok: true }; },
       });
@@ -333,7 +333,7 @@ async function main() {
       assert.equal(await guest.locator('#session').isVisible(), false); assert.equal(await host.locator('#session').isVisible(), false); proof.disconnectStopsMediaAndNoRoomResume = true;
     } else { proof.connectionLossBoundary = 'Connection-loss and no-room-resume behavior tested in the separate local workerd/browser proof; not injected into this public coordinator test.'; await guest.locator('#end-button').click(); }
     phase = 'forget'; await guest.locator('.nav-item[data-view="settings"]').click(); await guest.locator('#internet-forget').click(); await guest.waitForFunction(() => document.getElementById('internet-status').textContent === 'Offline');
-    assert.equal(await guest.evaluate(origin => localStorage.getItem(`auralink.internet.identity:${origin}`), serviceOrigin), null); proof.forgetRemovesLocalCredential = true;
+    assert.equal(await guest.evaluate(origin => localStorage.getItem(`glance-port.internet.identity:${origin}`), serviceOrigin), null); proof.forgetRemovesLocalCredential = true;
     await host.locator('.nav-item[data-view="devices"]').click(); await host.waitForFunction(name => ![...document.querySelectorAll('#online-device-list h3')].some(el => el.textContent === name), guestName); proof.forgetRevokesDirectoryRecord = true;
     assert.deepEqual(errors, []); proof.status = 'passed'; proof.boundary = publicMode ? 'Two Chromium contexts on the same PC; public Cloudflare coordinator over normal CA-validated WSS, synthetic media/native consent. Media uses a direct local UDP route. This is not a cross-country, different-network or physical-device test.' : 'Local real workerd signaling and real Chromium WebRTC, synthetic media/native consent; no internet deployment or physical devices.';
     if (publicMode) { await host.locator('.nav-item[data-view="settings"]').click(); await host.locator('#internet-forget').click(); await host.waitForFunction(() => document.getElementById('internet-status').textContent === 'Offline'); proof.publicTestIdentitiesForgotten = true; }
@@ -349,7 +349,7 @@ async function main() {
   finally {
     if (publicMode) for (const context of contexts) for (const page of context.pages()) {
       try {
-        const identity = await page.evaluate(origin => JSON.parse(localStorage.getItem(`auralink.internet.identity:${origin}`) || 'null'), runtime.url);
+        const identity = await page.evaluate(origin => JSON.parse(localStorage.getItem(`glance-port.internet.identity:${origin}`) || 'null'), runtime.url);
         if (identity) await forgetTestIdentity(runtime.url, identity);
       } catch { console.error('A public browser test identity could not be forgotten automatically.'); }
     }

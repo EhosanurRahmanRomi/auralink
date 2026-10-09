@@ -15,7 +15,7 @@ This Worker supplies signaling and bounded, client-encrypted media forwarding wh
 
 An invitation is a capability: anyone who possesses it may enter the room. Share it only with intended participants and disable it after they join when appropriate. It does not authorize remote input. There is no public room listing or user search.
 
-Invitation codes use `A1.<room UUID>.<43-character base64url key>`. Invitation links keep the room/key in the URL fragment, which is not sent to the HTTP server. The coordinator's root page parses the fragment locally and offers `auralink://join#code=…` plus a copy-code fallback. It does not join web calls, contact analytics, load external scripts or access a microphone. Custom private coordinators still use the app's Advanced setup rather than the default-service code shortcut.
+Invitation codes use `A1.<room UUID>.<43-character base64url key>`. Invitation links keep the room/key in the URL fragment, which is not sent to the HTTP server. The coordinator's root page parses the fragment locally and offers `glance-port://join#code=…` plus a copy-code fallback. It does not join web calls, contact analytics, load external scripts or access a microphone. Custom private coordinators still use the app's Advanced setup rather than the default-service code shortcut.
 
 ## Free deployment
 

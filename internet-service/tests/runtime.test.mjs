@@ -38,7 +38,7 @@ test('real Workers runtime: bounded encrypted media forwarding, encrypted keys a
   try {
     const landing = await runtime.mf.dispatchFetch(`${runtime.url}/`); assert.equal(landing.status, 200);
     assert.match(landing.headers.get('Content-Security-Policy'), /default-src 'none'/); assert.equal(landing.headers.get('Referrer-Policy'), 'no-referrer');
-    const html = await landing.text(); assert.match(html, /auralink:\/\/join#code=/); assert.match(html, /releases\/latest/); assert.equal(html.includes('https://cdn'), false);
+    const html = await landing.text(); assert.match(html, /glance-port:\/\/join#code=/); assert.match(html, /releases\/latest/); assert.equal(html.includes('https://cdn'), false);
     const connect = async name => {
       const response = await runtime.mf.dispatchFetch(`${runtime.url}/internet/ws`, { headers: { Upgrade: 'websocket', 'CF-Connecting-IP': '198.51.100.20' } });
       assert.equal(response.status, 101); const ws = client(response.webSocket); sockets.push(ws.socket);

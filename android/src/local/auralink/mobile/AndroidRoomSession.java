@@ -227,7 +227,7 @@ final class AndroidRoomSession extends ContextWrapper {
         settings.setMediaPlaybackRequiresUserGesture(true); settings.setSafeBrowsingEnabled(true);
         settings.setSupportMultipleWindows(false); settings.setJavaScriptCanOpenWindowsAutomatically(false);
         webView.setBackgroundColor(0xff0b111a);
-        webView.addJavascriptInterface(new NativeBridge(), "AuralinkNative");
+        webView.addJavascriptInterface(new NativeBridge(), "GlancePortNative");
         webView.setWebViewClient(new WebViewClient() {
             @Override public boolean onRenderProcessGone(WebView failed, android.webkit.RenderProcessGoneDetail detail) {
                 // A terminated renderer cannot be reused. Close native consent
@@ -333,7 +333,7 @@ final class AndroidRoomSession extends ContextWrapper {
     }
     private void deliver(JSONObject value) {
         if (!transportPage()) return;
-        webView.evaluateJavascript("window.__auralinkNativeReceive && window.__auralinkNativeReceive(" + JSONObject.quote(value.toString()) + ")", null);
+        webView.evaluateJavascript("window.__glancePortNativeReceive && window.__glancePortNativeReceive(" + JSONObject.quote(value.toString()) + ")", null);
     }
     private void reply(String id, Object result) { deliver(json("requestId", id, "ok", true, "result", result)); }
     private void reject(String id, String error) { deliver(json("requestId", id, "ok", false, "error", error)); }
@@ -999,7 +999,7 @@ final class AndroidRoomSession extends ContextWrapper {
         exitFullscreen();
         clearProjectionRequest(); revokeControl("Android app closed."); if (callAudio != null) callAudio.stop();
         main.removeCallbacksAndMessages(null);
-        if (webView != null) { webView.removeJavascriptInterface("AuralinkNative"); webView.destroy(); webView = null; }
+        if (webView != null) { webView.removeJavascriptInterface("GlancePortNative"); webView.destroy(); webView = null; }
         if (recoveryDialog != null) { recoveryDialog.dismiss(); recoveryDialog = null; }
         if (current == this) current = null;
     }

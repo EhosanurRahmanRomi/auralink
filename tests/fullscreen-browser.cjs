@@ -401,8 +401,8 @@ async function run(browser, mode) {
     if (app) await app.evaluate(({ ipcMain }) => {
       // Explicit picker double only in this isolated test app. Do not enumerate
       // physical screens or obtain system capture when testing these UI controls.
-      ipcMain.removeHandler('auralink:sources'); ipcMain.handle('auralink:sources', () => [{ id: 'synthetic-quality-source', name: 'Synthetic quality verification source' }]);
-      ipcMain.removeHandler('auralink:choose-screen'); ipcMain.handle('auralink:choose-screen', () => true);
+      ipcMain.removeHandler('glance-port:sources'); ipcMain.handle('glance-port:sources', () => [{ id: 'synthetic-quality-source', name: 'Synthetic quality verification source' }]);
+      ipcMain.removeHandler('glance-port:choose-screen'); ipcMain.handle('glance-port:choose-screen', () => true);
     });
     await guest.evaluate(() => {
       navigator.mediaDevices.getDisplayMedia = async () => {

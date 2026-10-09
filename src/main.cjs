@@ -9,6 +9,7 @@ const {createBroker} = require('./core/broker.cjs');
 const {ControlGate, createAdapter} = require('./native/control.cjs');
 const {probeInternetService, NativeInternetClient} = require('./core/internet-client.cjs');
 const {parseAppInvitation} = require('./core/app-invitation.cjs');
+const {listScreenSources, resolveScreenSource} = require('./core/screen-sources.cjs');
 
 app.setName('Glance-Port');
 let win, broker, adapter, gate, selectedSource, currentSource;
@@ -17,14 +18,17 @@ let grantGeneration=0;
 let roomOperation=0, sourceOperation=0;
 let internetService = null, internetClient = null, roomContext = 'nearby';
 let microphonePermissionRequest = null;
+let screenCapture = null;
 const pins = new Map();
 const sources = new Map();
 const localPage = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
 const testing = process.argv.includes('--smoke-test');
-// Keep existing room credentials and preferences when upgrading the renamed
-// product. Explicit QA profiles remain isolated from the installed app.
+// macOS receives the new product's own TCC and storage identity. Windows keeps
+// its installer upgrade identity. Explicit QA profiles remain isolated.
+const profileName = process.platform === 'darwin' ? 'Glance-Port' : 'Auralink';
+const applicationId = process.platform === 'darwin' ? 'local.glanceport.desktop' : 'local.auralink.desktop';
 if (app.isPackaged && !testing && !app.commandLine.hasSwitch('user-data-dir')) {
-  const profile = path.join(app.getPath('appData'), 'Auralink');
+  const profile = path.join(app.getPath('appData'), profileName);
   require('node:fs').mkdirSync(profile, {recursive:true});
   app.setPath('userData', profile);
 }
@@ -47,7 +51,7 @@ function deliverInvitation(value) {
   pendingInvitation = code;
   if (win && !win.isDestroyed()) {
     if (win.isMinimized()) win.restore(); win.show(); win.focus();
-    if (!win.webContents.isLoadingMainFrame()) win.webContents.send('auralink:invitation', code);
+    if (!win.webContents.isLoadingMainFrame()) win.webContents.send('glance-port:invitation', code);
   }
 }
 // Only installed apps claim the protocol. QA/source launches retain independent
@@ -105,12 +109,12 @@ const settingsLinks = {
 function assertSender(event) {
   if (!win || event.sender !== win.webContents || !event.senderFrame || event.senderFrame !== win.webContents.mainFrame || event.senderFrame.url.split('#')[0] !== localPage) throw new Error('Privileged action blocked for untrusted content.');
 }
-function handle(name, fn) { ipcMain.handle(`auralink:${name}`, async (event, value) => {assertSender(event); return fn(value);}); }
+function handle(name, fn) { ipcMain.handle(`glance-port:${name}`, async (event, value) => {assertSender(event); return fn(value);}); }
 function localAddresses() {
   return Object.entries(os.networkInterfaces()).flatMap(([name, list]) => list.filter(x => x.family === 'IPv4' && !x.internal && !x.address.startsWith('169.254.')).map(x=>({name,address:x.address}))).sort((a,b)=>Number(/virtual|vmware|vbox/i.test(a.name))-Number(/virtual|vmware|vbox/i.test(b.name)));
 }
 async function revoke() { grantGeneration++; if (gate) await gate.revoke(); }
-function resetRoomSources() { roomOperation++; sourceOperation++; sources.clear(); selectedSource=null; currentSource=null; }
+function resetRoomSources() { roomOperation++; sourceOperation++; sources.clear(); selectedSource=null; currentSource=null; screenCapture=null; }
 function assertRoomOperation(operation) { if(operation !== roomOperation) throw new Error('Room preparation was canceled.'); }
 function pinOrigin(origin, fp) { pins.set(new URL(origin).hostname, fp); }
 function certificateDecision(request, callback) {
@@ -118,7 +122,7 @@ function certificateDecision(request, callback) {
 }
 function emergencyStop(reason) {
   revoke().catch(()=>{});
-  if (win && !win.isDestroyed()) win.webContents.send('auralink:emergency-stop', typeof reason === 'string' ? reason : undefined);
+  if (win && !win.isDestroyed()) win.webContents.send('glance-port:emergency-stop', typeof reason === 'string' ? reason : undefined);
 }
 function displayLayoutChanged() {
   sourceOperation++; sources.clear(); selectedSource = null; currentSource = null;
@@ -149,7 +153,10 @@ function acceptedForControl(peerId) {
 
 app.whenReady().then(async () => {
   if (!ownsInstance) return;
-  if (app.isPackaged && !testing && process.platform === 'win32') app.setAsDefaultProtocolClient('auralink');
+  if (app.isPackaged && !testing && process.platform === 'win32') {
+    app.setAsDefaultProtocolClient('glance-port');
+    app.setAsDefaultProtocolClient('auralink'); // Previously shared invitations remain usable.
+  }
   adapter = createAdapter({onError:emergencyStop});
   gate = new ControlGate(adapter,{onFailure:emergencyStop});
   screen.on('display-removed', displayLayoutChanged);
@@ -190,17 +197,26 @@ app.whenReady().then(async () => {
     const captureGeneration = grantGeneration;
     const captureRoom = roomOperation;
     const captureContext = roomContext;
+    const captureRequest = sourceOperation;
+    const isCurrent = () => Boolean(win && !win.isDestroyed() && request.frame === win.webContents.mainFrame &&
+      captureGeneration === grantGeneration && captureRoom === roomOperation && captureRequest === sourceOperation &&
+      captureContext === roomContext && (captureContext !== 'internet' || internetClient?.membership.roomId));
     try {
-      const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:0,height:0}});
-      const source = available.find(s=>s.id===chosen.id);
-      if (!source || captureGeneration !== grantGeneration || captureRoom !== roomOperation || captureContext !== roomContext ||
-          (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') ||
-          (captureContext === 'internet' && !internetClient?.membership.roomId)) return callback({});
+      const result = await resolveScreenSource({id:chosen.id, platform:process.platform,
+        getSources:options=>desktopCapturer.getSources(options), getStatus:permissionStatus, isCurrent});
+      if (!isCurrent()) return callback({});
+      screenCapture = result.ok ? null : result;
+      if (!result.ok) return callback({});
+      if (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') {
+        screenCapture={ok:false,code:'SCREEN_PERMISSION_REQUIRED',status:permissionStatus('screen'),reason:'Enable Glance-Port Screen & System Audio Recording in Mac privacy settings, then quit and reopen the app.'};
+        return callback({});
+      }
+      const source = result.source;
       if (chosen.purpose === 'device-audio') {
         if (!request.audioRequested || !currentSource || currentSource.id !== chosen.id || !['win32','darwin'].includes(process.platform)) return callback({});
         callback({video:source, audio:'loopback'});
       } else { currentSource = source; callback({video:source}); }
-    } catch {callback({});}
+    } catch { if (isCurrent()) screenCapture={ok:false,code:'SCREEN_SOURCES_UNAVAILABLE',status:permissionStatus('screen'),reason:'The system could not prepare the selected screen. Check screen-recording access, then select the display again.'}; callback({}); }
   });
 
   handle('host', async args => {
@@ -258,7 +274,7 @@ app.whenReady().then(async () => {
           roomContext = 'internet';
         }
       }
-      if (win && !win.isDestroyed()) win.webContents.send('auralink:internet-event', message);
+      if (win && !win.isDestroyed()) win.webContents.send('glance-port:internet-event', message);
     }, internetAuthorizationLost);
     return { ok: true };
   });
@@ -275,14 +291,21 @@ app.whenReady().then(async () => {
     const operation=roomOperation, request=++sourceOperation;
     // A failed refresh must not leave an older chooser authorization usable.
     sources.clear(); selectedSource=null;
-    const available = await desktopCapturer.getSources({types:['screen','window'],thumbnailSize:{width:320,height:180},fetchWindowIcons:false});
-    if(operation !== roomOperation || request !== sourceOperation) throw new Error('Screen selection was canceled.');
+    const result = await listScreenSources({platform:process.platform,
+      getSources:options=>desktopCapturer.getSources(options), getStatus:permissionStatus,
+      isCurrent:()=>Boolean(win && !win.isDestroyed() && operation === roomOperation && request === sourceOperation)});
+    if(operation !== roomOperation || request !== sourceOperation) return {ok:false,code:'SCREEN_SELECTION_CANCELED',reason:'Screen selection was canceled.'};
+    screenCapture = result.ok ? null : result;
+    if (!result.ok) return result;
     if (process.platform === 'darwin' && permissionStatus('screen') !== 'granted') {
-      throw new Error('Allow Glance-Port Screen & System Audio Recording in System Settings → Privacy & Security, then restart Glance-Port before sharing.');
+      screenCapture={ok:false,code:'SCREEN_PERMISSION_REQUIRED',status:permissionStatus('screen'),reason:'Enable Glance-Port Screen & System Audio Recording in Mac privacy settings, then quit and reopen the app.'};
+      return screenCapture;
     }
-    sources.clear();
-    for(const source of available) sources.set(source.id,source);
-    return available.map(s=>({id:s.id,name:s.name,displayId:s.display_id,thumbnail:s.thumbnail.toDataURL(),canControl:s.id.startsWith('screen:')}));
+    for(const source of result.sources) sources.set(source.id,source);
+    return {...result,sources:result.sources.map(s=>{
+      let thumbnail=''; try { if (!s.thumbnail?.isEmpty?.()) thumbnail=s.thumbnail?.toDataURL?.() || ''; } catch {}
+      return {id:s.id,name:s.name,displayId:s.display_id,thumbnail,canControl:s.id.startsWith('screen:')};
+    })};
   });
   handle('choose-screen', id => {
     if(typeof id!=='string'||!sources.has(id)) throw new Error('Select an available screen.');
@@ -332,7 +355,7 @@ app.whenReady().then(async () => {
     if(!url) throw new Error('This permission settings page is unavailable on this platform.');
     await shell.openExternal(url);return {ok:true};
   });
-  handle('info',()=>({version:app.getVersion(),platform:process.platform,hostname:os.hostname(),addresses:localAddresses(),nativeControl:Boolean(adapter.available),nativeSupports:adapter.supports,permissions:permissionInfo(),emergencyShortcut:process.platform==='darwin'?'Command+Option+Shift+Q':'Ctrl+Alt+Shift+Q',testing}));
+  handle('info',()=>({version:app.getVersion(),platform:process.platform,profileName,applicationId,screenCapture,hostname:os.hostname(),addresses:localAddresses(),nativeControl:Boolean(adapter.available),nativeSupports:adapter.supports,permissions:permissionInfo(),emergencyShortcut:process.platform==='darwin'?'Command+Option+Shift+Q':'Ctrl+Alt+Shift+Q',testing}));
   handle('session-active',setSessionActive);
   handle('presentation-fullscreen',active=>{
     if(typeof active !== 'boolean') throw new Error('Invalid fullscreen state.');
@@ -351,7 +374,7 @@ app.whenReady().then(async () => {
     // that would collapse a newly opened presentation.
     if(requestedPresentationFullscreen !== null && requestedPresentationFullscreen !== fullscreen) { win.setFullScreen(requestedPresentationFullscreen); return; }
     requestedPresentationFullscreen=null;
-    win.webContents.send('auralink:presentation-fullscreen',{fullscreen});
+    win.webContents.send('glance-port:presentation-fullscreen',{fullscreen});
   });
   win.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   win.webContents.on('will-navigate',event=>event.preventDefault());

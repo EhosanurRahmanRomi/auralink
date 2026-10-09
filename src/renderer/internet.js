@@ -14,12 +14,12 @@ export function roomInvitation(value) {
   const supplied = String(value);
   if (supplied.length > 2048 || /[\x00-\x1f\x7f]/.test(supplied)) throw new Error('Paste the complete room code or link without extra lines.');
   const raw = supplied.trim();
-  if (/^auralink:/i.test(raw)) {
+  if (/^(?:glance-port|auralink):/i.test(raw)) {
     const url = new URL(raw);
-    if (!/^auralink:\/\/join#code=A1\./.test(raw) || url.protocol !== 'auralink:' || url.hostname !== 'join' || url.port || url.pathname || url.username || url.password || url.search) throw new Error('Use the original Auralink invitation from the host.');
+    if (!/^(?:glance-port|auralink):\/\/join#code=A1\./.test(raw) || !['glance-port:', 'auralink:'].includes(url.protocol) || url.hostname !== 'join' || url.port || url.pathname || url.username || url.password || url.search) throw new Error('Use the original Glance-Port invitation from the host.');
     const fields = new URLSearchParams(url.hash.slice(1));
-    if ([...fields.keys()].length !== 1 || fields.getAll('code').length !== 1) throw new Error('This Auralink invitation has unexpected fields.');
-    if (raw !== `auralink://join#code=${fields.get('code')}`) throw new Error('Use the original Auralink invitation from the host.');
+    if ([...fields.keys()].length !== 1 || fields.getAll('code').length !== 1) throw new Error('This Glance-Port invitation has unexpected fields.');
+    if (raw !== `${url.protocol}//join#code=${fields.get('code')}`) throw new Error('Use the original Glance-Port invitation from the host.');
     return roomInvitation(fields.get('code'));
   }
   if (raw.startsWith('A1.')) {
@@ -77,7 +77,7 @@ export class InternetDirectory extends EventTarget {
     this.generation = 0; this.reconnectTimer = null; this.authTimer = null; this.heartbeatTimer = null; this.pongTimer = null; this.authWaiter = null; this.roomWaiter = null; this.leaveWaiter = null; this.forgetWaiter = null;
   }
   emit(type, detail = {}) { this.dispatchEvent(new CustomEvent(type, { detail })); }
-  storageKey(origin = this.origin) { return `auralink.internet.identity:${origin}`; }
+  storageKey(origin = this.origin) { return `glance-port.internet.identity:${origin}`; }
   identity(origin = this.origin) {
     try {
       const identity = JSON.parse(this.storage?.getItem(this.storageKey(origin)) || 'null');

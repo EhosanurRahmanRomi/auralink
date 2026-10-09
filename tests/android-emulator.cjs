@@ -656,7 +656,7 @@ async function checkPublicRoomStart(fixture) {
   checkpoint('openPublicRoomHomeReturn',{passed:true,existingRoomCodeRetained:true,sameProcess:true,roomServiceRemainsActive:true,microphoneRemainsOff:true,noCameraControl:true});
   phase='native invitation intent while public room remains open';console.log(phase);
   const pendingCode='A1.00000000-0000-4000-8000-000000000004.'+'A'.repeat(43);
-  await adb(['shell','am','start','-a','android.intent.action.VIEW','-d','auralink://join#code='+pendingCode,'-n','local.auralink.mobile/.MainActivity']);
+  await adb(['shell','am','start','-a','android.intent.action.VIEW','-d','glance-port://join#code='+pendingCode,'-n','local.auralink.mobile/.MainActivity']);
   phase='observe pending native invitation banner';console.log(phase);
   await findNativeRoomAction(node=>node['resource-id']==='dismiss-incoming-invite');
   await findNode(node=>/A new invitation is ready\. Leave your current room/.test(node.text || ''));

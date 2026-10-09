@@ -207,7 +207,7 @@ async function main() {
     await desktop.waitForFunction(() => document.getElementById('refresh-devices').getAttribute('aria-busy') === 'false');
     assert.equal(await desktop.locator('#microphone-device').inputValue(), microphoneDevice, 'Late enumeration must preserve the pending microphone choice');
     await desktop.locator('#save-settings').click();
-    assert.equal(await desktop.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).microphone), microphoneDevice);
+    assert.equal(await desktop.evaluate(() => JSON.parse(localStorage.getItem('glance-port.preferences')).microphone), microphoneDevice);
     await desktop.locator('[data-view="rooms"]').click();
     assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Mobile room overflows horizontally');
     await mobile.waitForFunction(() => document.getElementById('toast-region').childElementCount === 0, undefined, { timeout: 10000 });

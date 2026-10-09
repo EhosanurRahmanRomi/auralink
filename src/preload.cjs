@@ -1,21 +1,21 @@
 const {contextBridge, ipcRenderer} = require('electron');
-const invoke = (name, args) => ipcRenderer.invoke(`auralink:${name}`, args);
-contextBridge.exposeInMainWorld('auralink', {
+const invoke = (name, args) => ipcRenderer.invoke(`glance-port:${name}`, args);
+contextBridge.exposeInMainWorld('glancePort', {
   platform: process.platform,
   setSessionActive: active => invoke('session-active', active),
   setPresentationFullscreen: active => invoke('presentation-fullscreen', active),
   onPresentationFullscreenChanged: listener => {
     if (typeof listener !== 'function') return;
     const handler = (_event, state) => listener(state);
-    ipcRenderer.on('auralink:presentation-fullscreen', handler);
-    return () => ipcRenderer.removeListener('auralink:presentation-fullscreen', handler);
+    ipcRenderer.on('glance-port:presentation-fullscreen', handler);
+    return () => ipcRenderer.removeListener('glance-port:presentation-fullscreen', handler);
   },
   getPendingInvitation: () => invoke('pending-invitation'),
   onInvitation: listener => {
     if (typeof listener !== 'function') return;
     const handler = (_event, code) => listener(code);
-    ipcRenderer.on('auralink:invitation', handler);
-    return () => ipcRenderer.removeListener('auralink:invitation', handler);
+    ipcRenderer.on('glance-port:invitation', handler);
+    return () => ipcRenderer.removeListener('glance-port:invitation', handler);
   },
   hostRoom: args => invoke('host', args),
   stopRoom: () => invoke('stop'),
@@ -27,8 +27,8 @@ contextBridge.exposeInMainWorld('auralink', {
   onInternetEvent: listener => {
     if (typeof listener !== 'function') return;
     const handler = (_event, message) => listener(message);
-    ipcRenderer.on('auralink:internet-event', handler);
-    return () => ipcRenderer.removeListener('auralink:internet-event', handler);
+    ipcRenderer.on('glance-port:internet-event', handler);
+    return () => ipcRenderer.removeListener('glance-port:internet-event', handler);
   },
   sources: () => invoke('sources'),
   chooseScreen: id => invoke('choose-screen', id),
@@ -45,7 +45,7 @@ contextBridge.exposeInMainWorld('auralink', {
   onEmergencyStop: listener => {
     if (typeof listener !== 'function') return;
     const handler = (_event, reason) => listener(reason);
-    ipcRenderer.on('auralink:emergency-stop', handler);
-    return () => ipcRenderer.removeListener('auralink:emergency-stop', handler);
+    ipcRenderer.on('glance-port:emergency-stop', handler);
+    return () => ipcRenderer.removeListener('glance-port:emergency-stop', handler);
   }
 });

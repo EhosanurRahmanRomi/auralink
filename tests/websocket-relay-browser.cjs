@@ -233,7 +233,7 @@ async function main() {
     for (const [width, height, phone] of [[1380, 940, false], [1380, 940, false], [1380, 940, false]]) {
       const context = await browser.newContext({ viewport: { width, height }, isMobile: phone, hasTouch: phone, permissions: ['microphone'] }); contexts.push(context);
       await context.addInitScript(({ origin, phone, generatedMicrophone }) => {
-        if (!localStorage.getItem('auralink.preferences')) localStorage.setItem('auralink.preferences', JSON.stringify({ name: 'My device', quality: '1440' }));
+        if (!localStorage.getItem('glance-port.preferences')) localStorage.setItem('glance-port.preferences', JSON.stringify({ name: 'My device', quality: '1440' }));
         window.qaSentTypes = []; window.qaCipherCount = 0; window.qaCipherViolation = false; window.qaCaptureCalls = []; window.qaStreams = []; window.qaPCs = []; window.qaTrustCalls = []; window.qaGrants = []; window.qaCopies = []; window.qaRoutes = []; window.qaInputs = [];
         const NativeSocket = window.WebSocket;
         window.WebSocket = new Proxy(NativeSocket, { construct(target, args) {
@@ -370,7 +370,7 @@ async function main() {
           const stop = track.stop.bind(track); track.stop = () => { clearInterval(timer); void writer.abort().catch(() => {}); stop(); };
           const stream = new MediaStream([track]); qaStreams.push(stream); return stream;
         };
-        window.auralink = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); }, requestMedia: async () => ({ ok: true }), copyText: async value => { qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async value => { qaInputs.push(value); return { ok: true }; }, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {} };
+        window.glancePort = { platform: 'qa-desktop', getInfo: async () => ({ platform: phone ? 'Responsive desktop fixture' : 'Desktop fixture' }), trustInternetService: async address => { qaTrustCalls.push(address); }, requestMedia: async () => ({ ok: true }), copyText: async value => { qaCopies.push(value); }, sources: async () => [{ id: 'screen:qa', name: 'Synthetic full desktop' }], chooseScreen: async () => {}, grantControl: async value => { qaGrants.push(value); return { ok: true }; }, revokeControl: async () => {}, applyInput: async value => { qaInputs.push(value); return { ok: true }; }, setAudioRoute: async route => { qaRoutes.push(route); }, stopSharing: async () => {} };
       }, { origin: proxy.origin, phone, generatedMicrophone });
     }
     const host = await contexts[0].newPage(); const guest = await contexts[1].newPage(); const outsider = await contexts[2].newPage();
@@ -383,7 +383,7 @@ async function main() {
     const firstCode = await host.locator('#room-code').inputValue(); assert.match(firstCode, /^A1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i);
     assert.deepEqual(await host.evaluate(() => qaSentTypes.slice(0, 3)), ['bootstrap', 'create-room', 'join']);
     assert.deepEqual(await host.evaluate(() => qaCaptureCalls), []);
-    assert.equal(await host.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('auralink.internet.identity:')).length), 0);
+    assert.equal(await host.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('glance-port.internet.identity:')).length), 0);
     proof.oneClickRoomWithoutPairingOrCapture = true;
     phase = 'automatic invitation admission'; await join(guest, firstCode);
     assert.equal(await host.locator('#pending-banner').isVisible(), false); assert.deepEqual(await guest.evaluate(() => qaCaptureCalls), []);
@@ -466,7 +466,7 @@ async function main() {
     proof.shiftedKeyBurstRetainsConsentAndLiveMedia = true;
     phase = 'teardown'; await guest.locator('#end-button').click(); await guest.waitForFunction(() => document.getElementById('host-button').disabled === false); await host.locator('#end-button').click(); await host.waitForFunction(() => document.getElementById('host-button').disabled === false);
     for (const page of [host, guest, outsider]) {
-      assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('auralink.internet.identity:')).length), 0);
+      assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('glance-port.internet.identity:')).length), 0);
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     }
     assert.deepEqual(errors, []); proof.status = 'passed'; proof.coordinator = live ? 'Deployed public Cloudflare Worker via PKI-verified WSS' : 'Local workerd via TLS fixture';

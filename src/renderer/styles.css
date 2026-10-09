@@ -497,3 +497,8 @@ body.presentation-mode #toast-region { bottom: calc(var(--presentation-toolbar-h
   .presentation-quality > span { padding-left: 7px; }
   .presentation-quality select { width: 61px; min-height: 42px; padding: 4px 2px; }
 }
+
+.screen-access-guide { padding: 8px 18px; border: 1px solid rgba(255, 195, 223, .18); border-radius: 16px; background: rgba(255, 182, 211, .055); }
+.screen-access-guide p { font-size: .9rem; line-height: 1.6; }
+#screen-access-dialog .modal-actions { flex-wrap: wrap; }
+#screen-access-status { min-height: 44px; font-size: .85rem; }

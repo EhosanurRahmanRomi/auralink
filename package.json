@@ -1,6 +1,6 @@
 {
   "name": "glance-port",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "One-click screen sharing and attended remote control",
   "private": true,
   "main": "src/main.cjs",
@@ -34,6 +34,7 @@
       {
         "name": "Glance-Port room invitation",
         "schemes": [
+          "glance-port",
           "auralink"
         ]
       }
@@ -99,7 +100,8 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "notarize": false,
-      "minimumSystemVersion": "13.0"
+      "minimumSystemVersion": "13.0",
+      "appId": "local.glanceport.desktop"
     }
   }
 }

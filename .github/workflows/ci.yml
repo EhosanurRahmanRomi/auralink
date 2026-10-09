@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: auralink-ci-${{ github.ref }}
+  group: glance-port-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -43,6 +43,8 @@ jobs:
         run: npm run check
       - name: Protocol, permission and Android bridge unit tests
         run: npm test
+      - name: Mac screen permission recovery with the actual renderer and native bridge fixture
+        run: node tests/mac-screen-recovery-browser.cjs
       - name: Browser room interface and media
         run: node tests/ui-browser.cjs
       - name: Real WebRTC mesh and media transitions
@@ -140,6 +142,8 @@ jobs:
         run: node tests/websocket-relay-browser.cjs --electron
       - name: Native Apple Silicon fullscreen and minimize recovery
         run: node tests/fullscreen-browser.cjs --electron
+      - name: Mac screen settings and explicit capture retry with synthetic fixtures
+        run: node tests/mac-screen-recovery-browser.cjs
       - name: JavaScript syntax and protocol permissions
         run: |
           npm run check
@@ -160,6 +164,8 @@ jobs:
             test-results/mac-lobby.png
             test-results/websocket-relay-browser.json
             test-results/fullscreen-electron.json
+            test-results/mac-screen-recovery-browser.json
+            test-results/mac-screen-recovery-help.png
           if-no-files-found: error
           retention-days: 7
 

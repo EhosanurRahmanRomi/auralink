@@ -99,7 +99,7 @@ async function main() {
         return replaceTrack.call(this, track);
       };
     });
-    await desktop.addInitScript(() => localStorage.setItem('auralink.preferences', JSON.stringify({ microphone: 'missing-previous-microphone' })));
+    await desktop.addInitScript(() => localStorage.setItem('glance-port.preferences', JSON.stringify({ microphone: 'missing-previous-microphone' })));
     await mobile.addInitScript(() => {
       window.qaAllowRemotePlayback = false; const play = HTMLMediaElement.prototype.play;
       HTMLMediaElement.prototype.play = function () { if (this.dataset.peer && !qaAllowRemotePlayback) return Promise.reject(new DOMException('Simulated browser autoplay block', 'NotAllowedError')); return play.call(this); };
@@ -111,7 +111,7 @@ async function main() {
     phase = 'admission'; await join(a, invite, 'Desktop voice QA', owner); await join(b, invite, 'Phone voice QA', owner);
     phase = 'explicit microphone activation'; await a.locator('#mic-button').click(); await b.locator('#mic-button').click();
     for (const page of [a, b]) await page.waitForFunction(() => document.getElementById('mic-button').getAttribute('aria-label') === 'Turn microphone off', undefined, { timeout: 20000 });
-    assert.equal(await a.evaluate(() => JSON.parse(localStorage.getItem('auralink.preferences')).microphone), '', 'Stale microphone preference should fall back to system default');
+    assert.equal(await a.evaluate(() => JSON.parse(localStorage.getItem('glance-port.preferences')).microphone), '', 'Stale microphone preference should fall back to system default');
     assert.equal(await a.evaluate(() => qaCaptureCalls.length), 2, 'Stale microphone triggers one default retry');
     phase = 'input level';
     for (const page of [a, b]) await page.waitForFunction(() => document.getElementById('mic-level').value > .001, undefined, { timeout: 12000 });

@@ -6,7 +6,7 @@ const { app, BrowserWindow, screen } = require('electron');
 const { ControlGate, createAdapter } = require('../src/native/control.cjs');
 
 if (process.platform !== 'win32') throw new Error('This isolated native input test supports Windows only');
-app.setName('AuraLink isolated input verification');
+app.setName('Glance-Port isolated input verification');
 let window;
 let adapter;
 let gate;
@@ -29,7 +29,7 @@ app.whenReady().then(async () => {
   original = physical(screen.getCursorScreenPoint());
   const work = screen.getPrimaryDisplay().workArea;
   window = new BrowserWindow({
-    title: 'AuraLink isolated input verification', width: 620, height: 390,
+    title: 'Glance-Port isolated input verification', width: 620, height: 390,
     x: Math.round(work.x + Math.max(0, (work.width - 620) / 2)),
     y: Math.round(work.y + Math.max(0, (work.height - 390) / 2)),
     resizable: false, show: false, autoHideMenuBar: true,
@@ -71,7 +71,7 @@ app.whenReady().then(async () => {
     pointer: () => physical(screen.getCursorScreenPoint()),
     async dispose() { await gate.revoke(); await adapter.dispose(); },
   };
-  const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><title>AuraLink isolated input verification</title><style>body{font:16px system-ui;background:#101827;color:#eff5ff;padding:24px}h1{font-size:22px}p{color:#a8b5c9}textarea{width:95%;height:76px;padding:10px;font-size:20px}button{padding:12px 24px;margin-top:16px;font-size:16px}#result{margin-left:16px}</style></head><body><h1>Isolated native input verification</h1><p>Only plain test characters and this local button are exercised.</p><textarea id="input" aria-label="Native input test"></textarea><br><button id="target">QA click target</button><span id="result">0 native clicks</span><script>window.qa={keys:[],clicks:[]};document.getElementById('input').addEventListener('keydown',event=>window.qa.keys.push({key:event.key,code:event.code,trusted:event.isTrusted}));document.getElementById('target').addEventListener('click',event=>{window.qa.clicks.push({trusted:event.isTrusted});document.getElementById('result').textContent=window.qa.clicks.length+' native clicks';});</script></body></html>`;
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><title>Glance-Port isolated input verification</title><style>body{font:16px system-ui;background:#101827;color:#eff5ff;padding:24px}h1{font-size:22px}p{color:#a8b5c9}textarea{width:95%;height:76px;padding:10px;font-size:20px}button{padding:12px 24px;margin-top:16px;font-size:16px}#result{margin-left:16px}</style></head><body><h1>Isolated native input verification</h1><p>Only plain test characters and this local button are exercised.</p><textarea id="input" aria-label="Native input test"></textarea><br><button id="target">QA click target</button><span id="result">0 native clicks</span><script>window.qa={keys:[],clicks:[]};document.getElementById('input').addEventListener('keydown',event=>window.qa.keys.push({key:event.key,code:event.code,trusted:event.isTrusted}));document.getElementById('target').addEventListener('click',event=>{window.qa.clicks.push({trusted:event.isTrusted});document.getElementById('result').textContent=window.qa.clicks.length+' native clicks';});</script></body></html>`;
   await window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
   window.show();
   window.focus();

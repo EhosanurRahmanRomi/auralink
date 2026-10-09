@@ -10,15 +10,15 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function setup({ android = true, existing, reject, response } = {}) {
   const messages = [];
-  const window = existing ? { auralink: existing } : {};
-  if (android) window.AuralinkNative = { postMessage(raw) {
+  const window = existing ? { glancePort: existing } : {};
+  if (android) window.GlancePortNative = { postMessage(raw) {
     const message = JSON.parse(raw); messages.push(message);
-    queueMicrotask(() => window.__auralinkNativeReceive?.(JSON.stringify({ requestId: message.requestId,
+    queueMicrotask(() => window.__glancePortNativeReceive?.(JSON.stringify({ requestId: message.requestId,
       ok: !reject?.(message), result: response ? response(message) : message.method === 'getInfo' ? { platform: 'android', nativeControl: false } : { ok: true },
       error: 'Native permission declined.' })));
   } };
   vm.runInNewContext(source, { window, EventTarget, Event, MessageEvent, DOMException, TextEncoder, URL, atob, setTimeout, clearTimeout, queueMicrotask });
-  return { window, messages, bridge: window.auralink, receive: data => window.__auralinkNativeReceive(JSON.stringify(data)) };
+  return { window, messages, bridge: window.glancePort, receive: data => window.__glancePortNativeReceive(JSON.stringify(data)) };
 }
 
 test('ordinary browser and Electron retain their original transport and privileged API', () => {

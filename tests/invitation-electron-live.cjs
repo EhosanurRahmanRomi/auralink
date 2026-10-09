@@ -57,7 +57,7 @@ async function prepare(page, forceRTC) {
       }).observe(notices, { childList: true });
     }
     window.qaNativeSocketEvents = { open: 0, message: 0, error: 0, closes: [] };
-    window.auralink?.onInternetEvent?.(event => {
+    window.glancePort?.onInternetEvent?.(event => {
       if (['open', 'message', 'error'].includes(event?.type)) qaNativeSocketEvents[event.type]++;
       else if (event?.type === 'close') {
         qaNativeSocketEvents.closes.push({ code: Number.isInteger(event.code) ? event.code : null,
@@ -157,7 +157,7 @@ async function audioFailureDiagnosis(page) {
     const label = (id, choices) => enumValue(document.getElementById(id)?.getAttribute('aria-label'), choices);
     let permissions = null;
     try {
-      const info = await window.auralink?.getInfo?.();
+      const info = await window.glancePort?.getInfo?.();
       if (info?.permissions) permissions = Object.fromEntries(['microphone', 'screen', 'accessibility'].map(key => [key, enumValue(info.permissions[key], ['granted', 'denied', 'restricted', 'not-determined', 'not-required', 'unknown'])]));
     } catch { permissions = { unavailable: 'Permission status read failed.' }; }
     return {
@@ -270,7 +270,7 @@ async function main() {
     const host = await launch(); await prepare(host, true); await host.locator('#quick-name').fill('Desktop host');
     phase = 'one-click public room'; await host.locator('#host-button').click(); await host.waitForFunction(() => !document.getElementById('share-button').disabled);
     const code = await host.locator('#room-code').inputValue(); assert.match(code, /^A1\.[a-f0-9-]{36}\.[A-Za-z0-9_-]{43}$/);
-    phase = 'cold joining link'; const guest = await launch(`auralink://join#code=${code}`); await prepare(guest, false);
+    phase = 'cold joining link'; const guest = await launch(`glance-port://join#code=${code}`); await prepare(guest, false);
     await guest.waitForFunction(() => !document.getElementById('share-button').disabled); assert.equal(await host.locator('#pending-banner').isVisible(), false);
     const guestName = (await guest.locator('#display-name').inputValue()) || 'My device';
     assert.deepEqual(await host.evaluate(() => qaCaptureCalls), []); assert.deepEqual(await guest.evaluate(() => qaCaptureCalls), []);
