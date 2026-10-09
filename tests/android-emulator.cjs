@@ -635,6 +635,17 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
         if(!element){element=document.createElement(kind==='audio'?'audio':'video');element.id='public-'+kind;element.autoplay=true;element.muted=true;element.playsInline=true;document.body.append(element);}
         element.srcObject=stream;void element.play().catch(error=>publicErrors.push(error.message));
       });
+      window.publicScreenSnapshot=()=>{
+        const video=document.getElementById('public-screen'),track=video?.srcObject?.getVideoTracks()[0];
+        if(!video || video.readyState<2 || video.ended || video.videoWidth<1 || video.videoHeight<1 || track?.readyState!=='live')return null;
+        const canvas=document.createElement('canvas');canvas.width=90;canvas.height=160;canvas.getContext('2d').drawImage(video,0,0,90,160);
+        const pixels=canvas.getContext('2d').getImageData(0,0,90,160).data;let hash=2166136261,nonBlank=false;
+        for(let index=0;index<pixels.length;index++){
+          hash=Math.imul(hash^pixels[index],16777619);
+          if(index%4!==3 && pixels[index]!==pixels[index%4])nonBlank=true;
+        }
+        return {frames:video.getVideoPlaybackQuality().totalVideoFrames,hash:hash>>>0,nonBlank,width:video.videoWidth,height:video.videoHeight,trackId:track.id};
+      };
       for(const peer of welcome.peers)publicRTC.addPeer(peer);
       await publicRTC.useSecureRelay();
       window.publicToneContext=new AudioContext({sampleRate:48000});await publicToneContext.resume();
@@ -647,6 +658,10 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     const relayStats=async()=>page.evaluate(async id=>({row:(await publicRTC.stats()).find(value=>value.peerId===id),frames:document.getElementById('public-screen')?.getVideoPlaybackQuality().totalVideoFrames || 0,
       width:document.getElementById('public-screen')?.videoWidth,height:document.getElementById('public-screen')?.videoHeight,
       allDirectClosed:publicPCs.length>0 && publicPCs.every(pc=>pc.connectionState==='closed'),noTurnServers:publicPCs.every(pc=>pc.getConfiguration().iceServers.length===0 && pc.getConfiguration().iceTransportPolicy==='relay')}),peerId);
+    const imageHash=async()=>{
+      const snapshot=await page.evaluate(()=>publicScreenSnapshot());
+      assert.ok(snapshot?.nonBlank,'Actual Android screen hash requires a live nonblank decoded video frame');return snapshot.hash;
+    };
     recordPublicProgress=async stage=>{
       const stats=await relayStats();
       const summary={stage,route:stats.row?.route || null,width:stats.width || 0,height:stats.height || 0,decodedScreenFrames:stats.frames,
@@ -692,17 +707,40 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
       await tapRoomAction(node=>node['resource-id']==='fullscreen-button');
       await findNode((node,nodes)=>node['resource-id']==='presentation-fullscreen-exit' && visibleInWebView(node,nodes));
       await screenshot('android-emulator-fullscreen.png');
-      const beforeFullscreenFrames=(await relayStats()).frames;
-      await page.waitForFunction(first=>document.getElementById('public-screen')?.getVideoPlaybackQuality().totalVideoFrames>first,beforeFullscreenFrames,{timeout:20000});
+      const fullscreenBaseline=await page.evaluate(()=>{
+        const snapshot=publicScreenSnapshot(),video=document.getElementById('public-screen');
+        if(snapshot){window.fullscreenSourceVideo=video;window.fullscreenSourceTrack=video.srcObject.getVideoTracks()[0];}return snapshot;
+      });
+      assert.ok(fullscreenBaseline?.nonBlank && fullscreenBaseline.frames>0,'Fullscreen must retain the actual live decoded Android screen');
+      // Native ImageReader emits changed display images, not a periodic still
+      // image pump. Exercise a real owner-visible change after the baseline.
+      publicPhase('owner volume change advances actual fullscreen screen pixels');
+      const fullscreenDeadline=Date.now()+20000;
+      await adb(['shell','input','keyevent','24']);
+      const fullscreenRemaining=fullscreenDeadline-Date.now();
+      assert.ok(fullscreenRemaining>0,'The actual fullscreen pixel change must finish within its original 20-second deadline');
+      await page.waitForFunction(first=>{
+        const video=document.getElementById('public-screen'),next=publicScreenSnapshot();
+        return video===window.fullscreenSourceVideo && video?.srcObject?.getVideoTracks()[0]===window.fullscreenSourceTrack &&
+          next?.nonBlank && next.trackId===first.trackId && next.width===first.width && next.height===first.height &&
+          next.frames>first.frames && next.hash!==first.hash;
+      },fullscreenBaseline,{timeout:fullscreenRemaining});
+      await screenshot('android-emulator-fullscreen-change.png');
+      publicPhase('owner volume panel settles before native fullscreen Back');
+      await findNode((node,nodes)=>node['resource-id']==='presentation-fullscreen-exit' && visibleInWebView(node,nodes) &&
+        !nodes.some(value=>value.package==='com.android.systemui' && value['visible-to-user']==='true' &&
+          /^com\.android\.systemui:id\/volume_/.test(value['resource-id'] || '')));
       publicPhase('Android Back exits fullscreen without leaving room');
       await adb(['shell','input','keyevent','4']);
-      await findNativeRoomAction(node=>node['resource-id']==='fullscreen-button');
+      await findNativeRoomAction((node,nodes)=>node['resource-id']==='fullscreen-button' && (node.text || node['content-desc'])==='Enter fullscreen' &&
+        !nodes.some(value=>value['resource-id']==='presentation-fullscreen-exit' && value['visible-to-user']==='true'));
       await findNativeRoomAction(node=>node['resource-id']==='room-code' && (node.text || node['content-desc'])===codeText);
       assert.equal((await adb(['shell','pidof','local.auralink.mobile'])).trim(),fullscreenProcess);
       const resumed=(await adb(['shell','dumpsys','activity','activities'])).split('\n').find(line=>line.includes('topResumedActivity='));
       assert.ok(resumed?.includes('local.auralink.mobile'),'Native Back must exit presentation instead of closing the Activity');
       assert.match(await adb(['shell','dumpsys','power']),/PARTIAL_WAKE_LOCK[^\n]*local\.auralink\.mobile:active-room/,'The admitted foreground room must hold its scoped CPU wake lock');
-      fullscreenProof={passed:true,visibleExitControl:true,nativeBackRetainsActivityAndRoom:true,screenFramesAdvanced:true,scopedRoomCpuWakeLock:true};
+      fullscreenProof={passed:true,visibleExitControl:true,nativeBackRetainsActivityAndRoom:true,screenFramesAdvanced:true,
+        ownerVisibleChange:'Android volume panel',decodedPixelsChanged:true,sameScreenTrack:true,scopedRoomCpuWakeLock:true};
       checkpoint('nativeFullscreen',fullscreenProof);
     }
     publicPhase('open native connection diagnostics');
@@ -715,7 +753,6 @@ async function checkNativePublicRelayMedia(fixture,codeText) {
     publicPhase('close native diagnostics before Home');
     await tapRoomAction(node=>node['resource-id']==='diagnostics-close');
     const processBefore=(await adb(['shell','pidof','local.auralink.mobile'])).trim();
-    const imageHash=()=>page.evaluate(()=>{const video=document.getElementById('public-screen');const canvas=document.createElement('canvas');canvas.width=90;canvas.height=160;canvas.getContext('2d').drawImage(video,0,0,90,160);let hash=2166136261;for(const value of canvas.getContext('2d').getImageData(0,0,90,160).data)hash=Math.imul(hash^value,16777619);return hash>>>0;});
     const homeComponent=(await adb(['shell','cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.HOME'])).trim().split(/\r?\n/).find(line=>/^[\w.]+\//.test(line));
     assert.ok(homeComponent);const homePackage=homeComponent.split('/')[0];
     publicPhase('actual Android Home remains foreground');
