@@ -39,14 +39,17 @@ function fits(node, area) {
   return Boolean(area && box && node['visible-to-user'] === 'true' &&
     box[0] >= area[0] && box[2] <= area[2] && box[1] >= area[1] && box[3] <= area[3]);
 }
+function gestureBlockers(nodes) {
+  return nodes.filter(node => node['visible-to-user'] === 'true' &&
+    (node.clickable === 'true' || node['long-clickable'] === 'true' || node['resource-id'] === 'stage-video' ||
+      /^android\.widget\.(?:Button|ToggleButton|EditText|Spinner|SeekBar|Switch)$/.test(node.class || '')) && rect(node));
+}
 function gesturePath(nodes, area, direction) {
   if (!area) return null;
   const middle = Math.round((area[1] + area[3]) / 2), half = Math.round((area[3] - area[1]) * .23);
   if (half < 1) return null;
   const top = middle - half, bottom = middle + half;
-  const blockers = nodes.filter(node => node['visible-to-user'] === 'true' &&
-    (node.clickable === 'true' || node['long-clickable'] === 'true' || node['resource-id'] === 'stage-video' ||
-      /^android\.widget\.(?:Button|ToggleButton|EditText|Spinner|SeekBar|Switch)$/.test(node.class || ''))).map(rect).filter(Boolean);
+  const blockers = gestureBlockers(nodes).map(rect);
   for (const fraction of [.025,.975,.5,.25,.75]) {
     const x = Math.round(area[0] + (area[2] - area[0]) * fraction);
     if (x <= area[0] || x >= area[2] || blockers.some(box => x >= box[0] - 4 && x <= box[2] + 4 && bottom >= box[1] - 4 && top <= box[3] + 4)) continue;
@@ -75,18 +78,19 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
   let stableBounds, previousViewport, sameViewport = 0, direction = 'earlier', scans = 0, observedViewport = false;
   do {
     const nodes = await read(); const area = viewport(nodes); const node = nodes.find(value => value.package === appPackage && predicate(value,nodes));
-    observe?.(nodes, node);
-    if (now() >= deadline) break;
+    const attempt = {viewport:area,direction,decision:'pending',path:null};
+    observe?.(nodes, node, attempt);
+    if (now() >= deadline) { attempt.decision = 'deadline'; break; }
     // UiAutomation can briefly omit the app while returning only SystemUI.
     // Such a snapshot proves neither a scroll boundary nor an absent action.
-    if (!area) { stableBounds = previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
+    if (!area) { attempt.decision = 'wait-no-viewport'; stableBounds = previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
     observedViewport = true;
     if (node && fits(node, area)) {
-      if (node.bounds === stableBounds) return node;
-      stableBounds = node.bounds; await wait(300); continue;
+      if (node.bounds === stableBounds) { attempt.decision = 'return-stable-action'; return node; }
+      attempt.decision = 'wait-stable-action'; stableBounds = node.bounds; await wait(300); continue;
     }
     stableBounds = undefined;
-    if (!gesturePath(nodes,area,direction)) { previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
+    if (!gesturePath(nodes,area,direction)) { attempt.decision = 'wait-no-safe-gesture'; previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
     const box = rect(node);
     if (box && box[3] > box[1]) {
       // Above the viewport needs a downward finger swipe; below needs upward.
@@ -99,17 +103,19 @@ async function findRoomAction(predicate, {read, swipe, wait, now = Date.now, tim
       sameViewport = current === previousViewport ? sameViewport + 1 : 0;
       previousViewport = current;
       if (sameViewport >= 2 || scans >= 8) {
-        if (direction === 'later') throw new Error('Room action is absent after searching the native viewport in both directions');
+        if (direction === 'later') { attempt.decision = 'absent-after-search'; throw new Error('Room action is absent after searching the native viewport in both directions'); }
         direction = 'later'; previousViewport = undefined; sameViewport = 0; scans = 0;
       }
       scans++;
     }
     const path = gesturePath(nodes,area,direction);
-    if (!path) { previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
+    attempt.direction = direction;
+    if (!path) { attempt.decision = 'wait-no-safe-gesture'; previousViewport = undefined; sameViewport = 0; await wait(300); continue; }
+    attempt.decision = 'swipe'; attempt.path = path;
     await swipe(...path);
     await wait(500);
   } while (now() < deadline);
   throw new Error(observedViewport ? 'Room action did not expose stable fully visible native bounds before the deadline' :
     'Production WebView did not expose a valid observed viewport before the deadline');
 }
-module.exports = {findRoomAction, fits, viewport, gesturePath, diagnosticValue};
+module.exports = {findRoomAction, fits, viewport, gesturePath, gestureBlockers, diagnosticValue};

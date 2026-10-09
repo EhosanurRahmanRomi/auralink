@@ -14,7 +14,7 @@ const selfsigned=require('selfsigned');
 const {chromium}=require('playwright');
 const {createBroker}=require('../src/core/broker.cjs');
 const {fingerprint}=require('../src/core/invite.cjs');
-const {findRoomAction,diagnosticValue}=require('./android-room-action.cjs');
+const {findRoomAction,diagnosticValue,gestureBlockers}=require('./android-room-action.cjs');
 const {visibleInWebView,createImmersiveTutorialHandler}=require('./android-hierarchy.cjs');
 const exec=promisify(execFile);
 const project=path.resolve(__dirname,'..');
@@ -149,9 +149,43 @@ async function tapRoomAction(predicate,timeout=30000) {
   const node=await findNativeRoomAction(predicate,timeout);await tap(node);return node;
 }
 async function findNativeRoomAction(predicate,timeout=30000,observe) {
+  const tracePhase=phase==='Android public relay: require recreated native room view and owner controls' ||
+    phase==='Android public relay: native fullscreen outgoing quality changes retain screen and device audio';
+  const search=tracePhase ? {phase,startedAt:new Date().toISOString(),observations:[],swipes:[],observationCount:0,executedSwipeCount:0,result:'in-progress'} : null;
+  const started=Date.now();
+  if(search) {
+    runtimeDiagnostics.roomActionSearches ||= [];
+    runtimeDiagnostics.roomActionSearches.push(search);
+    if(runtimeDiagnostics.roomActionSearches.length>8)runtimeDiagnostics.roomActionSearches.shift();
+  }
+  const safeNode=node=>({class:node.class,package:node.package,resourceId:node['resource-id'] || '',bounds:node.bounds,
+    visible:node['visible-to-user']==='true',clickable:node.clickable==='true',longClickable:node['long-clickable']==='true',
+    scrollable:node.scrollable==='true',enabled:node.enabled==='true'});
+  const observeSearch=(nodes,node,decision)=>{
+    observe?.(nodes,node);
+    if(!search)return;
+    const blockers=gestureBlockers(nodes);
+    const appSnapshot=nodes.filter(value=>value.package==='local.auralink.mobile').map(safeNode);
+    search.observationCount++;
+    search.observations.push({atMs:Date.now()-started,decision,appNodes:appSnapshot.length,
+      layoutSha256:crypto.createHash('sha256').update(JSON.stringify(appSnapshot)).digest('hex'),
+      target:node ? safeNode(node) : null,
+      webViews:nodes.filter(value=>value.class==='android.webkit.WebView').slice(0,8).map(safeNode),
+      navigation:nodes.filter(value=>['Rooms','Devices','Settings'].includes(value.text || value['content-desc'])).slice(0,8)
+        .map(value=>({...safeNode(value),label:value.text || value['content-desc']})),
+      scrollables:nodes.filter(value=>value.scrollable==='true').slice(0,8).map(safeNode),
+      blockerCount:blockers.length,blockers:blockers.slice(0,64).map(safeNode),
+      roomCodeCandidates:nodes.filter(value=>value.package==='local.auralink.mobile' && value['resource-id']==='room-code').slice(0,4)
+        .map(value=>({...safeNode(value),textMatchesExpected:predicate(value,nodes)}))});
+    if(search.observations.length>20)search.observations.shift();
+  };
   try {
-    return await findRoomAction(predicate,{read:roomHierarchy,swipe:(x1,y1,x2,y2)=>adb(['shell','input','swipe',...[x1,y1,x2,y2].map(String),'450']),wait:delay,timeout,observe});
-  } catch(error) { throw new Error(`${error.message} during ${phase}`); }
+    const found=await findRoomAction(predicate,{read:roomHierarchy,swipe:async(x1,y1,x2,y2)=>{
+      await adb(['shell','input','swipe',...[x1,y1,x2,y2].map(String),'450']);
+      if(search){search.executedSwipeCount++;search.swipes.push({atMs:Date.now()-started,path:[x1,y1,x2,y2]});if(search.swipes.length>20)search.swipes.shift();}
+    },wait:delay,timeout,observe:observeSearch});
+    if(search)search.result='found';return found;
+  } catch(error) { if(search)search.result='failed';throw new Error(`${error.message} during ${phase}`); }
 }
 async function readNativePublicStat(labelText,valuePattern,timeout=30000) {
   assert.ok(['Audio received','Audio playback processing'].includes(labelText),'Only the whitelisted native media statistics may be observed');

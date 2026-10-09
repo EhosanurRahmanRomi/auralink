@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {findRoomAction, fits, viewport, gesturePath, diagnosticValue} = require('./android-room-action.cjs');
+const {findRoomAction, fits, viewport, gesturePath, gestureBlockers, diagnosticValue} = require('./android-room-action.cjs');
 
 const packageName = 'local.auralink.mobile';
 const view = {class:'android.webkit.WebView',package:packageName,'visible-to-user':'true',bounds:'[0,136][720,1245]'};
@@ -141,6 +141,23 @@ test('gesture coordinates come from the observed viewport and avoid the captured
   const nested = {...view,bounds:'[40,180][680,1000]'};const narrowArea=viewport([nested,view]);
   const narrowPath=gesturePath([nested,view],narrowArea,'later');
   assert.ok(narrowPath[0]>40 && narrowPath[0]<680 && narrowPath[3]>=180 && narrowPath[1]<=1000);
+});
+
+test('diagnostic observations report actual blocked, swipe and stability decisions without changing the search', async () => {
+  const clickedAncestor={...view,clickable:'true',scrollable:'true'};
+  const above=button('[66,-40][655,100]'),onScreen=button('[66,300][655,368]');
+  const snapshots=[[clickedAncestor,navBand,nav,above],[],[view,navBand,nav,above],
+    [view,navBand,nav,onScreen],[view,navBand,nav,onScreen]];
+  let reads=0,clock=0;const swipes=[],trace=[];
+  const found=await findRoomAction(target,{read:async()=>snapshots[reads++],
+    swipe:(...path)=>swipes.push(path),wait:async ms=>{clock+=ms;},now:()=>clock,timeout:5000,
+    observe:(nodes,node,decision)=>trace.push({decision,blockers:gestureBlockers(nodes),target:node})});
+  assert.equal(found.bounds,onScreen.bounds);assert.equal(reads,5);assert.equal(swipes.length,1);
+  assert.deepEqual(trace.map(value=>value.decision.decision),[
+    'wait-no-safe-gesture','wait-no-viewport','swipe','wait-stable-action','return-stable-action']);
+  assert.deepEqual(trace[2].decision.path,swipes[0]);assert.equal(trace[2].decision.direction,'earlier');
+  assert.equal(trace[0].decision.path,null);assert.ok(trace[0].blockers.includes(clickedAncestor));
+  assert.equal(trace[1].decision.viewport,null);
 });
 
 test('an interactive or video-covered viewport never falls back to fabricated gesture coordinates', async () => {
