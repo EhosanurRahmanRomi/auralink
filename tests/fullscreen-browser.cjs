@@ -408,10 +408,26 @@ async function run(browser, mode) {
       navigator.mediaDevices.getDisplayMedia = async () => {
         qaCaptureCalls.push('syntheticDisplayMedia');
         const canvas = document.createElement('canvas'); canvas.width = 2560; canvas.height = 1440;
-        const draw = canvas.getContext('2d'); draw.fillStyle = '#522536'; draw.fillRect(0, 0, canvas.width, canvas.height);
-        draw.fillStyle = '#ffe4b2'; draw.font = '48px sans-serif'; draw.fillText('Owned synthetic display — quality controls', 80, 180);
+        const draw = canvas.getContext('2d'); let frame = 0;
+        const paint = () => {
+          draw.fillStyle = '#522536'; draw.fillRect(0, 0, canvas.width, canvas.height);
+          draw.fillStyle = '#ffe4b2'; draw.font = '48px sans-serif'; draw.fillText('Owned synthetic display — quality controls', 80, 180);
+          draw.font = '32px sans-serif'; draw.fillText(`Generated verification frame ${++frame}`, 80, 240);
+        };
+        paint(); window.qaOwnedQualityTimer = setInterval(paint, Math.round(1000 / 12));
         const stream = canvas.captureStream(12), track = stream.getVideoTracks()[0];
+        track.addEventListener('ended', () => clearInterval(qaOwnedQualityTimer), { once: true });
         window.qaOwnedQualityTrack = track; window.qaOwnedQualityApplied = [];
+        window.qaOwnedQualityDisplayed = () => {
+          const video = document.getElementById('stage-video');
+          const sample = document.createElement('canvas'); sample.width = 16; sample.height = 16;
+          const pixels = sample.getContext('2d'); pixels.drawImage(video, 0, 0, 16, 16);
+          const data = pixels.getImageData(0, 0, 16, 16).data; let sum = 0;
+          for (let index = 0; index < data.length; index += 4) sum += data[index] + data[index + 1] + data[index + 2];
+          return { width: video.videoWidth, height: video.videoHeight, readyState: video.readyState,
+            decodedFrames: video.getVideoPlaybackQuality().totalVideoFrames, rgbMean: sum / (256 * 3),
+            sameTrack: video.srcObject?.getVideoTracks()[0] === qaOwnedQualityTrack };
+        };
         const original = track.applyConstraints.bind(track);
         track.applyConstraints = async constraints => { await original(constraints); const { width, height, frameRate, resizeMode } = track.getSettings(); qaOwnedQualityApplied.push({ requested: structuredClone(constraints), actual: { width, height, frameRate, resizeMode } }); };
         return stream;
@@ -438,10 +454,20 @@ async function run(browser, mode) {
     assert.equal(await guest.locator('#presentation-quality').inputValue(), '720', 'Unsupported preset values restore the current selected ceiling');
     if (mode === 'browser') assert.equal(await guest.evaluate(() => document.fullscreenElement?.id), 'stage');
     if (mode === 'electron') await assertEventually(app, true);
+    // Constraint settings can settle before a canvas produces its next resized
+    // frame. Inspect only the explicit generated source before its screenshot.
+    await guest.waitForFunction(() => {
+      const video = document.getElementById('stage-video');
+      if (video.readyState < 2 || video.videoWidth !== 1280 || video.videoHeight !== 720) return false;
+      const shown = qaOwnedQualityDisplayed();
+      return shown.sameTrack && shown.decodedFrames >= 3 && shown.rgbMean > 10;
+    });
+    const displayedSource = await guest.evaluate(() => qaOwnedQualityDisplayed());
     const ownLayout = await presentationBounds(guest); assert.ok(ownLayout.buttons.every(button => button.reachable)); assert.equal(ownLayout.buttons.length, 8); assert.ok(ownLayout.toolbar.height <= proof.initialLayout.toolbar.height + 1);
     await guest.screenshot({ path: path.join(output, `fullscreen-quality-${mode}.png`) });
-    proof.liveQuality = { passed: true, disabledWhileOnlyViewing: proof.streamQuality.viewerCannotChangeRemoteOwner, selectorsSynchronized: true, sameScreenTrack: true, fullscreenRetained: true, finalSelectionApplied: true, noRemoteInput: true, finalQuality: '720', snapshots: qualitySnapshots, finalConstraints: await guest.evaluate(() => qaOwnedQualityApplied.at(-1)), layout: ownLayout, boundary: 'Explicit synthetic canvas display source and isolated picker double. Genuine track.applyConstraints and shipped renderer UI/RTC quality path; physical/native capture dimensions are checked separately.' };
+    proof.liveQuality = { passed: true, disabledWhileOnlyViewing: proof.streamQuality.viewerCannotChangeRemoteOwner, selectorsSynchronized: true, sameScreenTrack: true, fullscreenRetained: true, finalSelectionApplied: true, noRemoteInput: true, finalQuality: '720', snapshots: qualitySnapshots, finalConstraints: await guest.evaluate(() => qaOwnedQualityApplied.at(-1)), displayedSource, layout: ownLayout, boundary: 'Explicit synthetic canvas display source and isolated picker double. Genuine track.applyConstraints and shipped renderer UI/RTC quality path; a fresh generated nonblack 720p frame is checked before the screenshot. Physical/native capture dimensions are checked separately.' };
     await noInputs(owner, () => guest.locator('#presentation-share-button').click());
+    await guest.evaluate(() => clearInterval(qaOwnedQualityTimer));
     await guest.waitForFunction(() => document.getElementById('presentation-quality').disabled);
     await guest.locator('#presentation-fullscreen-exit').click(); await guest.waitForFunction(() => !document.body.classList.contains('presentation-mode'));
     if (mode === 'electron') await assertEventually(app, false);

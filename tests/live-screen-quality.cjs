@@ -22,7 +22,7 @@ async function main() {
   const profile = fs.mkdtempSync(path.join(output, 'live-quality-profile-'));
   let application, page, phase = 'launch'; const errors = [];
   const proof = {passed:false, platform:process.platform, sourceHashes:hashes(),
-    boundary:'Production Electron main/preload native app-window selection and getDisplayMedia; active production owner RoomRTC with isolated in-memory-signaled real direct RTC and encrypted relay peers. UI quality selector changes actual native track constraints. Real changing captured pixels and decoded dimensions are checked without saving screen images. No physical microphone, remote OS input, public relay quota or different-network claim.'};
+    boundary:'Production Electron main/preload source selection and getDisplayMedia capture a separately owned native1920×1080 Electron window containing animated QA pixels, even when the desktop is smaller. Active production owner RoomRTC uses isolated in-memory-signaled real direct RTC and encrypted relay peers. Main app fullscreen UI changes actual native capture constraints. Real changing captured pixels and decoded dimensions are checked without saving screen images. No synthetic capture track, physical microphone, remote OS input, public relay quota or different-network claim.'};
   try {
     const env = {...process.env}; delete env.ELECTRON_RUN_AS_NODE;
     application = await _electron.launch({args:[root, '--smoke-test', `--user-data-dir=${profile}`, '--mute-audio', '--autoplay-policy=no-user-gesture-required'], env, timeout:60000});
@@ -45,13 +45,39 @@ async function main() {
       const microphone = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
       navigator.mediaDevices.getUserMedia = async options => { liveQualityQA.microphoneCalls++; return microphone(options); };
     });
+    phase = 'create independent native capture window';
+    proof.fixtureWindow=await application.evaluate(async ({BrowserWindow,screen}) => {
+      const owner=BrowserWindow.getAllWindows()[0];
+      const fixture=new BrowserWindow({width:1920,height:1080,minWidth:1920,minHeight:1080,useContentSize:true,frame:false,
+        show:false,focusable:false,skipTaskbar:true,backgroundColor:'#583f39',title:'Glance-Port isolated live quality capture',
+        ...(process.platform==='darwin'?{enableLargerThanScreen:true}:{}),
+        webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
+      globalThis.liveQualityCaptureFixture=fixture;
+      await fixture.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(`<!doctype html><html><head><title>Glance-Port isolated live quality capture</title><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'"></head><body style="margin:0;background:#583f39;overflow:hidden"><canvas id="motion" width="1920" height="1080" style="display:block;width:1920px;height:1080px"></canvas><script>
+        window.qaPaints=0;const canvas=document.getElementById('motion'),ctx=canvas.getContext('2d');
+        function paint(){const count=++window.qaPaints;ctx.fillStyle=count%2?'#583f39':'#8c4554';ctx.fillRect(0,0,1920,1080);
+          ctx.fillStyle='#faf0c4';ctx.fillRect(count*23%1760,300,160,450);ctx.font='64px sans-serif';ctx.fillText('Native screen quality '+count,90,150);
+          ctx.fillStyle='#d7a6c1';ctx.fillRect(1850,1010,50,50);}
+        paint();window.qaMotion=setInterval(paint,40);
+      </script></body></html>`));
+      // Set client bounds after load/show as well; a runner's smaller work area
+      // must not silently substitute its own size for this native source.
+      fixture.showInactive();fixture.setContentBounds({x:0,y:0,width:1920,height:1080});owner.focus();
+      return {bounds:fixture.getBounds(),contentBounds:fixture.getContentBounds(),visible:fixture.isVisible(),minimized:fixture.isMinimized(),
+        desktop:screen.getPrimaryDisplay().size,deviceScaleFactor:screen.getPrimaryDisplay().scaleFactor,
+        sourceId:fixture.getMediaSourceId(),nativeSourceCreated:true};
+    });
+    assert.equal(proof.fixtureWindow.contentBounds.width,1920);assert.equal(proof.fixtureWindow.contentBounds.height,1080);
+    assert.equal(proof.fixtureWindow.visible,true);assert.equal(proof.fixtureWindow.minimized,false);
     phase = 'native capture';
-    await application.evaluate(({BrowserWindow}) => BrowserWindow.getAllWindows()[0].setTitle('Glance-Port isolated live quality capture'));
     await page.locator('#share-button').click(); await page.locator('.screen-source').filter({hasText:'Glance-Port isolated live quality capture'}).click();
     await page.waitForFunction(() => liveQualityQA.owner && document.getElementById('stage-video').videoWidth > 0, null, {timeout:25000});
     const native = await page.evaluate(() => liveQualityQA.originalTrack.getSettings());
     assert.ok(native.width > 1280 || native.height > 720, 'Selected native window must exceed 720p to demonstrate a real live downscale');
     proof.nativeSource = {width:native.width, height:native.height, displaySurface:native.displaySurface};
+    assert.equal(native.displaySurface,'window');
+    assert.equal(native.deviceId,proof.fixtureWindow.sourceId,'Native capture must belong to the uniquely owned test window');
+    assert.equal(native.width,1920);assert.equal(native.height,1080,'Actual native source pixels must remain independent from the smaller desktop');
     phase = 'direct and encrypted relay peers';
     await page.evaluate(async () => {
       const {RoomRTC} = await import('./rtc.js'); const {RelayMedia} = await import('./relay-media.js'); const qa = liveQualityQA, owner = qa.owner;
@@ -78,12 +104,7 @@ async function main() {
         if (relay) { await peer.relayReady; await Promise.all([owner.activateRelay(owner.peers.get(id)), peer.activateRelay(peer.peers.get(owner.selfId))]); }
       };
       await qa.addPeer('quality-direct', false); await qa.addPeer('quality-relay', true);
-      const motion = document.createElement('canvas'); motion.width = 500; motion.height = 160;
-      Object.assign(motion.style, {position:'fixed', top:'150px', left:'300px', width:'500px', height:'160px', zIndex:'999', pointerEvents:'none'}); document.getElementById('stage').append(motion);
-      let paints = 0; const ctx = motion.getContext('2d');
-      qa.timer = setInterval(() => { ctx.fillStyle = paints % 2 ? '#583f39' : '#8c4554'; ctx.fillRect(0,0,500,160);
-        ctx.fillStyle = '#faf0c4'; ctx.fillRect(++paints * 13 % 440,45,60,75); ctx.font = '22px sans-serif'; ctx.fillText(`Native live quality ${paints}`,15,30); }, 40);
-      qa.stop = () => { clearInterval(qa.timer); motion.remove(); for (const [id, peer] of qa.peers) { peer.close(); owner.removePeer(id); document.getElementById(`live-quality-${id}`)?.remove(); } qa.peers.clear(); };
+      qa.stop = () => { for (const [id, peer] of qa.peers) { peer.close(); owner.removePeer(id); document.getElementById(`live-quality-${id}`)?.remove(); } qa.peers.clear(); };
     });
     await page.waitForFunction(() => ['quality-direct','quality-relay'].every(id => { const video = document.getElementById(`live-quality-${id}`); return video?.videoWidth > 0 && video.getVideoPlaybackQuality().totalVideoFrames > 3; }), null, {timeout:30000});
     await page.locator('#fullscreen-button').click(); await page.locator('#presentation-quality').waitFor({state:'visible'});
@@ -171,6 +192,7 @@ async function main() {
       videos:[...document.querySelectorAll('video[id^="live-quality-"]')].map(video=>({id:video.id,width:video.videoWidth,height:video.videoHeight,frames:video.getVideoPlaybackQuality().totalVideoFrames}))})).catch(()=>null);
     fs.writeFileSync(path.join(output,'live-screen-quality.json'),JSON.stringify(proof,null,2)); throw error;
   } finally {
+    await application?.evaluate(() => {const fixture=globalThis.liveQualityCaptureFixture;if(fixture && !fixture.isDestroyed())fixture.destroy();delete globalThis.liveQualityCaptureFixture;}).catch(()=>{});
     await application?.close(); const relative=path.relative(path.resolve(output),path.resolve(profile));
     assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative),'Generated test profile must stay inside test-results');
     fs.rmSync(profile,{recursive:true,force:true,maxRetries:3,retryDelay:100});
