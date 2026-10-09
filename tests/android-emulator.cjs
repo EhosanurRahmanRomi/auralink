@@ -149,8 +149,7 @@ async function tapRoomAction(predicate,timeout=30000) {
   const node=await findNativeRoomAction(predicate,timeout);await tap(node);return node;
 }
 async function findNativeRoomAction(predicate,timeout=30000,observe) {
-  const tracePhase=phase==='Android public relay: require recreated native room view and owner controls' ||
-    phase==='Android public relay: native fullscreen outgoing quality changes retain screen and device audio';
+  const tracePhase=true;
   const search=tracePhase ? {phase,startedAt:new Date().toISOString(),observations:[],swipes:[],observationCount:0,executedSwipeCount:0,result:'in-progress'} : null;
   const started=Date.now();
   if(search) {
