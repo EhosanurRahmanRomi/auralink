@@ -44,8 +44,11 @@ function nativeQualityOption(nodes,quality) {
     const view=views.find(value=>value._observerWindowId!==node._observerWindowId && contained(node,value));
     if(!view)continue;
     const container=containers[0];
-    options.push({node,container,root,view,identity:JSON.stringify([node._observerWindowId,node.class,node['resource-id'] || '',
-      node.text,node.bounds,container.class,container.bounds,root.bounds,view.bounds])});
+    // Window IDs associate nodes within this snapshot. A fresh UiAutomation
+    // connection can renumber them, so compare owner identity and geometry
+    // across consecutive observations rather than the connection's IDs.
+    options.push({node,container,root,view,identity:JSON.stringify([node.text,...[node,container,root,view]
+      .map(value=>[value.package,value.class,value['resource-id'] || '',value.bounds])])});
   }
   return options.length===1 ? options[0] : null;
 }

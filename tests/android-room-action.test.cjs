@@ -87,11 +87,30 @@ test('ambiguous quality rows or nested native list containers never select an ar
   assert.equal(nativeQualityOption(nested,'720'),null);
 });
 test('quality selection requires two consecutive identical current row container and window bounds', async () => {
-  const first=qualityPopupFixture(),second=qualityPopupFixture(),third=qualityPopupFixture();
-  second[2].bounds=third[2].bounds='[830,1380][910,1640]';
-  let reads=0,clock=0;const snapshots=[first,second,third];
+  const changes=[
+    nodes=>{nodes.find(node=>node.text==='720p').bounds='[830,1451][910,1511]';},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView').bounds='[830,1391][910,1640]';},
+    nodes=>{nodes[2].bounds='[830,1380][910,1640]';},
+    nodes=>{nodes.find(node=>node.class==='android.webkit.WebView').bounds='[0,0][1080,1919]';},
+    nodes=>{nodes.find(node=>node.text==='720p').class='android.widget.TextView';},
+    nodes=>{nodes.find(node=>node.class==='android.widget.ListView')['resource-id']='changed-list';},
+    nodes=>{nodes[2].class='android.widget.PopupWindow$PopupDecorView';},
+    nodes=>{nodes.find(node=>node.class==='android.webkit.WebView')['resource-id']='changed-view';}
+  ];
+  for(const [index,change] of changes.entries()) {
+    const snapshots=[qualityPopupFixture(),qualityPopupFixture(),qualityPopupFixture()];change(snapshots[1]);change(snapshots[2]);
+    let reads=0,clock=0;
+    await findNativeQualityOption('720',{read:async()=>snapshots[reads++],wait:async ms=>{clock+=ms;},now:()=>clock,timeout:2000});
+    assert.equal(reads,3,`changed native owner geometry or identity${index} must reset stability`);
+  }
+});
+test('fresh observer window IDs do not prevent stable contained native quality selection', async () => {
+  const snapshots=[qualityPopupFixture(),qualityPopupFixture()];
+  snapshots[1].forEach(node=>{node._observerWindowId=String(Number(node._observerWindowId)+50);});
+  let reads=0,clock=0;
   const found=await findNativeQualityOption('720',{read:async()=>snapshots[reads++],wait:async ms=>{clock+=ms;},now:()=>clock,timeout:2000});
-  assert.equal(reads,3);assert.equal(found.root.bounds,'[830,1380][910,1640]');
+  assert.equal(reads,2);assert.equal(found.node._observerWindowId,'61');
+  assert.equal(found.container._observerWindowId,'61');assert.equal(found.view._observerWindowId,'60');
 });
 test('missing native popup fails within the original bounded deadline without selecting a DOM label', async () => {
   const nodes=qualityPopupFixture().slice(0,2);nodes.push({...button('[830,1450][910,1510]'),text:'720p',class:'android.widget.TextView'});
